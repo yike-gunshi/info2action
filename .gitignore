@@ -78,6 +78,8 @@ screenshots/
 # === 敏感文件 ===
 .env
 .env.*
+# .env.example 是无敏感值的模板，必须入仓（公开仓库 Quick Start 依赖）
+!.env.example
 *.key
 *.pem
 credentials.json
