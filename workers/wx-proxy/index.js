@@ -9,9 +9,11 @@ export default {
       return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET', 'Access-Control-Allow-Headers': 'Authorization' } });
     }
 
-    const SECRET = 'infofeed-wx-2026';
+    // 共享密钥从 Cloudflare env binding 读取，不硬编码。
+    // 部署前设置: wrangler secret put WX_PROXY_SECRET
+    const SECRET = env.WX_PROXY_SECRET;
     const auth = request.headers.get('Authorization') || '';
-    if (auth !== `Bearer ${SECRET}`) {
+    if (!SECRET || auth !== `Bearer ${SECRET}`) {
       return jsonResp({ error: 'unauthorized' }, 401);
     }
 

@@ -3,7 +3,7 @@
 > 你已经跑通了 [README Quick Start](../README.md#-quick-start)（最小集 = 1 把 LLM key + RSS）？这份文档帮你把项目升级到「完整能力」并部署到自己的服务器。
 >
 > 凭证字段速查 → [docs/配置指南.md](配置指南.md)
-> ECS 部署细节 → [docs/DEPLOY.md](DEPLOY.md)
+> 部署到服务器 → 见下方 [§4 部署到服务器](#4-部署到服务器)
 
 ## 1. 选择你的部署模式
 
@@ -91,9 +91,7 @@ Info2Action 的「行动建议」可以派发到你私有 Discord 服务器的 F
 
 ## 4. 部署到服务器
 
-详细 ECS 部署、systemd unit、git pull 部署流程见 [docs/DEPLOY.md](DEPLOY.md)。
-
-简要路径：
+一台常规 Linux（Ubuntu 22.04 实测）+ Python 3.11 + Node 20 即可。完整路径：
 
 ```bash
 # 服务器侧
@@ -103,7 +101,8 @@ cp .env.example .env && vim .env       # 填凭证
 uv pip install -r requirements.txt
 cd frontend-react && npm install && npm run build && cd ..
 
-# systemd
+# systemd（ops/info-feed.service 是示例单元，按你的部署目录改
+# WorkingDirectory / EnvironmentFile / ExecStart 里的路径后再拷贝）
 sudo cp ops/info-feed.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now info-feed
@@ -153,6 +152,6 @@ A: `src/clustering/embedding_provider.py` 已抽象 provider 基类，加新 pro
 
 - 改 prompt 调 AI 行为 → `prompts/*.md`，每个文件都有自己的 README 说明
 - 调阈值/排序权重 → `config/config.json` + `src/routes/feed.py` 的 ranking 公式
-- 看每个模块怎么实现的 → [docs/产品实现速查.md](产品实现速查.md)（PM cheat sheet）
-- 调整 UX → [docs/DESIGN.md](DESIGN.md)
+- 看每个模块怎么实现的 → `src/` 各 `fetch_*.py` / `enrich_items.py` / `clustering/`，配合 `prompts/` 一起读
+- 调整前端样式 / 交互 → `frontend-react/src/`
 - 想贡献代码 → 看 [README #Contributing](../README.md#-contributing)

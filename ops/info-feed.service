@@ -1,0 +1,26 @@
+[Unit]
+Description=info2action FastAPI backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/info2act-git
+EnvironmentFile=/opt/info2act-git/.env
+# P1-2(2026-07-03 事故加固):重启不再等 fetch。被打断的 run 由启动
+# 恢复逻辑标记 interrupted,下个调度周期自动重跑;换来发版秒级可控,
+# 不再出现"优雅停机等抓取导致全站 502 数分钟"(原 TimeoutStopSec=7200)。
+# 注意 .env 若也定义此变量会覆盖这里(EnvironmentFile 优先)。
+Environment=INFO2ACTION_FETCH_SHUTDOWN_GRACE_SEC=0
+ExecStart=/opt/info2act-git/.venv/bin/python src/app.py 8080
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=90
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=info-feed
+
+[Install]
+WantedBy=multi-user.target

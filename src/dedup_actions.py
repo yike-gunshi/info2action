@@ -389,8 +389,10 @@ def run_dedup(dry_run=True, threshold=0.25, max_cluster_size=20):
                 print(f"    → [skip] too large ({len(cluster_actions)} > {max_cluster_size})")
                 continue
 
-            if dry_run and not api_key:
-                print("    → [dry-run, no API key] skipping LLM")
+            if not api_key:
+                # 无 key 时干净跳过 LLM 精判（对齐 generate_summaries），
+                # 而非带空 key 调用撞 401；dedup 降级为仅 TF-IDF 分组不合并。
+                print("    → [no API key] skipping LLM confirmation")
                 continue
 
             # Rate limit

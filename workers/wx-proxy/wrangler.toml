@@ -2,3 +2,7 @@ name = "wx-proxy"
 main = "index.js"
 compatibility_date = "2024-01-01"
 workers_dev = true
+
+# 鉴权密钥不写在代码/配置里，部署前用 secret 注入：
+#   wrangler secret put WX_PROXY_SECRET
+# 调用方在 Authorization 头传 `Bearer <same-secret>`。
