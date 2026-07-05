@@ -1,0 +1,20 @@
+{
+  "_meta": {
+    "since": "2026-05-12",
+    "version": "v16.0",
+    "doc": "GitHub 综合抓取系统配置。trending = github.com/trending?spoken_language_code 维度（删编程语言遍历）；awesome_repos = 5 个仓库当普通 GitHub repo 抓取（不做 git diff 增量）；readme_max_tokens = 每个 GitHub item README 上限（fetch 阶段从尾部按 UTF-8 字符边界截）。配置改动后 git push → ECS deploy-ecs.sh → 下次 cron 生效，不需要重启 info-feed.service。"
+  },
+  "trending": {
+    "spoken_languages": ["zh", ""],
+    "since": "daily",
+    "count": 25
+  },
+  "awesome_repos": [
+    "modelcontextprotocol/registry",
+    "ComposioHQ/awesome-claude-skills",
+    "VoltAgent/awesome-claude-code-subagents",
+    "Shubhamsaboo/awesome-llm-apps",
+    "punkpeye/awesome-mcp-servers"
+  ],
+  "readme_max_tokens": 12000
+}

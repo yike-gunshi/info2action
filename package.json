@@ -1,0 +1,12 @@
+{
+  "scripts": {
+    "dev": "bash scripts/dev-stack.sh start",
+    "dev:status": "bash scripts/dev-stack.sh status",
+    "dev:stop": "bash scripts/dev-stack.sh stop",
+    "dev:restart": "bash scripts/dev-stack.sh restart"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2",
+    "puppeteer": "^24.40.0"
+  }
+}

@@ -1,0 +1,145 @@
+# === 构建产物 ===
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# === 根目录残留数据库 ===
+feed.db
+feeds.db
+deeplinks-*.js
+
+# === 数据库（运行时产物，体积大）===
+data/*.db
+data/*.db.*
+data/feed.db
+data/feed.db-wal
+data/feed.db-shm
+data/user_feedback.db
+data/user_feedback.db-wal
+data/user_feedback.db-shm
+data/feed.db.backup-*
+
+# === 运行时缓存 ===
+.devserver.json
+data/health.json
+data/cli_auth_cache.json
+data/ai_provider_state.json
+data/ai_provider_state.lock
+data/action_streams/
+data/backfill_*_progress.json
+data/dedup_plan.json
+data/highlights_score_calibration/
+data/images/
+data/lingowhale/
+data/run_sources/
+data/remote_read_cache/
+.devserver.json
+
+# === 日志 ===
+logs/
+nohup.out
+
+# === 测试产物 ===
+test-results/
+screenshots/
+# 例外：docs/qa/ 下的 QA 验收截图（forge-qa 审计材料）必须入仓
+!docs/qa/**/screenshots/
+!docs/qa/**/screenshots/**
+
+# === 系统文件 ===
+.DS_Store
+
+# === IDE ===
+.idea/
+.vscode/
+
+# === Claude 本地配置 ===
+.claude/
+.claude/worktrees/
+
+# === forge/deliver 本地 checkpoint 产物 ===
+.do-dev/checkpoints/
+.forge/
+
+# === 凭证/token ===
+.api_token
+.cc-poc
+
+# === CodePilot 上传缓存 ===
+.codepilot-uploads/
+
+# === Syncthing 残留 ===
+*.sync-conflict-*
+.stfolder/
+.stversions/
+
+# === 敏感文件 ===
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+
+# Database backups
+data/backups/
+data/*.bak.*
+data/*.bak
+data/*.db.pre-*-bak
+data/*.corrupted
+.gstack/
+.worktrees/
+
+# Data sources (fetched by cron, not code)
+data/sources/
+
+# SQLite WAL/SHM + 附加 .bak-timestamp + 其他 sqlite3 临时文件
+data/*.sqlite3
+data/*.db-wal
+data/*.db-shm
+data/*.db.bak-*
+
+# QA screenshots
+qa_screenshots/
+frontend-react/qa_screenshots/
+
+# TS build cache
+frontend-react/tsconfig.*.tsbuildinfo
+
+# Temp files
+brainstorm-*.md
+!docs/archive/brainstorm/
+!docs/archive/brainstorm/*.md
+
+# Local evaluation raw data
+docs/调研/embedding/**/results.json
+
+# === 前端构建产物（ECS 上 build，不入 git）===
+frontend-react/dist/
+frontend-react/node_modules/
+
+# === ECS runtime 产物 / 数据源（抓取内容与配置生成物）===
+# 由 cron/fetch 脚本生成，不同机器各自产出
+/bilibili/
+/hackernews/
+/reddit/
+/rss/
+/twitter/
+/xiaohongshu/
+/github/
+/data/data/
+/data/sources/
+/prompts/prompts/
+
+# === 运行时配置（每台机器/环境独立，不入 git）===
+/classification.json
+/config.json
+/topics.json
+/user_context.json
+
+# === ECS-only 运维脚本（若存在，不同步）===
+scripts/auto-deploy.sh
+
+# oss-export 工作目录（导出快照与公开仓库 clone）
+.oss-export/

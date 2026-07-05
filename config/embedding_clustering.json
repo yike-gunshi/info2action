@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "purpose": "Embedding vectors and cluster aggregation must be tuned together. This file records the active embedding-clustering threshold profile so future clustering-quality work starts from the right knob.",
+  "active_profile": "openrouter_text_embedding_3_small_conservative",
+  "active_decision": {
+    "date": "2026-05-15",
+    "summary": "Use OpenRouter text-embedding-3-small for embedding, with a conservative Stage 1 cosine floor before cluster aggregation.",
+    "report": "docs/调研/embedding/openrouter-vs-minimax-2026-05-15-large/report.md"
+  },
+  "profiles": {
+    "openrouter_text_embedding_3_small_conservative": {
+      "embedding_provider": "openrouter",
+      "embedding_model": "openai/text-embedding-3-small",
+      "stage1_cosine_min": 0.75,
+      "stage1_gray_cosine_min": 0.70,
+      "stage1_shadow_cosine_min": 0.65,
+      "stage1_gray_max_temporal_hours": 2,
+      "stage1_top_k": 10,
+      "rationale": "Conservative rollout profile. Keep 0.75 as the strong recall floor for precision, add 0.70-0.75 as a rule-gated gray band sent to LLM judge, and log 0.65-0.70 as shadow observations only.",
+      "offline_eval": {
+        "sample_items": 120,
+        "sample_clusters": 30,
+        "precision": 0.705882,
+        "recall": 0.533333,
+        "f1": 0.607595,
+        "weighted_purity": 0.908333,
+        "report": "docs/调研/embedding/openrouter-vs-minimax-2026-05-15-large/report.md"
+      }
+    },
+    "openrouter_text_embedding_3_small_recall": {
+      "embedding_provider": "openrouter",
+      "embedding_model": "openai/text-embedding-3-small",
+      "stage1_cosine_min": 0.70,
+      "stage1_gray_cosine_min": 0.70,
+      "stage1_shadow_cosine_min": 0.65,
+      "stage1_gray_max_temporal_hours": 2,
+      "stage1_top_k": 10,
+      "rationale": "Higher-recall candidate profile. The same offline test reached the best F1 at 0.70, but overmerged more than the conservative profile.",
+      "offline_eval": {
+        "sample_items": 120,
+        "sample_clusters": 30,
+        "precision": 0.594595,
+        "recall": 0.733333,
+        "f1": 0.656716,
+        "weighted_purity": 0.833333,
+        "report": "docs/调研/embedding/openrouter-vs-minimax-2026-05-15-large/report.md"
+      }
+    }
+  }
+}

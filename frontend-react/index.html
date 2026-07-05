@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=image2-newspaper-1" />
+    <link rel="apple-touch-icon" href="/icon-192.png?v=image2-newspaper-1" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="application-name" content="Info2Act" />
+    <meta name="apple-mobile-web-app-title" content="Info2Act" />
+    <!-- UX-14: theme-color 跟随主题(原藏青 #11154A 与米色品牌不符) -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#F4F3EF" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#181611" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Info2Act</title>
+    <!-- UX-4: 暗色 pre-paint——React effect 写入 .dark 之前就定妆,消除暗色用户冷加载闪白 -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('i2a_theme');
+          if (t === 'dark' || (!t && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

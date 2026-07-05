@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Info2Act</title>
+  <desc id="desc">Warm newspaper app icon</desc>
+  <rect width="512" height="512" rx="112" fill="#FFF1DD"/>
+  <rect x="64" y="64" width="384" height="384" rx="96" fill="#E95F32"/>
+  <path fill="#FFE8BE" d="M143 143h208c32 0 58 26 58 58v168H171c-15 0-28-12-28-28V143Z"/>
+  <path fill="#FFC66D" d="M351 143h18c22 0 40 18 40 40v186h-58V143Z"/>
+  <path fill="#B74325" d="M143 320h266v49H171c-15 0-28-12-28-28v-21Z" opacity=".18"/>
+  <rect x="178" y="184" width="116" height="76" rx="18" fill="#F07A3F"/>
+  <rect x="178" y="285" width="142" height="18" rx="9" fill="#7C2F22"/>
+  <rect x="178" y="324" width="102" height="18" rx="9" fill="#7C2F22" opacity=".74"/>
+  <rect x="322" y="185" width="52" height="18" rx="9" fill="#7C2F22"/>
+  <rect x="322" y="224" width="52" height="18" rx="9" fill="#7C2F22" opacity=".74"/>
+  <circle cx="268" cy="222" r="22" fill="#FFD98A"/>
+  <path fill="#FFF1DD" d="M198 243c15-21 31-31 48-31 20 0 36 13 48 39v9h-96v-17Z" opacity=".92"/>
+</svg>

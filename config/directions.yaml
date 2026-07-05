@@ -1,0 +1,176 @@
+# 行动方向框架 (Action Directions Framework)
+#
+# 用途：为行动点生成和去重提供结构化的方向分类体系。
+# LLM 在生成行动点时必须从此框架中选择方向，或提议新方向。
+# 修改后无需重启服务，下次调用自动生效。
+#
+# 结构：direction_slug → { label, description, scope, not_scope }
+#   - label: 显示名称
+#   - description: 方向定义（告诉 LLM 这个方向覆盖什么）
+#   - scope: 属于此方向的典型场景（正例）
+#   - not_scope: 不属于此方向的边界澄清（反例，防止 LLM 误归类）
+#
+# 迭代规则：
+#   - 新增方向：直接添加条目，下次生成自动生效
+#   - 废弃方向：注释掉或删除，已有 action 的 direction 不受影响
+#   - LLM 可提议新方向（propose_new），由用户确认后加入此文件
+
+directions:
+
+  openclaw:
+    label: "OpenClaw"
+    description: "OpenClaw 平台本身的功能跟踪、版本迁移、安全加固、部署运维"
+    scope:
+      - "OpenClaw 新版本发布、API 变更、迁移指南"
+      - "OpenClaw 安全漏洞（CVE）、越权审计、WebSocket 加固"
+      - "OpenClaw 多 Agent 角色配置、运行时优化"
+    not_scope:
+      - "用 OpenClaw 做某个业务项目 → 归到具体业务方向"
+      - "OpenClaw 生态中的第三方插件调研 → 归到 agent-ecosystem"
+
+  claude-code:
+    label: "Claude Code"
+    description: "Claude Code 工具链的配置优化、记忆增强、官方更新跟踪"
+    scope:
+      - "Claude Code 配置审计（.claude/、CLAUDE.md、hooks）"
+      - "Claude Code 记忆系统（mem9、Signet、context 管理）"
+      - "Claude Code 官方更新、新功能评估、最佳实践"
+      - "Claude Code 生态头部项目调研（everything-cc、awesome-claude-code）"
+    not_scope:
+      - "Skill 开发实践、Skill 框架设计 → 归到 skill-practice"
+      - "用 Claude Code 开发某个具体项目 → 归到该项目方向"
+      - "Claude API / Anthropic SDK 集成 → 归到 ai-infra"
+
+  skill-practice:
+    label: "Skill 实践"
+    description: "AI 工具的 Skill/Plugin/Extension 体系：开发、复用、管理、分享"
+    scope:
+      - "Claude Code Skill 开发、调试、发布"
+      - "MiniMax Skills、dbskill 等第三方 Skill 框架调研"
+      - "Skill 管理器（Skills Manager、Skill Registry）"
+      - "Agent 上下文工程技能库、可复用 Prompt 模板"
+      - "gstack、browser-use 等工具型 Skill 的集成实践"
+    not_scope:
+      - "Claude Code 配置/记忆/官方更新 → 归到 claude-code"
+      - "Agent 框架层面的编排设计 → 归到 agent-ecosystem"
+      - "具体业务场景的 Skill 使用（如用 Skill 写文章）→ 归到业务方向"
+
+  agent-ecosystem:
+    label: "Agent 生态"
+    description: "AI Agent 框架设计、多 Agent 编排、Agent 架构模式"
+    scope:
+      - "Agent 框架（LangChain、CrewAI、AutoGen、deer-flow 等）对比调研"
+      - "多 Agent 协作模式、任务编排、Agent 通信协议"
+      - "Agent 执行边界、安全沙箱、上下文漂移检测"
+      - "World Models、认知架构等 Agent 理论研究"
+    not_scope:
+      - "具体工具/Skill 的使用实践 → 归到 skill-practice"
+      - "MCP Server 开发（工具侧）→ 归到 skill-practice"
+      - "Claude Code 自身功能 → 归到 claude-code"
+      - "具体模型的 API 调用 → 归到 ai-infra"
+
+  ai-infra:
+    label: "AI 基础设施"
+    description: "模型 API、推理优化、RAG、向量库、Embedding、AI 工程化"
+    scope:
+      - "新模型发布（GPT/Claude/Gemini/开源模型）评估"
+      - "RAG 管线、向量数据库选型、Embedding 方案"
+      - "推理加速、量化、本地部署（Ollama/vLLM）"
+      - "Prompt Engineering 方法论、评测框架"
+    not_scope:
+      - "Agent 框架层面的编排 → 归到 agent-ecosystem"
+      - "具体产品中的 AI 功能 → 归到该产品方向"
+
+  info2action:
+    label: "信息雷达"
+    description: "info2action 产品本身的功能开发、数据管线、前端体验、运维"
+    scope:
+      - "信息源抓取（Twitter/Reddit/HN/RSS/B站/小红书/微信）"
+      - "AI 摘要管线、评分引擎、行动点生成"
+      - "前端 UI/UX、搜索、过滤、时间线"
+      - "健康检查、部署、性能优化"
+    not_scope:
+      - "被抓取内容本身的调研行动 → 归到内容对应的方向"
+
+  content-creation:
+    label: "内容创作"
+    description: "自媒体内容生产：选题、写作、发布，覆盖公众号/X/小红书"
+    scope:
+      - "公众号文章选题、写作、排版"
+      - "X/Twitter 内容策略、发帖优化"
+      - "小红书内容创作、视觉优化"
+      - "Vibe Coding 实战教程、AI 工具使用心得"
+      - "跨平台内容复用与分发策略"
+    not_scope:
+      - "内容创作工具本身的开发 → 归到对应工具方向"
+      - "AI 生图/生视频工具调研 → 归到 creative-tools"
+
+  creative-tools:
+    label: "AI 创意工具"
+    description: "AI 生图、生视频、设计工具的调研与实践"
+    scope:
+      - "Lovart、Midjourney、DALL-E 等 AI 生图工具"
+      - "Seedance、Runway、Kling 等 AI 视频工具"
+      - "Figma + AI、设计自动化工具"
+      - "AI 音乐、AI 配音等多媒体工具"
+    not_scope:
+      - "用这些工具产出的内容 → 归到 content-creation"
+
+  dev-efficiency:
+    label: "开发效能"
+    description: "通用开发效率工具、工作流自动化、DevOps、知识管理"
+    scope:
+      - "终端工具（tmux、zsh、CLI 工具链）"
+      - "Git 工作流、CI/CD、自动化脚本"
+      - "知识管理（Obsidian、Notion、书签系统）"
+      - "跨设备同步（Syncthing）、远程开发"
+    not_scope:
+      - "AI 特定的开发工具 → 归到 claude-code 或 agent-ecosystem"
+
+  industry-intel:
+    label: "行业动态"
+    description: "AI 行业趋势、融资、政策、竞品动态、值得关注但无即时行动的信息"
+    scope:
+      - "AI 公司融资、收购、IPO"
+      - "政策法规变化（AI 监管、数据安全）"
+      - "竞品/替代品动态（不直接影响当前项目）"
+      - "行业分析报告、市场趋势"
+    not_scope:
+      - "直接影响用户项目的技术更新 → 归到对应技术方向"
+      - "可以立即行动的工具发布 → 归到对应工具方向"
+
+  startup:
+    label: "创业机会"
+    description: "从信息流中发现的创业方向、商业模式、市场机会分析"
+    scope:
+      - "AI 产品/工具的商业化机会分析"
+      - "未被满足的市场需求、用户痛点洞察"
+      - "可复制的商业模式、变现路径"
+      - "竞品空白、蓝海赛道识别"
+      - "技术趋势中的创业窗口期判断"
+    not_scope:
+      - "纯行业新闻（无创业启发）→ 归到 industry-intel"
+      - "已有产品的功能改进 → 归到对应产品方向"
+      - "技术调研（无商业视角）→ 归到对应技术方向"
+
+  _uncategorized:
+    label: "待归类"
+    description: "LLM 无法匹配现有方向时的兜底。积累后由用户 review 并创建新方向或重新归类。"
+    scope:
+      - "确实不属于任何现有方向的全新领域"
+    not_scope:
+      - "能勉强归入某个方向的 → 不要用 _uncategorized，选最接近的"
+
+# --- LLM 提议新方向的格式 ---
+# 当 LLM 认为某个行动点不适合任何现有方向时，可在输出中包含：
+# {
+#   "propose_new_direction": {
+#     "slug": "blockchain-web3",
+#     "label": "区块链/Web3",
+#     "description": "...",
+#     "scope": ["...", "..."],
+#     "not_scope": ["...", "..."],
+#     "reason": "为什么现有方向不够用"
+#   }
+# }
+# 提议的方向暂时归入 _uncategorized，由用户确认后手动加入此文件。

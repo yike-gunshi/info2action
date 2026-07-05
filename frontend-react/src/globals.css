@@ -1,0 +1,631 @@
+/* 字体改为自托管(main.tsx @fontsource 导入),不再远程引入 Google Fonts —— DESIGN.md §8.7。
+   合并说明(2026-07-04):main 的 UX-1 拉丁子集方案(fonts.css)被 §8.7 D1 全自托管方案取代。 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: #F4F3EF;
+    --foreground: #1A1917;
+    --card: #FFFFFF;
+    --card-foreground: #1A1917;
+    --primary: #4F52E4;
+    --primary-foreground: #FFFFFF;
+    --secondary: #F2F1ED;
+    --secondary-foreground: #4A4946;
+    --muted: #F2F1ED;
+    --muted-foreground: #6B6A65;
+    --accent: #EEECFF;
+    --accent-foreground: #4F52E4;
+    --destructive: #DC2626;
+    --destructive-foreground: #FFFFFF;
+    --border: #E4E2DC;
+    --input: #E4E2DC;
+    --ring: #4F52E4;
+    --radius: 0.625rem;
+
+    /* v19.0 Global Visual Reset: editorial brand layer */
+    --brand: #C65A1E;
+    --brand-foreground: #FFFFFF;
+    --brand-soft: #F6E5DC;
+    --brand-border: #E2B49F;
+    --wordmark-ink: #171512;
+    --wordmark-copper: #C66A2E;
+    --wordmark-shadow: rgba(86, 52, 24, 0.18);
+    --wordmark-highlight: rgba(255, 255, 255, 0.78);
+
+    /* Score colors */
+    --score-high: #D97706;
+    --score-high-bg: #FFFBEB;
+    --score-mid: #4A4946;
+    --score-low: #ADACA6;
+
+    /* Platform glows */
+    --glow-twitter: rgba(29,161,242,.18);
+    --glow-xhs: rgba(254,44,85,.18);
+    --glow-bili: rgba(0,161,214,.18);
+    --glow-reddit: rgba(255,69,0,.18);
+    --glow-hn: rgba(255,102,0,.18);
+    --glow-github: rgba(51,51,51,.12);
+    --glow-rss: rgba(242,101,34,.18);
+    --glow-lingowhale: rgba(45,184,75,.18);
+    --glow-waytoagi: rgba(78,110,242,.18);
+
+    /* Terminal */
+    --terminal-bg: #1A1A2E;
+    --terminal-text: #4ade80;
+    --terminal-muted: #6366F1;
+
+    /* v15.0 事件聚合语义 token (DESIGN.md §15.3) */
+    --pulse-update: #F59E0B;            /* 有更新小圆点 (琥珀,语义=被动提醒) */
+    --badge-official-bg: #EEECFF;       /* [官方] 标签底 (复用 --accent 浅) */
+    --badge-official-fg: #4F52E4;       /* [官方] 标签字 (复用 --accent) */
+    --floating-btn-bg: #1A1917;         /* 悬浮按钮深底 (复用 --foreground) */
+    --floating-btn-fg: #FFFFFF;         /* 悬浮按钮白字 */
+    --floating-btn-shadow: 0 4px 16px rgba(26, 25, 23, 0.18);
+    --app-visual-height: 100vh;
+    --app-safe-bottom: env(safe-area-inset-bottom, 0px);
+    --modal-browser-bottom-clearance: 0px;
+    --modal-bottom-clearance: calc(var(--app-safe-bottom) + var(--modal-browser-bottom-clearance));
+    --highlights-l2-top: 84px;
+    --highlights-l2-height: 40px;
+    --highlights-date-top: calc(var(--highlights-l2-top) + var(--highlights-l2-height));
+
+    /* Shared editorial modal tokens */
+    --modal-surface: #FAF8F5;
+    --modal-surface-soft: #FFFCF8;
+    --modal-surface-muted: #F0ECE5;
+    --modal-border: #DCD7CC;
+    --modal-border-soft: #E5DED5;
+    --modal-divider: #E8E1D8;
+    --modal-text: #171512;
+    --modal-text-soft: #3F3A34;
+    --modal-text-muted: #6B6258;
+    --modal-text-faint: #7A7166;
+    --modal-text-subtle: #C2B8AC;
+    --modal-hover: #EFE7DE;
+    --modal-hover-soft: #FFF7EF;
+    --modal-current-bg: #F7E6DC;
+    --modal-current-hover: #F1ECE5;
+    --modal-current-text: #A84F1E;
+    --modal-danger: #B6452C;
+    --modal-danger-border: #D8A08E;
+    --modal-danger-surface: #FFF8F4;
+    --modal-danger-hover: #F7E6DC;
+    --modal-shadow: 0 22px 70px rgba(26,25,23,0.22);
+    --modal-paper-texture:
+      linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0) 36%),
+      radial-gradient(circle at 1px 1px, rgba(198,90,30,0.035) 1px, transparent 0);
+
+    color-scheme: light;
+  }
+
+  @supports (height: 100dvh) {
+    :root {
+      --app-visual-height: 100dvh;
+    }
+  }
+
+  @media (min-width: 640px) {
+    :root {
+      --highlights-l2-top: 52px;
+    }
+  }
+
+  .dark {
+    --background: #181611;
+    --foreground: #ECE4D8;
+    --card: #211E18;
+    --card-foreground: #ECE4D8;
+    --primary: #F0A273;
+    --primary-foreground: #1F1713;
+    --secondary: #26221B;
+    --secondary-foreground: #D6CABB;
+    --muted: #25211B;
+    --muted-foreground: #A79D90;
+    --accent: #332620;
+    --accent-foreground: #F2B287;
+    --destructive: #EF4444;
+    --destructive-foreground: #FFFFFF;
+    --border: #39342B;
+    --input: #463D31;
+    --ring: #F0A273;
+
+    --brand: #F0A273;
+    --brand-foreground: #1F1713;
+    --brand-soft: #3A2A21;
+    --brand-border: #7A573F;
+    --wordmark-ink: #EFE8DD;
+    --wordmark-copper: #E69A61;
+    --wordmark-shadow: rgba(0, 0, 0, 0.42);
+    --wordmark-highlight: rgba(255, 244, 229, 0.08);
+
+    --score-high: #FBBF24;
+    --score-high-bg: #2A2520;
+    --score-mid: #C8BBAA;
+    --score-low: #6F665B;
+
+    /* v15.0 暗色模式 token (DESIGN.md §15.18) */
+    --pulse-update: #FBBF24;            /* 琥珀加饱和 */
+    --badge-official-bg: #332620;
+    --badge-official-fg: #F0A273;
+    --floating-btn-bg: #E8E2D8;         /* 反转浅底 */
+    --floating-btn-fg: #1A1917;
+    --floating-btn-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+
+    --modal-surface: #211E18;
+    --modal-surface-soft: #26221B;
+    --modal-surface-muted: #2C261F;
+    --modal-border: #4A4034;
+    --modal-border-soft: #39342B;
+    --modal-divider: #39342B;
+    --modal-text: #ECE4D8;
+    --modal-text-soft: #D6CABB;
+    --modal-text-muted: #A79D90;
+    --modal-text-faint: #8D8376;
+    --modal-text-subtle: #63594E;
+    --modal-hover: #332A22;
+    --modal-hover-soft: #3A2E24;
+    --modal-current-bg: #3A2A21;
+    --modal-current-hover: #30271F;
+    --modal-current-text: #F2B287;
+    --modal-danger: #FCA5A5;
+    --modal-danger-border: #7F4A3E;
+    --modal-danger-surface: #2D201B;
+    --modal-danger-hover: #3A2520;
+    --modal-shadow: 0 24px 72px rgba(0,0,0,0.5);
+    --modal-paper-texture:
+      linear-gradient(180deg, rgba(255,244,229,0.055), rgba(255,244,229,0) 38%),
+      radial-gradient(circle at 1px 1px, rgba(240,162,115,0.055) 1px, transparent 0);
+
+    color-scheme: dark;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    max-width: 100%;
+    overflow-x: clip;
+  }
+
+  html {
+    scrollbar-gutter: stable;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    text-wrap: pretty;
+  }
+}
+
+/* v15.0 事件聚合动画 (DESIGN.md §15.16) */
+@keyframes event-pill-slide-in {
+  from { transform: translate(-50%, -100%); opacity: 0; }
+  to   { transform: translate(-50%, 0);     opacity: 1; }
+}
+
+@keyframes event-skeleton-shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes fetch-status-text-shine {
+  0%   { background-position: 160% 0; }
+  100% { background-position: -80% 0; }
+}
+
+.fetch-status-shine {
+  color: var(--muted-foreground);
+  background-image: linear-gradient(
+    110deg,
+    var(--muted-foreground) 0%,
+    var(--muted-foreground) 38%,
+    rgba(255, 255, 255, 0.95) 50%,
+    var(--muted-foreground) 62%,
+    var(--muted-foreground) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: fetch-status-text-shine 2.4s linear infinite;
+}
+
+@layer components {
+  /* ============================================================
+     阅读场景文字角色 Token —— DESIGN.md §8.7(2026-07-03 D2/D3)
+     每个角色 = 字号 + 行高 + 字重 + 颜色 的四元组打包。
+     阅读场景组件(事件弹窗/详情页)只准引用角色类,不再写死数值。
+     ============================================================ */
+  .reading-title {
+    /* 事件大标题 */
+    font-family: theme('fontFamily.event-title');
+    font-size: 20px;
+    line-height: 1.36;
+    font-weight: 700;
+    color: var(--modal-text);
+  }
+  .reading-section {
+    /* 拆解小节标题(含编号) */
+    font-family: theme('fontFamily.event-title');
+    font-size: 16px;
+    line-height: 1.42;
+    font-weight: 700;
+    color: var(--modal-text);
+  }
+  .reading-body {
+    /* 阅读正文:速览段落。
+       D3: 正文用次墨(10.5:1, AAA),弱墨只留给元信息。
+       行高 1.75 为用户确认的舒适值,全阅读场景统一。 */
+    font-family: theme('fontFamily.event-title');
+    font-size: 16px;
+    line-height: 1.75;
+    font-weight: 400;
+    color: var(--modal-text-soft);
+    letter-spacing: 0;
+    text-autospace: normal; /* 中西文间隙兜底(渐进增强,旧浏览器忽略) */
+  }
+  .reading-bullet {
+    /* 拆解 bullet:比速览再轻一档(300),其余四元组与 .reading-body 一致 */
+    font-family: theme('fontFamily.event-title');
+    font-size: 16px;
+    line-height: 1.75;
+    font-weight: 300;
+    color: var(--modal-text-soft);
+    letter-spacing: 0;
+    text-autospace: normal;
+  }
+  .reading-meta {
+    /* 辅助信息:来源、时间、计数 */
+    font-family: theme('fontFamily.sans');
+    font-size: 13px;
+    line-height: 1.5;
+    font-weight: 400;
+    color: var(--modal-text-muted);
+  }
+  .reading-caption {
+    /* 最弱说明文字 */
+    font-family: theme('fontFamily.sans');
+    font-size: 12px;
+    line-height: 1.5;
+    font-weight: 400;
+    color: var(--modal-text-faint);
+  }
+
+  .brand-wordmark {
+    display: inline-flex;
+    align-items: baseline;
+    color: var(--wordmark-ink);
+    font-family: "Cormorant Garamond", Georgia, serif;
+    font-feature-settings: "kern" 1, "liga" 1;
+    font-kerning: normal;
+    font-optical-sizing: auto;
+    font-weight: 700;
+    letter-spacing: 0;
+    line-height: 0.82;
+    text-shadow:
+      0 0.5px 0 var(--wordmark-highlight),
+      0 1.5px 2.5px var(--wordmark-shadow);
+  }
+
+  .brand-wordmark__two {
+    color: var(--wordmark-copper);
+    display: inline-block;
+    font-style: italic;
+    font-weight: 600;
+    position: relative;
+    margin-inline: -0.015em -0.01em;
+    transform: translateY(0.028em) scale(1.14);
+    transform-origin: 50% 62%;
+    text-shadow:
+      0 0.5px 0 color-mix(in srgb, var(--wordmark-highlight) 72%, transparent),
+      0 1.5px 3px color-mix(in srgb, var(--wordmark-copper) 38%, transparent);
+  }
+
+  .brand-wordmark__two::after {
+    content: '';
+    position: absolute;
+    left: 54%;
+    right: -0.34em;
+    bottom: 0.06em;
+    height: 0.055em;
+    border-radius: 999px;
+    background: linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--wordmark-copper) 82%, transparent),
+      color-mix(in srgb, var(--wordmark-copper) 28%, transparent)
+    );
+    transform: rotate(-3deg);
+    transform-origin: left center;
+  }
+
+  .content-inline-link {
+    position: relative;
+    display: inline;
+    overflow-wrap: anywhere;
+    color: var(--brand);
+    font-weight: 500;
+    text-decoration: none;
+    background-image: linear-gradient(currentColor, currentColor);
+    background-repeat: no-repeat;
+    background-position: 50% 100%;
+    background-size: 0 1px;
+    transition:
+      color 160ms ease,
+      background-size 180ms ease;
+  }
+
+  .content-inline-link:hover,
+  .content-inline-link:focus-visible {
+    color: color-mix(in srgb, var(--brand) 82%, #171512);
+    background-size: 100% 1px;
+  }
+
+  .content-inline-link:focus-visible {
+    border-radius: 2px;
+    outline: 2px solid color-mix(in srgb, var(--brand) 32%, transparent);
+    outline-offset: 2px;
+  }
+
+  .modal-viewport-panel {
+    max-height: calc(var(--app-visual-height) - 32px - var(--modal-bottom-clearance));
+  }
+
+  .modal-viewport-shell {
+    align-items: center;
+    justify-content: center;
+    overflow-y: auto;
+    padding: 16px 12px;
+  }
+
+  .modal-safe-footer {
+    padding-bottom: var(--app-safe-bottom);
+  }
+
+  @media (max-width: 640px) {
+    :root {
+      --modal-browser-bottom-clearance: 96px;
+    }
+
+    .modal-viewport-shell {
+      align-items: flex-start;
+      padding-bottom: calc(16px + var(--modal-bottom-clearance));
+    }
+
+    .modal-safe-footer {
+      padding-bottom: max(8px, var(--app-safe-bottom));
+    }
+  }
+
+  .ai-summary-signal {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border));
+    background:
+      radial-gradient(
+        180px 110px at 24px 0,
+        color-mix(in srgb, var(--primary) 9%, transparent),
+        transparent 72%
+      ),
+      linear-gradient(
+        180deg,
+        color-mix(in srgb, var(--card) 96%, var(--accent)) 0%,
+        var(--card) 42%
+      );
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.82),
+      0 12px 30px rgba(26, 25, 23, 0.045);
+  }
+
+  .ai-summary-signal::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    border-radius: inherit;
+    background:
+      linear-gradient(
+        90deg,
+        color-mix(in srgb, var(--primary) 9%, transparent),
+        transparent 22%,
+        transparent 78%,
+        color-mix(in srgb, var(--primary) 7%, transparent)
+      );
+    opacity: 0.48;
+  }
+
+  .ai-summary-signal:focus-within {
+    border-color: color-mix(in srgb, var(--primary) 34%, var(--border));
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.88),
+      0 14px 34px rgba(26, 25, 23, 0.06),
+      0 0 0 3px color-mix(in srgb, var(--primary) 8%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-testid="event-card"],
+  [data-testid="floating-updates-button"],
+  [data-testid="event-skeleton"],
+  [data-testid="latest-events-fetch-status"],
+  .content-inline-link,
+  .ai-summary-signal {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .fetch-status-shine {
+    background-image: none !important;
+    -webkit-text-fill-color: currentColor !important;
+  }
+}
+
+/* 阅读正文的强调:字重拉开到 700 + 颜色升主墨,双通道同向。
+   有意写在 @layer 外——无层级样式压过 markdown 渲染器输出的 .font-semibold 工具类。 */
+.reading-body strong,
+.reading-bullet strong {
+  font-weight: 700;
+  color: var(--modal-text);
+}
+
+/* Utility: hide scrollbar */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Event detail: keep independent columns scrollable without making the rail a visual element. */
+.event-detail-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, #8F877C 24%, transparent) transparent;
+}
+.event-detail-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.event-detail-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.event-detail-scrollbar::-webkit-scrollbar-thumb {
+  min-height: 44px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-color: color-mix(in srgb, #8F877C 26%, transparent);
+  background-clip: content-box;
+}
+.event-detail-scrollbar:hover {
+  scrollbar-color: color-mix(in srgb, #8F877C 42%, transparent) transparent;
+}
+.event-detail-scrollbar:hover::-webkit-scrollbar-thumb {
+  border-width: 1px;
+  background-color: color-mix(in srgb, #8F877C 42%, transparent);
+  background-clip: content-box;
+}
+.event-detail-scrollbar::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Skeleton shimmer gradient */
+.animate-skeleton {
+  background: linear-gradient(90deg, var(--muted) 25%, var(--border) 50%, var(--muted) 75%);
+  background-size: 200% 100%;
+}
+
+/* Shimmer button effect */
+.shimmer-button {
+  @apply relative overflow-hidden;
+}
+.shimmer-button::after {
+  content: '';
+  @apply absolute inset-0;
+  background: linear-gradient(110deg, transparent 25%, rgba(255,255,255,0.2) 50%, transparent 75%);
+  background-size: 200% 100%;
+  animation: shimmer 3s infinite;
+}
+.shimmer-button:hover::after {
+  animation-duration: 1.5s;
+}
+
+/* Action zone gradient */
+.action-zone {
+  background: linear-gradient(135deg, rgba(5,150,105,.04), rgba(5,150,105,.01));
+  border: 1px solid rgba(167,243,208,.4);
+  box-shadow: inset 0 1px 2px rgba(5,150,105,.06);
+}
+.dark .action-zone {
+  background: linear-gradient(135deg, rgba(5,150,105,.08), rgba(5,150,105,.02));
+  border-color: rgba(167,243,208,.15);
+}
+
+/* Detail content fade-in — masks height change when skeleton → content */
+.animate-detail-fade-in {
+  animation: detail-fade-in 200ms ease-out both;
+}
+@keyframes detail-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Modal animations */
+.animate-modal-in {
+  animation: modal-in 200ms ease-out both;
+}
+.animate-modal-out {
+  animation: modal-out 180ms ease-in both;
+}
+.animate-backdrop-in {
+  animation: backdrop-in 200ms ease-out both;
+}
+.animate-backdrop-out {
+  animation: backdrop-out 180ms ease-in both;
+}
+
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes modal-out {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(8px); }
+}
+@keyframes backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes backdrop-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+/* Auth form inputs — per DESIGN.md Module 13.4 */
+.auth-input {
+  @apply w-full h-11 px-3.5 font-body-cjk text-sm text-foreground bg-card rounded-[4px]
+    border border-input transition-[border-color,box-shadow] duration-150;
+}
+.auth-input::placeholder { color: var(--muted-foreground); opacity: 0.5; }
+.auth-input:focus {
+  outline: none;
+  border-color: var(--brand-border);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 16%, transparent);
+}
+.auth-input-error {
+  border-color: var(--destructive);
+  background-color: color-mix(in srgb, var(--destructive) 7%, var(--card));
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .animate-blur-fade,
+  .animate-zone-in,
+  .animate-modal-in,
+  .animate-modal-out,
+  .animate-backdrop-in,
+  .animate-backdrop-out {
+    animation: none !important;
+    opacity: 1 !important;
+    filter: none !important;
+    transform: none !important;
+  }
+}
+
+/* FE-2(Wave C): 低成本"虚拟化"——离屏卡片跳过渲染(layout/paint),
+   contain-intrinsic-size 提供占位高度避免滚动条跳动。真虚拟化(DOM 回收)
+   留给后续;此方案零结构改动,对长列表滚动帧率立竿见影。 */
+.cv-auto {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 320px;
+}
+.cv-auto-event {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 180px;
+}

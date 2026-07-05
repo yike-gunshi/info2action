@@ -1,0 +1,545 @@
+{
+  "ai_summary": {
+    "provider": "minimax",
+    "model": "MiniMax-M2.7",
+    "api_key": "",
+    "api_base": "https://api.minimaxi.com/anthropic/v1",
+    "max_concurrency": 5,
+    "request_interval": 1.0,
+    "max_tokens": 12000
+  },
+  "actions": {
+    "auto_generate_enabled": false,
+    "auto_dedup_enabled": false
+  },
+  "global": {
+    "search_keywords": [],
+    "event_aggregation_ready": true,
+    "embedding_provider": "openrouter",
+    "clustering": {
+      "embedding_clustering_profile": "openrouter_text_embedding_3_small_conservative",
+      "stage1_high_confidence": 0.85,
+      "stage1_boundary_low": 0.7,
+      "representative_decay_tau_hours": 24,
+      "candidate_window_days": 30,
+      "temporal_candidate_window_days": 3,
+      "max_cluster_span_days": 7,
+      "summary_max_docs": 20,
+      "stage1_top_k": 10,
+      "stage1_cosine_min": 0.75,
+      "stage1_gray_cosine_min": 0.7,
+      "stage1_shadow_cosine_min": 0.65,
+      "stage1_gray_max_temporal_hours": 2,
+      "stage2_judge_workers": 8,
+      "stage2_judge_min_interval_sec": 0.5,
+      "cluster_summary_workers": 8,
+      "pipeline_timeout_sec": 7200
+    }
+  },
+  "twitter": {
+    "following_count": 50,
+    "for_you_count": 50
+  },
+  "xiaohongshu": {
+    "enabled": false,
+    "feed": {
+      "batches": 3,
+      "batch_delay_s": 6,
+      "detail_delay_s": 2,
+      "target": 25,
+      "comments_per_note": 5
+    },
+    "search": {
+      "extra_keywords": [
+        "AI效率",
+        "AI编程"
+      ],
+      "sort": "latest",
+      "max_per_keyword": 20
+    },
+    "filter": {
+      "feed": {
+        "enabled": true,
+        "keywords_include": [
+          "AI",
+          "Claude",
+          "GPT",
+          "LLM",
+          "Agent",
+          "MCP",
+          "Cursor",
+          "编程",
+          "代码",
+          "开发",
+          "产品",
+          "技术",
+          "科技",
+          "创业",
+          "认知",
+          "思维",
+          "底层逻辑",
+          "成长",
+          "学习",
+          "效率",
+          "工具",
+          "自动化",
+          "机器人",
+          "模型",
+          "算法",
+          "OpenAI",
+          "Anthropic",
+          "Google",
+          "Gemini",
+          "Copilot",
+          "prompt",
+          "token",
+          "API",
+          "开源",
+          "openclaw",
+          "龙虾",
+          "vibe coding"
+        ],
+        "keywords_exclude": [
+          "明星",
+          "八卦",
+          "追星",
+          "偶遇",
+          "恋爱",
+          "分手",
+          "美妆",
+          "穿搭",
+          "减肥",
+          "瘦身"
+        ]
+      },
+      "search": {
+        "enabled": true,
+        "min_likes": 5,
+        "min_collects": 0,
+        "min_total_engagement": 10
+      }
+    }
+  },
+  "bilibili": {
+    "up_list": [
+      {
+        "name": "影视飓风",
+        "uid": "946974",
+        "tags": [
+          "科技",
+          "科普"
+        ]
+      },
+      {
+        "name": "罗永浩的十字路口",
+        "uid": "538596213",
+        "tags": [
+          "播客",
+          "商业"
+        ]
+      },
+      {
+        "name": "唯一讲述者",
+        "uid": "278761367",
+        "tags": [
+          "科普",
+          "商业"
+        ]
+      },
+      {
+        "name": "史诗级韭菜",
+        "uid": "322005137",
+        "tags": [
+          "投资",
+          "财经"
+        ]
+      },
+      {
+        "name": "姜Dora在此",
+        "uid": "16385920",
+        "tags": [
+          "认知",
+          "访谈"
+        ]
+      },
+      {
+        "name": "林亦LYi",
+        "uid": "4401694",
+        "tags": [
+          "AI",
+          "科技"
+        ]
+      },
+      {
+        "name": "赛文乔伊",
+        "uid": "39613022",
+        "tags": [
+          "AI",
+          "工具"
+        ]
+      },
+      {
+        "name": "通往AGI之路",
+        "uid": "259768893",
+        "tags": [
+          "AI",
+          "科普"
+        ]
+      },
+      {
+        "name": "图灵的猫",
+        "uid": "371846699",
+        "tags": [
+          "AI",
+          "科普"
+        ]
+      },
+      {
+        "name": "漫士沉思录",
+        "uid": "266765166",
+        "tags": [
+          "AI",
+          "学术"
+        ]
+      },
+      {
+        "name": "码农高天",
+        "uid": "245645656",
+        "tags": [
+          "编程",
+          "Python"
+        ]
+      },
+      {
+        "name": "沧海九粟",
+        "uid": "28357052",
+        "tags": [
+          "AI",
+          "LangChain"
+        ]
+      },
+      {
+        "name": "AI进化论-花生",
+        "uid": "14097567",
+        "tags": [
+          "AI",
+          "产品"
+        ]
+      },
+      {
+        "name": "超能汽水",
+        "uid": "1414929244",
+        "tags": [
+          "AI",
+          "科普"
+        ]
+      },
+      {
+        "name": "硅谷101",
+        "uid": "508452265",
+        "tags": [
+          "播客",
+          "科技"
+        ]
+      },
+      {
+        "name": "张小珺商业访谈录",
+        "uid": "280780745",
+        "tags": [
+          "访谈",
+          "商业"
+        ]
+      },
+      {
+        "name": "乱翻书播客",
+        "uid": "27429603",
+        "tags": [
+          "播客",
+          "商业"
+        ]
+      },
+      {
+        "name": "晚点LatePost",
+        "uid": "478559884",
+        "tags": [
+          "商业",
+          "深度"
+        ]
+      },
+      {
+        "name": "北京青年x壹次访谈录",
+        "uid": "1266160043",
+        "tags": [
+          "访谈",
+          "认知"
+        ]
+      },
+      {
+        "name": "老奇好好奇",
+        "uid": "35894872",
+        "tags": [
+          "科普",
+          "认知"
+        ]
+      },
+      {
+        "name": "IC实验室",
+        "uid": "486287787",
+        "tags": [
+          "商业",
+          "消费"
+        ]
+      },
+      {
+        "name": "全嘻嘻",
+        "uid": "25637408",
+        "tags": [
+          "认知",
+          "访谈"
+        ]
+      },
+      {
+        "name": "大小马聊科技",
+        "uid": "15503525",
+        "tags": [
+          "播客",
+          "AI"
+        ]
+      },
+      {
+        "name": "知安局",
+        "uid": "515019371",
+        "tags": [
+          "AI",
+          "科普"
+        ]
+      },
+      {
+        "name": "WhynotTV",
+        "uid": "14145636",
+        "tags": [
+          "播客",
+          "访谈"
+        ]
+      },
+      {
+        "name": "小Lin说",
+        "uid": "520819684",
+        "tags": [
+          "财经",
+          "科普"
+        ]
+      },
+      {
+        "name": "严伯钧",
+        "uid": "11914415",
+        "tags": [
+          "AI",
+          "创业"
+        ]
+      },
+      {
+        "name": "我是小崔Leo",
+        "uid": "1251430013",
+        "tags": [
+          "科技",
+          "投资"
+        ]
+      },
+      {
+        "name": "Git源宝",
+        "uid": "38061207",
+        "tags": [
+          "AI",
+          "工具"
+        ]
+      },
+      {
+        "name": "跟李沐学AI",
+        "uid": "1567748478",
+        "tags": [
+          "AI",
+          "学术"
+        ]
+      },
+      {
+        "name": "GenJi是真想教会你",
+        "uid": "49746395",
+        "tags": [
+          "AI",
+          "教程"
+        ]
+      },
+      {
+        "name": "SchelleyYuki",
+        "uid": "2630977",
+        "tags": [
+          "编程",
+          "全栈"
+        ]
+      },
+      {
+        "name": "老石谈芯",
+        "uid": "612932327",
+        "tags": [
+          "芯片",
+          "科普"
+        ]
+      },
+      {
+        "name": "柴知道",
+        "uid": "26798384",
+        "tags": [
+          "科普",
+          "知识"
+        ]
+      },
+      {
+        "name": "温竣岩",
+        "uid": "2026173074",
+        "tags": [
+          "传播学",
+          "哲学"
+        ]
+      },
+      {
+        "name": "底层原理",
+        "uid": "26606146",
+        "tags": [
+          "脑科学",
+          "认知"
+        ]
+      },
+      {
+        "name": "思维实验室",
+        "uid": "14583962",
+        "tags": [
+          "思维",
+          "认知"
+        ]
+      },
+      {
+        "name": "亿点点不一样",
+        "uid": "407054668",
+        "tags": [
+          "科普",
+          "知识"
+        ]
+      },
+      {
+        "name": "付鹏的财经世界",
+        "uid": "662660667",
+        "tags": [
+          "财经",
+          "投资"
+        ]
+      },
+      {
+        "name": "鹤老师说经济",
+        "uid": "493805437",
+        "tags": [
+          "经济",
+          "认知"
+        ]
+      },
+      {
+        "name": "36氪",
+        "uid": "90183256",
+        "tags": [
+          "科技",
+          "商业"
+        ]
+      }
+    ],
+    "videos_per_up": 3,
+    "hot_count": 10,
+    "rank_count": 10
+  },
+  "rss": {
+    "feeds": [
+      {
+        "name": "Simon Willison",
+        "slug": "simonwillison",
+        "url": "https://simonwillison.net/atom/everything/"
+      },
+      {
+        "name": "The Gradient",
+        "slug": "gradient",
+        "url": "https://thegradient.pub/rss/"
+      },
+      {
+        "name": "Lilian Weng",
+        "slug": "lilianweng",
+        "url": "https://lilianweng.github.io/index.xml"
+      },
+      {
+        "name": "Import AI (Jack Clark)",
+        "slug": "importai",
+        "url": "https://importai.substack.com/feed"
+      },
+      {
+        "name": "Stratechery",
+        "slug": "stratechery",
+        "url": "https://stratechery.com/feed/"
+      },
+      {
+        "name": "The Verge - AI",
+        "slug": "verge-ai",
+        "url": "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"
+      },
+      {
+        "name": "MIT Tech Review - AI",
+        "slug": "mit-ai",
+        "url": "https://www.technologyreview.com/topic/artificial-intelligence/feed"
+      },
+      {
+        "name": "Hacker News Best",
+        "slug": "hn-best",
+        "url": "https://hnrss.org/best"
+      }
+    ]
+  },
+  "hackernews": {
+    "count": 30
+  },
+  "reddit": {
+    "subreddits": [
+      "ClaudeAI",
+      "OpenAI",
+      "singularity",
+      "MachineLearning",
+      "LocalLLaMA",
+      "artificial"
+    ],
+    "count": 25
+  },
+  "lingowhale": {
+    "_credentials_note": "BF-0419-10: 凭证已迁移到 .env (LINGOWHALE_AUTH_TOKEN / ACCESS_TOKEN / UID / BID / GUEST_ID),取值步骤见 docs/配置指南.md",
+    "max_items": 3000,
+    "enrich_days": 3,
+    "fetch_lookback_hours": 48,
+    "max_pages": 20,
+    "enabled": true
+  },
+  "wechat_exporter": {
+    "api_base": "https://down.mptext.top",
+    "auth_key": "",
+    "enabled": true
+  },
+  "github_trending": {
+    "spoken_languages": [
+      "zh",
+      ""
+    ],
+    "since": "daily",
+    "count": 25
+  },
+  "display": {
+    "github_min_stars": 50
+  },
+  "discord": {
+    "forum_channel_id": "1485850914492383392",
+    "manager_user_id": "1471536997783965728",
+    "tags": {}
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "_meta": {
+    "since": "2026-05-12",
+    "version": "v16.0",
+    "doc": "v16.0 起 keyword search 全部下线（Twitter / B 站 / GitHub 不再按 search:keyword 抓取）。本文件保留为空，避免 routes/fetch.py / routes/feed.py / routes/config.py / backfill_since.py 等历史调用点 raise；topics 数组留空表示无可用 topic，相关 API 端点事实上空跑。决策稿见 docs/讨论/频道精简/2026-05-12-频道精简-需求讨论.md §4.1 边界 B2 + 决策 §4.2 各平台 search 删除。"
+  },
+  "topics": []
+}

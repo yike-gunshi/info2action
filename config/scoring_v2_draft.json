@@ -1,0 +1,64 @@
+{
+  "version": "scoring_v2_draft",
+  "_status": "OFFLINE DRAFT — 阶段一离线实验用，非线上配置。权重用档位（高/中/低），非小数；数据只整档纠偏，不拟合小数。不替代 classification.json。",
+  "feature": "cluster-highlight-scoring-v2",
+  "_grounding": "档位参照 data/highlights_score_calibration/snapshot.jsonl 真实 item 分布和首轮 51 条人工偏好诊断设定。精选采用多路径价值：重大新闻可走 importance/novelty，工具/教程/课程/开源项目可走 actionability/substance，benchmark/行业分析可走 credibility/substance，创作者方法/个人经验/有趣 AI 案例可走 novelty/substance/actionability。importance 只表示影响面，不是进精选的核心门槛。",
+  "scale": [1, 3],
+
+  "positive_dimensions": ["importance", "novelty", "credibility", "substance", "actionability"],
+
+  "tier_weights": {
+    "_note": "档位 → 相对权重。只用这三档，不用小数；调整只在档位间切换。",
+    "高": 3,
+    "中": 2,
+    "低": 1
+  },
+
+  "quality_formula": "先把每个维度分 (1-3) 归一为 (s-1)/2 ∈ {0,0.5,1}；quality_score = Σ(tier_weight × 归一分) / Σ(tier_weight) ∈ [0,1]。",
+
+  "default_profile": {
+    "_note": "未在 category_profiles 覆盖的分类用此默认。",
+    "importance": "中", "novelty": "中", "credibility": "中", "substance": "中", "actionability": "中"
+  },
+
+  "category_profiles": {
+    "models":           {"importance": "高", "novelty": "高", "credibility": "高", "substance": "中", "actionability": "低"},
+    "products":         {"importance": "中", "novelty": "高", "credibility": "中", "substance": "中", "actionability": "高"},
+    "industry":         {"importance": "中", "novelty": "中", "credibility": "高", "substance": "高", "actionability": "低"},
+    "eval":             {"importance": "中", "novelty": "中", "credibility": "高", "substance": "高", "actionability": "中"},
+    "tech":             {"importance": "中", "novelty": "中", "credibility": "中", "substance": "高", "actionability": "中"},
+    "investment":       {"importance": "中", "novelty": "中", "credibility": "高", "substance": "高", "actionability": "中"},
+    "startup":          {"importance": "中", "novelty": "中", "credibility": "中", "substance": "高", "actionability": "中"},
+    "tutorials":        {"importance": "低", "novelty": "中", "credibility": "中", "substance": "高", "actionability": "高"},
+    "coding":           {"importance": "中", "novelty": "中", "credibility": "中", "substance": "高", "actionability": "高"},
+    "efficiency_tools": {"importance": "中", "novelty": "高", "credibility": "中", "substance": "高", "actionability": "高"},
+    "skill":            {"importance": "中", "novelty": "高", "credibility": "中", "substance": "高", "actionability": "高"},
+    "creator":          {"importance": "中", "novelty": "高", "credibility": "中", "substance": "高", "actionability": "高"},
+    "events":           {"importance": "低", "novelty": "低", "credibility": "中", "substance": "低", "actionability": "低"},
+    "other":            {"importance": "中", "novelty": "中", "credibility": "中", "substance": "中", "actionability": "中"}
+  },
+
+  "spam": {
+    "_note": "spam=3 仅用于纯引流、无关卖货、无实质软广，该 item 不参选；标题党但有真实工具/方法/案例最多 spam=2。spam=2 quality 降一档；spam=1 不扣。multiplier 为粗粒度三值，非自由小数。",
+    "exclude_at": 3,
+    "penalty_multiplier": {"1": 1.0, "2": 0.8, "3": 0.0}
+  },
+
+  "time_decay": {
+    "_note": "G3：分类给基准半衰期，time_sensitivity 缩放它。effective_half_life = base_half_life_hours[category] × sensitivity_scale[time_sensitivity]；time_factor = 0.5 ^ (age_hours / effective_half_life)。系数同样是粗粒度三值。",
+    "base_half_life_hours": {
+      "products": 72, "efficiency_tools": 168, "coding": 168, "skill": 720,
+      "models": 72, "eval": 336, "tech": 336, "tutorials": 720,
+      "industry": 168, "creator": 168, "investment": 168, "startup": 336,
+      "events": 168, "other": 168
+    },
+    "sensitivity_scale": {"1": 4.0, "2": 1.0, "3": 0.4},
+    "age_fallback": "published_at -> fetched_at -> 缺则 time_factor=1（不惩罚）"
+  },
+
+  "thresholds": {
+    "_note": "三区阈值待阶段二人工标注校准；现在必须为 null，不预设。",
+    "high": null,
+    "low": null
+  }
+}
