@@ -38,6 +38,12 @@ def test_fetch_all_respects_per_run_data_dir():
     assert "$SOURCE_DIR/twitter/2-for-you-feed.json" in text
 
 
+def test_fetch_all_runs_x_user_channel():
+    text = (ROOT / "ops" / "fetch_all.sh").read_text()
+
+    assert "fetch_x_users.py" in text
+
+
 def test_hourly_twitter_pipeline_uses_inserted_run_scope():
     text = (ROOT / "ops" / "cron_hourly_twitter_timeline_pipeline.sh").read_text()
 

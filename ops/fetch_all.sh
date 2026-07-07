@@ -62,6 +62,9 @@ echo "  Bookmarks..."
 twitter bookmarks -n 20 --json -o "$SOURCE_DIR/twitter/4-bookmarks.json" >/dev/null 2>&1 || true
 echo "  ✅ Bookmarks"
 
+# X user registry sources
+"$PYTHON_BIN" "$BASE/src/fetch_x_users.py" 2>&1 || true
+
 echo ""
 
 # ============================================================
@@ -77,11 +80,12 @@ mkdir -p "$SOURCE_DIR/bilibili"
 "$PYTHON_BIN" "$BASE/src/fetch_bili_watch_later.py" 2>&1 | tail -2
 
 # ============================================================
-# 3. LINGOWHALE (公众号)
+# 3. WECHAT MP (Lingowhale primary + RSS supplement)
 # ============================================================
 echo ""
-echo "🐋 [3/5] 公众号订阅..."
+echo "🐋 [3/5] 公众号 (语鲸主力 + RSS 补充)..."
 "$PYTHON_BIN" "$BASE/src/fetch_lingowhale.py" 2>&1 || true
+"$PYTHON_BIN" "$BASE/src/fetch_feeds.py" --wechat 2>&1 || true
 
 # v16.0: 小红书 section 全部下线（抓取 + 前端 section 隐藏 + 收藏一并停）
 
@@ -90,7 +94,7 @@ echo "🐋 [3/5] 公众号订阅..."
 # ============================================================
 echo ""
 echo "📡 [4/5] RSS / HN / Reddit / GitHub (trending + awesome)..."
-"$PYTHON_BIN" "$BASE/src/fetch_feeds.py" 2>&1 || true
+"$PYTHON_BIN" "$BASE/src/fetch_feeds.py" --rss --hn --reddit --github 2>&1 || true
 
 # ============================================================
 # 5. WAYTOAGI (Feishu Wiki)
@@ -186,6 +190,15 @@ echo "  远程增量同步..."
 echo "================================================"
 echo ""
 /bin/bash "$BASE/ops/remote_sync_after_pipeline.sh" 2>&1 || true
+
+if [ "$RAW_ONLY" != true ]; then
+  echo ""
+  echo "================================================"
+  echo "  信源注册表快照备份..."
+  echo "================================================"
+  echo ""
+  "$PYTHON_BIN" "$BASE/scripts/snapshot_sources.py" 2>&1 || true
+fi
 
 echo ""
 echo "✅ 全部完成!"

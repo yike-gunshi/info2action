@@ -1,10 +1,11 @@
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode, UIEvent } from 'react'
-import { Activity, ArrowLeft, ChevronRight, Clock3, Copy, Database, Loader2, Plus, Trash2 } from 'lucide-react'
+import { Activity, AlertTriangle, ArrowLeft, CheckCircle2, ChevronRight, Clock3, Copy, Database, Loader2, Plus, RefreshCw, Settings2, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '../lib/utils'
 import { buildInfoItemHash } from '../lib/itemDeepLink'
+import { OverviewTab } from '../components/admin/OverviewTab'
 import {
   createInviteCodes,
   deleteInviteCode,
@@ -21,6 +22,75 @@ import {
   type FetchRunSummary,
   type InviteCode,
 } from '../lib/api'
+import {
+  getAdminSources,
+  createAdminSource,
+  validateAdminSource,
+  updateAdminSource,
+  deleteAdminSource,
+  reconcileLingowhaleSources,
+  getAdminSourceAlgoParams,
+  updateAdminSourceAlgoParams,
+} from '../lib/api'
+import type {
+  AdminSource,
+  AdminSourceGroup,
+  AdminSourceAlgoParams,
+  AdminSourcePreviewItem,
+  AdminSourceReconcileResponse,
+  AdminSourceValidateResponse,
+} from '../lib/api'
+
+type AdminTab = 'overview' | 'runs' | 'subscriptions' | 'access'
+const ADMIN_TABS: { key: AdminTab; label: string }[] = [
+  { key: 'overview', label: '总览' },
+  { key: 'runs', label: '抓取运行' },
+  { key: 'subscriptions', label: '订阅配置' },
+  { key: 'access', label: '用户与权限' },
+]
+
+const SOURCE_GROUP_PREVIEW_LIMIT = 20
+
+type SourceWizardStep = 1 | 2 | 3
+
+type WizardPlatform = 'wechat_mp' | 'x_user' | 'rss' | 'reddit' | 'github_repo' | 'bilibili_up'
+
+const SOURCE_PLATFORM_OPTIONS: Array<{
+  value: WizardPlatform
+  label: string
+  helper: string
+  disabled?: boolean
+}> = [
+  { value: 'wechat_mp', label: '公众号', helper: '粘贴公众号 RSS URL（从 we-mp-rss / Wechat2RSS 等服务获取）' },
+  { value: 'x_user', label: 'X', helper: '只输入 handle，不含 @，最长 15 位' },
+  { value: 'rss', label: 'RSS', helper: '输入 http(s) feed URL' },
+  { value: 'reddit', label: 'Reddit', helper: '输入 subreddit 名，不含 r/' },
+  { value: 'github_repo', label: 'GitHub', helper: '输入 owner/repo' },
+  { value: 'bilibili_up', label: 'B站', helper: '抓取管线未接入', disabled: true },
+]
+
+const ALGO_PARAM_SPECS: Array<{
+  key: keyof AdminSourceAlgoParams
+  label: string
+  min: number
+  max: number
+  note: string
+}> = [
+  { key: 'hackernews_count', label: 'Hacker News 数量', min: 1, max: 500, note: 'HN top 抓取条数' },
+  { key: 'github_trending_count', label: 'GitHub Trending 数量', min: 1, max: 500, note: 'trending 仓库条数' },
+  { key: 'twitter_following_count', label: 'X Following 数量', min: 1, max: 500, note: '过渡期 following feed' },
+  { key: 'twitter_for_you_count', label: 'X For You 数量', min: 1, max: 500, note: '个性化推荐流' },
+  { key: 'bilibili_hot_count', label: 'B站热门数量', min: 1, max: 500, note: '热门榜抓取条数' },
+  { key: 'bilibili_rank_count', label: 'B站排行数量', min: 1, max: 500, note: '排行榜抓取条数' },
+  { key: 'bilibili_videos_per_up', label: 'B站每 UP 视频数', min: 1, max: 100, note: '单个 UP 视频上限' },
+]
+
+function readAdminTab(): AdminTab {
+  const hash = window.location.hash.slice(1) // e.g. "admin/runs"
+  const sub = hash.split('?')[0].split('/')[1] as AdminTab | undefined
+  if (sub === 'runs' || sub === 'subscriptions' || sub === 'access') return sub
+  return 'overview'
+}
 
 const RUN_PAGE_SIZE = 50
 const INVITE_COUNT_PRESETS = [
@@ -111,8 +181,21 @@ export function AdminPage() {
   const [runsHasMore, setRunsHasMore] = useState(true)
   const [runsLoadingMore, setRunsLoadingMore] = useState(false)
   const runsLoadingMoreRef = useRef(false)
+  const [activeTab, setActiveTab] = useState<AdminTab>(() => readAdminTab())
+  const [reloadSignal, setReloadSignal] = useState(0)
 
   useEffect(() => {
+    const onHash = () => setActiveTab(readAdminTab())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  function navTab(tab: AdminTab) {
+    window.location.hash = tab === 'overview' ? 'admin' : `admin/${tab}`
+  }
+
+  const loadAdminData = useCallback(() => {
+    setLoading(true)
     getAdminOverview()
       .then((overview) => {
         setCodes(overview.codes)
@@ -141,6 +224,15 @@ export function AdminPage() {
       .catch((err) => toast.error(err.message))
       .finally(() => setLoading(false))
   }, [])
+
+  useEffect(() => {
+    loadAdminData()
+  }, [loadAdminData])
+
+  function handleRefresh() {
+    loadAdminData()
+    setReloadSignal((n) => n + 1)
+  }
 
   async function handleSelectRun(runId: number) {
     const localRun = runs.find((run) => run.id === runId)
@@ -324,12 +416,8 @@ export function AdminPage() {
   const selectedRunAiLabel = selectedRun ? getRunAiLabel(selectedRun) : '—'
   const selectedRunPublishedEvents = selectedRun ? getRunPublishedEvents(selectedRun) : null
 
-  if (loading) {
-    return <AdminSkeleton />
-  }
-
   return (
-    <div className="min-h-screen bg-background">
+    <div className="admin-scope min-h-screen bg-background">
       <header className="sticky top-0 z-50 flex items-center gap-3 px-4 h-14 bg-card border-b border-border">
         <a
           href="#"
@@ -338,28 +426,59 @@ export function AdminPage() {
         >
           <ArrowLeft className="w-4 h-4" />
         </a>
-        <h1 className="text-base font-semibold text-foreground">管理面板</h1>
-        <div className="ml-auto hidden sm:flex items-center gap-2 text-[12px] text-muted-foreground">
-          <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2 py-1">
-            <Activity className="w-3.5 h-3.5" />
-            抓取观测台
-          </span>
-          <span>已加载 {runs.length} 次</span>
+        <h1 className="text-base font-semibold text-foreground hidden sm:block">管理面板</h1>
+        <nav className="flex items-stretch gap-0.5 h-full ml-1" aria-label="管理面板导航">
+          {ADMIN_TABS.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => navTab(t.key)}
+              className={cn(
+                'px-3 font-body-cjk text-sm border-b-2 -mb-px transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-inset',
+                activeTab === t.key
+                  ? 'text-foreground font-semibold border-primary'
+                  : 'text-muted-foreground border-transparent hover:text-foreground',
+              )}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+        <div className="ml-auto flex items-center gap-2 text-[12px] text-muted-foreground">
+          <button
+            onClick={handleRefresh}
+            disabled={loading}
+            className="inline-flex h-8 items-center gap-1.5 rounded-[4px] border border-border bg-card px-2.5 font-body-cjk text-sm font-medium hover:border-muted-foreground disabled:opacity-50 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            aria-label="刷新"
+          >
+            <RefreshCw className={cn('w-3.5 h-3.5', loading && 'animate-spin')} />
+            <span className="hidden sm:inline">刷新</span>
+          </button>
         </div>
       </header>
 
-      <main className="max-w-[1280px] mx-auto px-4 py-8 space-y-6">
-        <section className="bg-card border border-border rounded-lg overflow-hidden shadow-subtle">
-          <div className="flex items-center justify-between gap-4 px-5 py-4">
-            <div>
-              <h2 className="text-[15px] font-semibold text-foreground">抓取运行</h2>
-              <p className="mt-1 text-[12px] text-muted-foreground">本轮新增入库、AI 总结和事件发布的对账面板</p>
-            </div>
-            <div className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
-              <Activity className="w-3.5 h-3.5" />
-              已加载 {runs.length} 次
-            </div>
-          </div>
+      <main className="max-w-[1280px] mx-auto px-4 py-8">
+        {activeTab === 'overview' && (
+          <OverviewTab reloadSignal={reloadSignal} onOpenRuns={() => navTab('runs')} />
+        )}
+
+        {activeTab === 'subscriptions' && <SubscriptionConfigTab />}
+
+        {activeTab === 'runs' &&
+          (loading ? (
+            <TabLoading />
+          ) : (
+            <div className="space-y-6">
+              <section className="bg-card border border-border rounded-md overflow-hidden">
+                <div className="flex items-center justify-between gap-4 px-5 py-4">
+                  <div>
+                    <h2 className="text-[15px] font-semibold text-foreground">抓取运行</h2>
+                    <p className="mt-1 text-[12px] text-muted-foreground">本轮新增入库、AI 总结和事件发布的对账面板</p>
+                  </div>
+                  <div className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
+                    <Activity className="w-3.5 h-3.5" />
+                    已加载 {runs.length} 次
+                  </div>
+                </div>
 
           {runs.length === 0 ? (
             <p className="text-sm text-muted-foreground py-10 text-center border-t border-border">暂无抓取记录</p>
@@ -468,7 +587,7 @@ export function AdminPage() {
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                      <div className="rounded-lg border border-border bg-background p-4">
+                      <div className="rounded-md border border-border bg-background p-4">
                         <h3 className="text-[13px] font-semibold text-foreground mb-2">阶段耗时</h3>
                         {stageRows.length === 0 ? (
                           <p className="text-sm text-muted-foreground py-3">暂无阶段耗时</p>
@@ -484,7 +603,7 @@ export function AdminPage() {
                         )}
                       </div>
 
-                      <div className="rounded-lg border border-border bg-background p-4">
+                      <div className="rounded-md border border-border bg-background p-4">
                         <h3 className="text-[13px] font-semibold text-foreground mb-2">Pill 分布</h3>
                         {pillRows.length === 0 ? (
                           <p className="text-sm text-muted-foreground py-3">暂无 pill 数据</p>
@@ -509,7 +628,7 @@ export function AdminPage() {
                       {platformSourceRows.length === 0 ? (
                         <p className="text-sm text-muted-foreground py-3">暂无 source 新增数据</p>
                       ) : (
-                        <div className="overflow-auto border border-border rounded-lg bg-card">
+                        <div className="overflow-auto border border-border rounded-md bg-card">
                           <table className="w-full text-sm">
                             <thead className="sticky top-0 z-10">
                               <tr className="bg-secondary text-muted-foreground text-[12px] font-semibold">
@@ -620,8 +739,7 @@ export function AdminPage() {
           )}
         </section>
 
-        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.15fr)_minmax(380px,0.85fr)] gap-6 items-start">
-          <section className="bg-card border border-border rounded-lg p-5 min-w-0 shadow-subtle">
+              <section className="bg-card border border-border rounded-md p-5 min-w-0">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-[15px] font-semibold text-foreground">Embedding 用量</h2>
               <div className="text-[12px] text-muted-foreground">最近 24 小时</div>
@@ -645,7 +763,7 @@ export function AdminPage() {
                     {embSourceRows.length === 0 ? (
                       <p className="text-sm text-muted-foreground py-3">暂无来源数据</p>
                     ) : (
-                      <div className="overflow-auto border border-border rounded-lg max-h-[360px]">
+                      <div className="overflow-auto border border-border rounded-md max-h-[360px]">
                         <table className="w-full min-w-[420px] text-sm">
                           <thead className="sticky top-0 z-10">
                             <tr className="bg-secondary text-muted-foreground text-[12px] font-semibold">
@@ -678,7 +796,7 @@ export function AdminPage() {
                     {embLogs.length === 0 ? (
                       <p className="text-sm text-muted-foreground py-3">暂无调用明细</p>
                     ) : (
-                      <div className="overflow-auto border border-border rounded-lg max-h-[360px]">
+                      <div className="overflow-auto border border-border rounded-md max-h-[360px]">
                         <table className="w-full min-w-[520px] text-sm">
                           <thead className="sticky top-0 z-10">
                             <tr className="bg-secondary text-muted-foreground text-[12px] font-semibold">
@@ -710,16 +828,23 @@ export function AdminPage() {
                 </div>
               </div>
             )}
-          </section>
+              </section>
+            </div>
+          ))}
 
-          <section className="bg-card border border-border rounded-lg p-5 min-w-0 shadow-subtle">
+        {activeTab === 'access' &&
+          (loading ? (
+            <TabLoading />
+          ) : (
+            <section className="bg-card border border-border rounded-md p-5 min-w-0">
             <div className="flex items-center justify-between gap-4 mb-4">
               <h2 className="text-[15px] font-semibold text-foreground">权限管理</h2>
               <button
                 onClick={copyUnusedCodes}
                 className={cn(
-                  'inline-flex items-center gap-1.5 px-3 py-2 text-[13px] font-semibold rounded-lg transition-colors',
+                  'inline-flex h-8 items-center gap-1.5 rounded-[4px] px-2.5 font-body-cjk text-sm font-medium transition-colors',
                   'text-muted-foreground bg-secondary hover:text-foreground hover:bg-muted',
+                  'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-background',
                 )}
               >
                 <Copy className="w-3.5 h-3.5" />
@@ -763,8 +888,9 @@ export function AdminPage() {
                     onClick={handleGenerate}
                     disabled={generating}
                     className={cn(
-                      'inline-flex h-9 items-center justify-center gap-1.5 self-end px-3 text-[13px] font-semibold rounded-lg transition-colors',
-                      'text-primary bg-accent hover:bg-primary hover:text-white',
+                      'inline-flex h-9 items-center justify-center gap-1.5 self-end px-3 font-body-cjk text-sm font-medium rounded-[4px] transition-colors',
+                      'text-primary bg-accent hover:bg-primary hover:text-primary-foreground',
+                      'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-background',
                       'disabled:opacity-50 disabled:cursor-not-allowed',
                     )}
                   >
@@ -780,7 +906,7 @@ export function AdminPage() {
                         setInviteCount(preset.count)
                         setInviteMaxUses(preset.maxUses)
                       }}
-                      className="px-2.5 py-1.5 text-[12px] font-medium rounded-md border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                      className="px-2.5 py-1.5 font-body-cjk text-[12px] font-medium rounded-[4px] border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                     >
                       {preset.label}
                     </button>
@@ -790,7 +916,7 @@ export function AdminPage() {
                 {codes.length === 0 ? (
                   <p className="text-sm text-muted-foreground py-4 text-center">暂无邀请码</p>
                 ) : (
-                  <div className="overflow-auto border border-border rounded-lg max-h-[220px]">
+                  <div className="overflow-auto border border-border rounded-md max-h-[220px]">
                     <table className="w-full text-sm">
                       <thead className="sticky top-0 z-10">
                         <tr className="bg-secondary text-muted-foreground text-[12px] font-semibold">
@@ -824,7 +950,7 @@ export function AdminPage() {
                                 <div className="flex items-center justify-end gap-1">
                                   <button
                                     onClick={() => copyCode(c.code)}
-                                    className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                                    className="p-1.5 rounded-[4px] text-muted-foreground hover:text-foreground hover:bg-muted transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]"
                                     title="复制"
                                   >
                                     <Copy className="w-3.5 h-3.5" />
@@ -832,7 +958,7 @@ export function AdminPage() {
                                   {st.kind === 'unused' && (
                                     <button
                                       onClick={() => handleDelete(c.code)}
-                                      className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                                      className="p-1.5 rounded-[4px] text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]"
                                       title="删除"
                                     >
                                       <Trash2 className="w-3.5 h-3.5" />
@@ -854,7 +980,7 @@ export function AdminPage() {
                 {users.length === 0 ? (
                   <p className="text-sm text-muted-foreground py-4 text-center">暂无用户</p>
                 ) : (
-                  <div className="overflow-auto border border-border rounded-lg max-h-[260px]">
+                  <div className="overflow-auto border border-border rounded-md max-h-[260px]">
                     <table className="w-full text-sm">
                       <thead className="sticky top-0 z-10">
                         <tr className="bg-secondary text-muted-foreground text-[12px] font-semibold">
@@ -886,12 +1012,818 @@ export function AdminPage() {
                 )}
               </div>
             </div>
-          </section>
-        </div>
+            </section>
+          ))}
       </main>
     </div>
   )
 }
+
+function TabLoading() {
+  return (
+    <div className="flex items-center justify-center gap-2 py-20 text-[13px] text-muted-foreground">
+      <Loader2 className="w-4 h-4 animate-spin" />
+      加载中…
+    </div>
+  )
+}
+
+function SubscriptionConfigTab() {
+  const [groups, setGroups] = useState<AdminSourceGroup[]>([])
+  const [total, setTotal] = useState(0)
+  const [algoParams, setAlgoParams] = useState<AdminSourceAlgoParams | null>(null)
+  const [algoDraft, setAlgoDraft] = useState<Record<keyof AdminSourceAlgoParams, string>>(emptyAlgoDraft)
+  const [algoError, setAlgoError] = useState<string | null>(null)
+  const [reconcile, setReconcile] = useState<AdminSourceReconcileResponse | null>(null)
+  const [showReconcileList, setShowReconcileList] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [expandedPlatforms, setExpandedPlatforms] = useState<Set<string>>(new Set())
+  const [savingSourceId, setSavingSourceId] = useState<number | null>(null)
+  const [savingAlgo, setSavingAlgo] = useState(false)
+  const [importingMissing, setImportingMissing] = useState(false)
+  const [wizardOpen, setWizardOpen] = useState(false)
+
+  async function load() {
+    setLoading(true)
+    setError(null)
+    try {
+      const [sourceRes, algoRes, reconcileRes] = await Promise.all([
+        getAdminSources(),
+        getAdminSourceAlgoParams(),
+        reconcileLingowhaleSources(),
+      ])
+      setGroups(sourceRes.groups)
+      setTotal(sourceRes.total)
+      setAlgoParams(algoRes.params)
+      setAlgoDraft(algoParamsToDraft(algoRes.params))
+      setReconcile(reconcileRes)
+      setShowReconcileList(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '加载订阅配置失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  async function refreshSourcesOnly() {
+    const sourceRes = await getAdminSources()
+    setGroups(sourceRes.groups)
+    setTotal(sourceRes.total)
+  }
+
+  async function handleStatus(source: AdminSource, status: 'active' | 'paused') {
+    setSavingSourceId(source.id)
+    try {
+      const res = await updateAdminSource(source.id, { status })
+      setGroups((prev) => replaceSourceInGroups(prev, res.source))
+      toast.success(status === 'active' ? '已启用' : '已停用')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '更新信源失败')
+    } finally {
+      setSavingSourceId(null)
+    }
+  }
+
+  async function handleDelete(source: AdminSource) {
+    if (!window.confirm(`确认删除 ${source.display_name || source.source_key}？`)) return
+    setSavingSourceId(source.id)
+    try {
+      await deleteAdminSource(source.id)
+      setGroups((prev) => removeSourceFromGroups(prev, source.id))
+      setTotal((prev) => Math.max(prev - 1, 0))
+      toast.success('已删除')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '删除信源失败')
+    } finally {
+      setSavingSourceId(null)
+    }
+  }
+
+  async function handleSaveAlgo() {
+    const parsed = parseAlgoDraft(algoDraft)
+    if ('error' in parsed) {
+      setAlgoError(parsed.error)
+      return
+    }
+    setAlgoError(null)
+    setSavingAlgo(true)
+    try {
+      const res = await updateAdminSourceAlgoParams(parsed.params)
+      setAlgoParams(res.params)
+      setAlgoDraft(algoParamsToDraft(res.params))
+      toast.success('算法源参数已保存')
+    } catch (err) {
+      setAlgoError(err instanceof Error ? err.message : '保存算法源参数失败')
+    } finally {
+      setSavingAlgo(false)
+    }
+  }
+
+  async function handleImportMissing() {
+    const missing = reconcile?.missing ?? []
+    if (missing.length === 0) return
+    setImportingMissing(true)
+    try {
+      const res = await reconcileLingowhaleSources({ import_keys: missing.map((item) => item.source_key) })
+      setReconcile(res)
+      await refreshSourcesOnly()
+      toast.success(`已导入 ${res.imported.length} 个订阅`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '导入语鲸订阅失败')
+    } finally {
+      setImportingMissing(false)
+    }
+  }
+
+  function handleCreated(source: AdminSource) {
+    setGroups((prev) => appendSourceToGroups(prev, source))
+    setTotal((prev) => prev + 1)
+  }
+
+  const latestUpdatedAt = latestSourceUpdatedAt(groups)
+  const missing = reconcile?.missing ?? []
+
+  if (loading) {
+    return <SubscriptionSkeleton />
+  }
+
+  if (error) {
+    return (
+      <section className="bg-card border border-border rounded-lg p-5 shadow-subtle">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-[15px] font-semibold text-foreground">订阅配置</h2>
+            <p className="mt-2 text-sm text-destructive">{error}</p>
+          </div>
+          <button
+            type="button"
+            onClick={load}
+            className="inline-flex h-9 items-center justify-center rounded-lg bg-accent px-3 text-[13px] font-semibold text-primary hover:bg-primary hover:text-white"
+          >
+            重试
+          </button>
+        </div>
+      </section>
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <button
+          type="button"
+          onClick={() => setWizardOpen(true)}
+          className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-primary px-3 text-[13px] font-semibold text-primary-foreground hover:bg-primary/90 md:w-auto"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          添加信源
+        </button>
+        <div className="text-[12px] text-muted-foreground tabular-nums">
+          注册表快照时间 {latestUpdatedAt ? formatAdminDate(latestUpdatedAt) : '—'} · {formatAdminNumber(total)} 个
+        </div>
+      </div>
+
+      {missing.length > 0 && (
+        <section className="rounded-lg border border-amber-300/60 bg-amber-50 px-4 py-3 text-[13px] text-amber-900">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div className="inline-flex items-center gap-2 font-semibold">
+              <AlertTriangle className="w-4 h-4" />
+              <span>语鲸侧有 {missing.length} 个未纳管订阅</span>
+              <span className="font-normal text-amber-800">当前不会被抓取</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowReconcileList((prev) => !prev)}
+              className="self-start rounded-md px-2.5 py-1.5 text-[12px] font-semibold text-amber-900 hover:bg-amber-100 md:self-auto"
+            >
+              查看并导入
+            </button>
+          </div>
+          {showReconcileList && (
+            <div className="mt-3 rounded-lg border border-amber-300/60 bg-card p-3">
+              <div className="grid gap-2 md:grid-cols-2">
+                {missing.map((item) => (
+                  <div key={item.source_key} className="rounded-md border border-border bg-background px-3 py-2">
+                    <div className="text-[13px] font-semibold text-foreground">{item.display_name}</div>
+                    <div className="mt-0.5 text-[12px] text-muted-foreground">{item.source_key}</div>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={handleImportMissing}
+                disabled={importingMissing}
+                className="mt-3 inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-accent px-3 text-[12px] font-semibold text-primary hover:bg-primary hover:text-white disabled:opacity-50"
+              >
+                {importingMissing && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                导入全部
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      <section className="bg-card border border-border rounded-lg overflow-hidden shadow-subtle">
+        <div className="flex items-center justify-between gap-4 px-5 py-4">
+          <div>
+            <h2 className="text-[15px] font-semibold text-foreground">名单型信源总览</h2>
+            <p className="mt-1 text-[12px] text-muted-foreground">按平台管理 source_key、状态和近 7 日入库健康度</p>
+          </div>
+          <div className="text-[12px] text-muted-foreground tabular-nums">{formatAdminNumber(total)} 个</div>
+        </div>
+        {groups.length === 0 ? (
+          <div className="border-t border-border px-5 py-12 text-center">
+            <p className="text-sm font-medium text-foreground">注册表为空</p>
+            <p className="mt-1 text-[12px] text-muted-foreground">可以先通过添加信源或对账导入建立注册表。</p>
+          </div>
+        ) : (
+          <div className="divide-y divide-border border-t border-border">
+            {groups.map((group) => (
+              <SourceGroupPanel
+                key={group.platform}
+                group={group}
+                expanded={expandedPlatforms.has(group.platform)}
+                onToggleExpand={() => {
+                  setExpandedPlatforms((prev) => {
+                    const next = new Set(prev)
+                    if (next.has(group.platform)) next.delete(group.platform)
+                    else next.add(group.platform)
+                    return next
+                  })
+                }}
+                onStatus={handleStatus}
+                onDelete={handleDelete}
+                savingSourceId={savingSourceId}
+              />
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section data-testid="algo-params-panel" className="bg-card border border-border rounded-lg p-5 shadow-subtle">
+        <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h2 className="text-[15px] font-semibold text-foreground">算法源区块</h2>
+            <p className="mt-1 text-[12px] text-muted-foreground">算法源没有名单，不能添加名字</p>
+          </div>
+          <button
+            type="button"
+            onClick={handleSaveAlgo}
+            disabled={savingAlgo || !algoParams}
+            className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-accent px-3 text-[13px] font-semibold text-primary hover:bg-primary hover:text-white disabled:opacity-50"
+          >
+            {savingAlgo ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Settings2 className="w-3.5 h-3.5" />}
+            保存参数
+          </button>
+        </div>
+        {algoError && <p className="mt-3 text-[12px] text-destructive">{algoError}</p>}
+        <div className="mt-4 grid grid-cols-[repeat(auto-fill,minmax(230px,1fr))] gap-3">
+          {ALGO_PARAM_SPECS.map((spec) => (
+            <label key={spec.key} className="rounded-lg border border-border bg-background p-3">
+              <span className="flex items-center justify-between gap-2">
+                <span className="text-[13px] font-semibold text-foreground">{spec.label}</span>
+                <span className={cn(
+                  'rounded-md px-2 py-0.5 text-[11px] font-semibold',
+                  spec.key === 'twitter_following_count'
+                    ? 'bg-amber-50 text-amber-700'
+                    : 'bg-accent text-primary',
+                )}>
+                  {spec.key === 'twitter_following_count' ? '过渡期' : '配置生效'}
+                </span>
+              </span>
+              <span className="mt-1 block text-[12px] text-muted-foreground">{spec.note}</span>
+              {spec.key === 'twitter_following_count' && (
+                <span className="mt-2 flex items-center justify-between gap-3 rounded-md border border-border bg-card px-2 py-1.5">
+                  <span className="text-[11px] text-muted-foreground">账号名单放量完成后在此关闭退役</span>
+                  <span className="inline-flex h-5 w-9 shrink-0 items-center rounded-full bg-muted px-0.5">
+                    <span className="h-4 w-4 rounded-full bg-muted-foreground/50" />
+                  </span>
+                </span>
+              )}
+              <input
+                aria-label={spec.label}
+                type="number"
+                min={spec.min}
+                max={spec.max}
+                value={algoDraft[spec.key]}
+                onChange={(event) => {
+                  setAlgoDraft((prev) => ({ ...prev, [spec.key]: event.target.value }))
+                  setAlgoError(null)
+                }}
+                className="mt-3 h-9 w-full rounded-md border border-border bg-card px-3 text-sm font-semibold text-foreground tabular-nums outline-none focus:border-primary"
+              />
+              <span className="mt-1 block text-[11px] text-muted-foreground">范围 {spec.min}-{spec.max}</span>
+            </label>
+          ))}
+        </div>
+      </section>
+
+      <AddSourceWizard
+        open={wizardOpen}
+        onClose={() => setWizardOpen(false)}
+        onCreated={handleCreated}
+      />
+    </div>
+  )
+}
+
+function SourceGroupPanel({
+  group,
+  expanded,
+  onToggleExpand,
+  onStatus,
+  onDelete,
+  savingSourceId,
+}: {
+  group: AdminSourceGroup
+  expanded: boolean
+  onToggleExpand: () => void
+  onStatus: (source: AdminSource, status: 'active' | 'paused') => void
+  onDelete: (source: AdminSource) => void
+  savingSourceId: number | null
+}) {
+  const visibleSources = expanded ? group.sources : group.sources.slice(0, SOURCE_GROUP_PREVIEW_LIMIT)
+  const anomalyCount = group.sources.filter((source) => source.status === 'broken' || source.health?.inserted_7d === 0).length
+  const notFetchedCount = group.sources.filter((source) => source.status === 'not_fetched').length
+
+  return (
+    <div>
+      <div className="flex flex-col gap-2 px-5 py-3 md:flex-row md:items-center md:justify-between">
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="text-[15px] font-semibold text-foreground">{platformLabel(group.platform)}</h3>
+          <span className="text-[12px] text-muted-foreground">
+            {group.sources.length} 个 · 显示{expanded ? '全部' : `前 ${Math.min(SOURCE_GROUP_PREVIEW_LIMIT, group.sources.length)}`}
+          </span>
+          {anomalyCount > 0 && (
+            <span className="rounded-md bg-destructive/10 px-2 py-0.5 text-[11px] font-semibold text-destructive">
+              {anomalyCount} 个异常
+            </span>
+          )}
+          {notFetchedCount > 0 && (
+            <span className="rounded-md bg-muted px-2 py-0.5 text-[11px] font-semibold text-muted-foreground">
+              {notFetchedCount} 个配置存在但未在抓
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] text-[13px]">
+          <thead>
+            <tr className="h-10 bg-secondary text-[12px] font-semibold text-muted-foreground">
+              <th className="min-w-[180px] px-5 text-left">名称</th>
+              <th className="px-3 text-left">状态</th>
+              <th className="px-3 text-right">最近抓取</th>
+              <th className="px-3 text-right">近7日入库</th>
+              <th className="px-5 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visibleSources.map((source) => {
+              const status = sourceStatusInfo(source)
+              const paused = source.status === 'paused'
+              const saving = savingSourceId === source.id
+              return (
+                <tr
+                  key={source.id}
+                  data-testid={`source-row-${source.id}`}
+                  className={cn(
+                    'h-10 border-t border-border transition-colors hover:bg-background',
+                    status.kind === 'error' && 'bg-destructive/5',
+                    paused && 'bg-muted/20 text-muted-foreground',
+                  )}
+                >
+                  <td className="px-5 py-2 align-middle">
+                    <div className={cn('font-medium', paused ? 'text-muted-foreground' : 'text-foreground')}>{source.display_name || source.source_key}</div>
+                    <div className="mt-0.5 text-[11px] text-muted-foreground">{source.source_key}</div>
+                  </td>
+                  <td className="px-3 py-2 align-middle">
+                    <span className={cn('inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold', status.cls)}>
+                      {status.label}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 text-right align-middle text-muted-foreground tabular-nums">
+                    {formatAdminDate(source.health?.last_fetched_at)}
+                  </td>
+                  <td className={cn('px-3 py-2 text-right align-middle font-semibold tabular-nums', status.kind === 'error' ? 'text-destructive' : 'text-foreground')}>
+                    {formatAdminNumber(source.health?.inserted_7d)}
+                  </td>
+                  <td className="px-5 py-2 text-right align-middle">
+                    <div className="inline-flex items-center justify-end gap-2 text-[12px] font-semibold">
+                      {source.status !== 'not_fetched' && (
+                        <button
+                          type="button"
+                          onClick={() => onStatus(source, source.status === 'paused' ? 'active' : 'paused')}
+                          disabled={saving}
+                          className="text-muted-foreground hover:text-foreground disabled:opacity-50"
+                        >
+                          {source.status === 'paused' ? '启用' : '停用'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onDelete(source)}
+                        disabled={saving}
+                        className="text-destructive hover:text-destructive/80 disabled:opacity-50"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      {group.sources.length > SOURCE_GROUP_PREVIEW_LIMIT && !expanded && (
+        <button
+          type="button"
+          onClick={onToggleExpand}
+          className="w-full border-t border-border px-5 py-2 text-left text-[12px] font-semibold text-primary hover:bg-accent"
+        >
+          展开全部 {group.sources.length} 个 ↓
+        </button>
+      )}
+    </div>
+  )
+}
+
+function AddSourceWizard({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean
+  onClose: () => void
+  onCreated: (source: AdminSource) => void
+}) {
+  const [step, setStep] = useState<SourceWizardStep>(1)
+  const [platform, setPlatform] = useState<WizardPlatform>('wechat_mp')
+  const [sourceKey, setSourceKey] = useState('')
+  const [validation, setValidation] = useState<AdminSourceValidateResponse | null>(null)
+  const [validationError, setValidationError] = useState<string | null>(null)
+  const [validating, setValidating] = useState(false)
+  const [creating, setCreating] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    setStep(1)
+    setPlatform('wechat_mp')
+    setSourceKey('')
+    setValidation(null)
+    setValidationError(null)
+    setValidating(false)
+    setCreating(false)
+  }, [open])
+
+  if (!open) return null
+
+  const platformOption = SOURCE_PLATFORM_OPTIONS.find((option) => option.value === platform)
+  const canValidate = sourceKey.trim().length > 0 && !validating
+
+  async function handleValidate() {
+    if (!canValidate) return
+    setValidating(true)
+    setValidation(null)
+    setValidationError(null)
+    try {
+      const res = await validateAdminSource({ platform, source_key: sourceKey.trim() })
+      setValidation(res)
+      if (res.status === 'ok' || res.status === 'empty') {
+        setStep(3)
+      }
+    } catch (err) {
+      setValidationError(err instanceof Error ? err.message : '校验失败')
+    } finally {
+      setValidating(false)
+    }
+  }
+
+  async function handleCreate() {
+    if (!validation || validation.status === 'deferred') return
+    setCreating(true)
+    try {
+      const res = await createAdminSource({
+        platform,
+        source_key: sourceKey.trim(),
+        display_name: validation.display_name || sourceKey.trim(),
+        status: 'active',
+        validated_at: new Date().toISOString(),
+      })
+      onCreated(res.source)
+      toast.success('信源已入库')
+      onClose()
+    } catch (err) {
+      setValidationError(err instanceof Error ? err.message : '入库失败')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-4">
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-label="添加信源"
+        className="flex max-h-[92vh] w-full max-w-[720px] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xl"
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-4">
+          <div>
+            <div className="text-[12px] font-semibold text-muted-foreground">第 {step} 步 / 共 3 步</div>
+            <h2 className="mt-1 text-[15px] font-semibold text-foreground">添加信源</h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label="关闭"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="min-h-0 overflow-auto px-5 py-4">
+          {step === 1 && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              {SOURCE_PLATFORM_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={platform === option.value}
+                  disabled={option.disabled}
+                  onClick={() => setPlatform(option.value)}
+                  className={cn(
+                    'rounded-lg border border-border bg-background p-3 text-left transition-colors',
+                    platform === option.value && 'border-primary bg-accent',
+                    option.disabled && 'cursor-not-allowed opacity-50',
+                  )}
+                >
+                  <span className="block text-[13px] font-semibold text-foreground">{option.label}</span>
+                  <span className="mt-1 block text-[12px] text-muted-foreground">{option.helper}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {step === 2 && (
+            <div className="space-y-4">
+              <label className="block">
+                <span className="text-[12px] font-semibold text-muted-foreground">source_key</span>
+                <input
+                  aria-label="source_key"
+                  value={sourceKey}
+                  onChange={(event) => setSourceKey(event.target.value)}
+                  className="mt-1.5 h-10 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-primary"
+                  placeholder={platformPlaceholder(platform)}
+                />
+              </label>
+              <p className="text-[12px] text-muted-foreground">{platformOption?.helper}</p>
+              {validationError && (
+                <p className="rounded-md bg-destructive/10 px-3 py-2 text-[12px] font-medium text-destructive">{validationError}</p>
+              )}
+              {validation?.status === 'deferred' && (
+                <div className="rounded-lg border border-amber-300/60 bg-amber-50 p-3 text-[13px] text-amber-900">
+                  <span className="mb-2 inline-flex rounded-md bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-900">后端 deferred</span>
+                  <p>{validation.reason || '该平台当前由后端异步或外部凭证路径处理。'}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {step === 3 && validation && (
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-background p-3">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-primary" />
+                  <span className="text-[13px] font-semibold text-foreground">{validation.display_name || sourceKey}</span>
+                  <span className="rounded-md bg-accent px-2 py-0.5 text-[11px] font-semibold text-primary">{validation.status}</span>
+                </div>
+                {validation.warning && <p className="mt-2 text-[12px] text-amber-700">{validation.warning}</p>}
+              </div>
+              <div className="rounded-lg border border-border overflow-hidden">
+                <div className="bg-secondary px-3 py-2 text-[12px] font-semibold text-muted-foreground">试抓预览</div>
+                {validation.preview.length === 0 ? (
+                  <p className="px-3 py-4 text-sm text-muted-foreground">暂无预览样本</p>
+                ) : (
+                  <div className="divide-y divide-border">
+                    {validation.preview.slice(0, 3).map((item, index) => (
+                      <PreviewRow key={`${item.url || item.title || index}`} item={item} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-t border-border px-5 py-4">
+          <button
+            type="button"
+            onClick={() => {
+              if (step === 1) onClose()
+              else setStep((prev) => (prev === 3 ? 2 : 1))
+            }}
+            className="rounded-md px-3 py-2 text-[13px] font-semibold text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            {step === 1 ? '取消' : '上一步'}
+          </button>
+          {step === 1 && (
+            <button
+              type="button"
+              onClick={() => setStep(2)}
+              className="rounded-lg bg-accent px-3 py-2 text-[13px] font-semibold text-primary hover:bg-primary hover:text-white"
+            >
+              下一步
+            </button>
+          )}
+          {step === 2 && (
+            <button
+              type="button"
+              onClick={handleValidate}
+              disabled={!canValidate}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-[13px] font-semibold text-primary hover:bg-primary hover:text-white disabled:opacity-50"
+            >
+              {validating && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              校验
+            </button>
+          )}
+          {step === 3 && (
+            <button
+              type="button"
+              onClick={handleCreate}
+              disabled={creating}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-[13px] font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {creating && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              确认入库
+            </button>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function PreviewRow({ item }: { item: AdminSourcePreviewItem }) {
+  return (
+    <div className="px-3 py-2.5">
+      <div className="text-[13px] font-medium text-foreground">{item.title || item.url || '未命名条目'}</div>
+      <div className="mt-1 text-[11.5px] text-muted-foreground tabular-nums">{formatAdminDate(item.published_at)}</div>
+      {item.summary && <div className="mt-1 line-clamp-2 text-[12px] text-muted-foreground">{item.summary}</div>}
+    </div>
+  )
+}
+
+function SubscriptionSkeleton() {
+  return (
+    <div className="space-y-6">
+      <section className="bg-card border border-border rounded-lg overflow-hidden shadow-subtle">
+        <div className="flex items-center justify-between gap-4 px-5 py-4">
+          <div className="space-y-2">
+            <SkeletonBlock className="w-28 h-4" />
+            <SkeletonBlock className="w-64 h-3" />
+          </div>
+          <SkeletonBlock className="w-24 h-4" />
+        </div>
+        <div className="border-t border-border px-5 py-4 space-y-3">
+          {Array.from({ length: 4 }).map((_, index) => (
+            <SkeletonBlock key={index} className="h-10 rounded-md" />
+          ))}
+        </div>
+      </section>
+      <SkeletonBlock className="h-52 rounded-lg" />
+    </div>
+  )
+}
+
+function sourceStatusInfo(source: AdminSource): {
+  label: string
+  cls: string
+  kind: 'ok' | 'error' | 'warning' | 'muted'
+} {
+  if (source.status === 'paused') return { label: '已停用', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
+  if (source.status === 'not_fetched') return { label: '配置存在但未在抓', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
+  if (source.status === 'pending') return { label: '待放量', cls: 'bg-amber-50 text-amber-700', kind: 'warning' }
+  if (source.status === 'broken') return { label: '异常 · broken', cls: 'bg-destructive/10 text-destructive', kind: 'error' }
+  if (source.health?.inserted_7d === 0) return { label: '异常 · 7 日 0 产出', cls: 'bg-destructive/10 text-destructive', kind: 'error' }
+  if (!source.health?.last_fetched_at && (source.health?.inserted_7d === null || source.health?.inserted_7d === undefined)) {
+    return { label: '待首抓', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
+  }
+  return { label: '正常', cls: 'bg-accent text-accent-foreground', kind: 'ok' }
+}
+
+function formatAdminDate(value?: string | null) {
+  if (!value) return '—'
+  return new Date(value).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function formatAdminNumber(value?: number | null) {
+  if (value === null || value === undefined) return '—'
+  return new Intl.NumberFormat('zh-CN').format(value)
+}
+
+function platformLabel(platform: string) {
+  if (platform === 'wechat_mp' || platform === 'lingowhale') return '公众号'
+  if (platform === 'x_user') return 'X'
+  if (platform === 'rss') return 'RSS'
+  if (platform === 'reddit') return 'Reddit'
+  if (platform === 'github_repo') return 'GitHub'
+  if (platform === 'bilibili_up') return 'B站'
+  return platform
+}
+
+function platformPlaceholder(platform: WizardPlatform) {
+  if (platform === 'x_user') return 'openai'
+  if (platform === 'rss') return 'https://example.com/feed.xml'
+  if (platform === 'reddit') return 'OpenAI'
+  if (platform === 'github_repo') return 'owner/repo'
+  if (platform === 'bilibili_up') return '123456'
+  if (platform === 'wechat_mp') return 'https://wechat2rss.xlab.app/feed/xxx.xml'
+  return 'channel_id'
+}
+
+function replaceSourceInGroups(groups: AdminSourceGroup[], source: AdminSource): AdminSourceGroup[] {
+  return groups.map((group) => {
+    if (group.platform !== source.platform) return group
+    return {
+      ...group,
+      sources: group.sources.map((item) => (item.id === source.id ? source : item)),
+    }
+  })
+}
+
+function removeSourceFromGroups(groups: AdminSourceGroup[], sourceId: number): AdminSourceGroup[] {
+  return groups
+    .map((group) => ({ ...group, sources: group.sources.filter((source) => source.id !== sourceId) }))
+    .filter((group) => group.sources.length > 0)
+}
+
+function appendSourceToGroups(groups: AdminSourceGroup[], source: AdminSource): AdminSourceGroup[] {
+  const existing = groups.find((group) => group.platform === source.platform)
+  if (!existing) return [...groups, { platform: source.platform, sources: [source] }]
+  return groups.map((group) => {
+    if (group.platform !== source.platform) return group
+    const hasSource = group.sources.some((item) => item.id === source.id)
+    return {
+      ...group,
+      sources: hasSource
+        ? group.sources.map((item) => (item.id === source.id ? source : item))
+        : [...group.sources, source],
+    }
+  })
+}
+
+function latestSourceUpdatedAt(groups: AdminSourceGroup[]) {
+  let latest: string | null = null
+  for (const group of groups) {
+    for (const source of group.sources) {
+      if (!latest || new Date(source.updated_at).getTime() > new Date(latest).getTime()) latest = source.updated_at
+    }
+  }
+  return latest
+}
+
+function emptyAlgoDraft(): Record<keyof AdminSourceAlgoParams, string> {
+  return ALGO_PARAM_SPECS.reduce((acc, spec) => {
+    acc[spec.key] = ''
+    return acc
+  }, {} as Record<keyof AdminSourceAlgoParams, string>)
+}
+
+function algoParamsToDraft(params: AdminSourceAlgoParams): Record<keyof AdminSourceAlgoParams, string> {
+  return ALGO_PARAM_SPECS.reduce((acc, spec) => {
+    const value = params[spec.key]
+    acc[spec.key] = value === null || value === undefined ? '' : String(value)
+    return acc
+  }, {} as Record<keyof AdminSourceAlgoParams, string>)
+}
+
+function parseAlgoDraft(draft: Record<keyof AdminSourceAlgoParams, string>):
+  | { params: AdminSourceAlgoParams }
+  | { error: string } {
+  const params = {} as AdminSourceAlgoParams
+  for (const spec of ALGO_PARAM_SPECS) {
+    const value = Number.parseInt(draft[spec.key], 10)
+    if (!Number.isInteger(value) || value < spec.min || value > spec.max) {
+      return { error: `${spec.key} 范围 ${spec.min}-${spec.max}` }
+    }
+    params[spec.key] = value
+  }
+  return { params }
+}
+
 
 function Metric({
   label,
@@ -903,7 +1835,7 @@ function Metric({
   icon?: ReactNode
 }) {
   return (
-    <div className="border border-border bg-background rounded-lg px-3 py-3 min-w-0 min-h-[72px]">
+    <div className="border border-border bg-background rounded-md px-3 py-3 min-w-0 min-h-[72px]">
       <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
         {icon}
         <span className="truncate">{label}</span>
@@ -918,54 +1850,6 @@ function RunContextStat({ label, value }: { label: string; value: string }) {
     <div className="rounded-md border border-border bg-background px-2.5 py-1.5 min-w-0">
       <div className="text-[11px] text-muted-foreground">{label}</div>
       <div className="mt-0.5 truncate font-semibold text-foreground">{value}</div>
-    </div>
-  )
-}
-
-function AdminSkeleton() {
-  return (
-    <div className="min-h-screen bg-background">
-      <header className="sticky top-0 z-50 flex items-center gap-3 px-4 h-14 bg-card border-b border-border">
-        <SkeletonBlock className="w-8 h-8 rounded-md" />
-        <SkeletonBlock className="w-20 h-4" />
-        <div className="ml-auto hidden sm:flex items-center gap-2">
-          <SkeletonBlock className="w-24 h-7 rounded-md" />
-          <SkeletonBlock className="w-20 h-4" />
-        </div>
-      </header>
-      <main className="max-w-[1280px] mx-auto px-4 py-8 space-y-6">
-        <section className="bg-card border border-border rounded-lg overflow-hidden shadow-subtle">
-          <div className="flex items-center justify-between gap-4 px-5 py-4">
-            <div className="space-y-2">
-              <SkeletonBlock className="w-20 h-4" />
-              <SkeletonBlock className="w-56 h-3" />
-            </div>
-            <SkeletonBlock className="w-24 h-4" />
-          </div>
-          <div className="grid grid-cols-1 lg:grid-cols-[352px_minmax(0,1fr)] border-t border-border lg:h-[min(760px,calc(100vh-148px))] lg:min-h-[560px]">
-            <div className="border-b border-border lg:border-b-0 lg:border-r">
-              <div className="grid grid-cols-[1fr_72px_64px] gap-3 bg-secondary px-3 py-3">
-                <SkeletonBlock className="h-3" />
-                <SkeletonBlock className="h-3" />
-                <SkeletonBlock className="h-3" />
-              </div>
-              <div className="divide-y divide-border">
-                {Array.from({ length: 9 }).map((_, index) => (
-                  <div key={index} className="grid grid-cols-[1fr_72px_64px] gap-3 px-3 py-3.5">
-                    <div className="space-y-2">
-                      <SkeletonBlock className="w-16 h-4" />
-                      <SkeletonBlock className="w-20 h-3" />
-                    </div>
-                    <SkeletonBlock className="w-11 h-5 rounded-md" />
-                    <SkeletonBlock className="justify-self-end w-8 h-4" />
-                  </div>
-                ))}
-              </div>
-            </div>
-            <RunInspectorSkeleton />
-          </div>
-        </section>
-      </main>
     </div>
   )
 }
@@ -989,14 +1873,14 @@ function RunInspectorSkeleton() {
       <div className="p-5 space-y-5">
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
           {Array.from({ length: 5 }).map((_, index) => (
-            <SkeletonBlock key={index} className="h-[72px] rounded-lg" />
+            <SkeletonBlock key={index} className="h-[72px] rounded-md" />
           ))}
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <SkeletonBlock className="h-32 rounded-lg" />
-          <SkeletonBlock className="h-32 rounded-lg" />
+          <SkeletonBlock className="h-32 rounded-md" />
+          <SkeletonBlock className="h-32 rounded-md" />
         </div>
-        <SkeletonBlock className="h-[280px] rounded-lg" />
+        <SkeletonBlock className="h-[280px] rounded-md" />
       </div>
     </div>
   )

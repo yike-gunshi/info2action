@@ -312,7 +312,7 @@ def run_dedup(dry_run=True, threshold=0.25, max_cluster_size=20):
         or ai.get('api_base', '')
         or 'https://api.minimaxi.com/anthropic/v1'
     ).strip()
-    model = ai.get('model', 'MiniMax-M2.7')
+    model = ai.get('model', 'MiniMax-M3')
     provider = ai.get('provider', 'minimax')
 
     if provider == "minimax":

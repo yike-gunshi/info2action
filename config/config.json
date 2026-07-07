@@ -1,7 +1,7 @@
 {
   "ai_summary": {
     "provider": "minimax",
-    "model": "MiniMax-M2.7",
+    "model": "MiniMax-M3",
     "api_key": "",
     "api_base": "https://api.minimaxi.com/anthropic/v1",
     "max_concurrency": 5,
@@ -38,7 +38,10 @@
   },
   "twitter": {
     "following_count": 50,
-    "for_you_count": 50
+    "for_you_count": 50,
+    "user_posts_count": 20,
+    "x_user_batch_size": 20,
+    "x_user_gray_limit": 30
   },
   "xiaohongshu": {
     "enabled": false,

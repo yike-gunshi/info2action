@@ -34,11 +34,93 @@ def lingowhale_path(*parts):
     return data_path('lingowhale', *parts)
 
 
+# v22.0 subscription-config: 信源归属 + 停用兜底(fail-open,任何异常都放行不阻断入库)。
+_source_index_cache = None
+_source_index_loaded = False
+
+
+def _source_index_for(conn):
+    """载入 sources 注册表反查索引(每进程一次,fail-open: 出错返回 None)。
+
+    本地后端从 sqlite sources 表载入；remote 权威后端从 Supabase sources 表载入。
+    """
+    global _source_index_cache, _source_index_loaded
+    if not _source_index_loaded:
+        _source_index_loaded = True
+        try:
+            if remote_db.fetch_write_to_remote():
+                _source_index_cache = remote_db.load_source_index_remote()
+            else:
+                _source_index_cache = db.load_source_index(conn)
+        except Exception:
+            _source_index_cache = None
+    return _source_index_cache
+
+
+def _apply_source_attribution(conn, item):
+    """反查注册表: 回填 item['source_id'] + 判定是否停用丢弃。
+
+    返回 (item, dropped)。fail-open: 索引缺失/异常 → 原样放行、不丢弃。
+    """
+    idx = _source_index_for(conn)
+    if idx is None:
+        return item, False
+    try:
+        sid, status = db.resolve_source(
+            idx, item.get('platform'), item.get('source'),
+            channel_id=item.get('channel_id'),
+            handle=item.get('author_handle') or item.get('handle'),
+            uid=item.get('author_id'),
+        )
+    except Exception:
+        return item, False
+    if status in db._SOURCE_DROP_STATUSES:
+        return item, True
+    item = dict(item)
+    if sid is not None:
+        item['source_id'] = sid
+    return item, False
+
+
+def record_source_fetch_result_current_backend(source_id, *, ok, error=None, broken_after=None):
+    """Record source fetch result on the active fetch write backend."""
+    if source_id is None:
+        return
+    threshold = broken_after if broken_after is not None else db._broken_after_threshold()
+    try:
+        if remote_db.fetch_write_to_remote():
+            remote_db.record_source_fetch_result_remote(
+                source_id,
+                ok=ok,
+                error=error,
+                broken_after=threshold,
+            )
+            return
+        conn = db.get_conn()
+        try:
+            db.record_source_fetch_result(
+                conn,
+                source_id,
+                ok=ok,
+                error=error,
+                broken_after=threshold,
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"  ⚠️  source result tracking skipped for {source_id}: {e}")
+
+
 def batch_upsert_current_run(conn, items):
     """Upsert items and tag them with the active fetch run when present."""
+    kept = []
+    for it in items:
+        it2, dropped = _apply_source_attribution(conn, it)
+        if not dropped:
+            kept.append(it2)
     if remote_db.fetch_write_to_remote():
-        return remote_db.batch_upsert_items_remote(None, items, fetch_run_id=CURRENT_RUN_ID)
-    return db.batch_upsert(conn, items, fetch_run_id=CURRENT_RUN_ID)
+        return remote_db.batch_upsert_items_remote(None, kept, fetch_run_id=CURRENT_RUN_ID)
+    return db.batch_upsert(conn, kept, fetch_run_id=CURRENT_RUN_ID)
 
 
 def start_current_fetch_run(conn):
@@ -57,6 +139,9 @@ def finish_current_fetch_run(conn, run_id, stats, error=None):
 
 def upsert_item_current_backend(conn, item):
     """Upsert a single item through the configured ingest write backend."""
+    item, dropped = _apply_source_attribution(conn, item)
+    if dropped:
+        return {'dropped': True}
     if remote_db.fetch_write_to_remote():
         return remote_db.upsert_item_remote(None, item, fetch_run_id=CURRENT_RUN_ID)
     return db.upsert_item(conn, item)
@@ -250,6 +335,11 @@ def ingest_twitter(conn, *, timeline_only=False):
         })
         # v16.0: keyword search is retired. Keep historical search files on disk,
         # but do not ingest them into new fetch runs.
+        for path in sorted(glob.glob(source_path('twitter', 'x-user-*.json'))):
+            fname = os.path.basename(path)
+            handle = fname[len('x-user-'):-len('.json')]
+            if handle:
+                mapping[fname] = f'user:{handle}'
     total = 0
     video_tasks: list[tuple[str, str]] = []  # v12.3 N4: (tid, mp4_url) for inline ffmpeg poster
     for fname, source in mapping.items():
@@ -1204,6 +1294,76 @@ def ingest_rss(conn):
     return total
 
 
+def ingest_wechat_rss(conn):
+    """Ingest WeChat MP RSS JSON files as lingowhale items."""
+    total = 0
+    wechat_dir = source_path('wechat')
+    if not os.path.isdir(wechat_dir):
+        return 0
+
+    for f_path in sorted(glob.glob(os.path.join(wechat_dir, '*.json'))):
+        data = safe_load_json(f_path)
+        if data is None:
+            continue
+
+        fname = os.path.basename(f_path).replace('.json', '')
+        feed_title = data.get('feed_title', fname) if isinstance(data, dict) else fname
+        feed_url = data.get('feed_url', '') if isinstance(data, dict) else ''
+        source_name = data.get('source_name') if isinstance(data, dict) else None
+        author_name = source_name or feed_title
+        raw_items = data.get('items', []) if isinstance(data, dict) else data
+        if not feed_url:
+            continue
+
+        items = []
+        for entry in raw_items:
+            entry_id = entry.get('id', '') or entry.get('link', '')
+            if not entry_id:
+                continue
+            item_hash = hashlib.md5(f'{feed_url}\n{entry_id}'.encode()).hexdigest()[:12]
+            item_id = f'lw_rss_{item_hash}'
+
+            title = entry.get('title', '')
+            content = entry.get('content', '') or entry.get('summary', '')
+            content = re.sub(r'<[^>]+>', '', content)[:2000]
+            link = entry.get('link', '')
+            tags = entry.get('tags', [])
+
+            items.append({
+                'id': item_id,
+                'platform': 'lingowhale',
+                'source': f'wechat:{feed_url}',
+                'title': title or None,
+                'content': content or None,
+                'author_name': author_name,
+                'author_id': '',
+                'author_avatar': '',
+                'url': link,
+                'cover_url': None,
+                'media_json': None,
+                'metrics_json': None,
+                'tags_json': json.dumps(tags, ensure_ascii=False) if tags else None,
+                'lang': 'zh',
+                'detail_json': json.dumps({
+                    'feed': feed_title,
+                    'feed_url': feed_url,
+                    'entry_id': entry_id,
+                }, ensure_ascii=False),
+                'comments_json': None,
+                'ai_summary': None,
+                'relevance_score': calc_relevance(title, content, {}, 'lingowhale'),
+                'fetched_at': now_ts(),
+                'published_at': entry.get('published', '') or None,
+            })
+
+        if items:
+            batch_upsert_current_run(conn, items)
+            total += len(items)
+            print(f"  ✅ 公众号 RSS {author_name}: {len(items)} items")
+
+    return total
+
+
 # ============================================================
 # HACKER NEWS
 # ============================================================
@@ -1739,7 +1899,11 @@ def ingest_lingowhale(conn):
 
         # Channel/source info
         channel = e.get('channel', {})
-        source = channel.get('name', 'subscription')
+        if not isinstance(channel, dict):
+            channel = {}
+        channel_id = str(channel.get('channel_id') or '').strip()
+        channel_name = channel.get('name') or 'subscription'
+        source = f'lingowhale:{channel_id}' if channel_id else channel_name
         group_name = e.get('group_name', '未分组')
 
         # Convert unix timestamp to ISO
@@ -1765,6 +1929,9 @@ def ingest_lingowhale(conn):
         _stripped_abstract = _raw_abstract.replace('<hl>', '').replace('</hl>', '') if _raw_abstract else None
 
         detail = {'group': group_name}
+        if channel_id:
+            detail['channel_id'] = channel_id
+            detail['channel_name'] = channel_name
         if _stripped_abstract:
             detail['lingowhale_abstract'] = _stripped_abstract
         if viewpoint:
@@ -1774,6 +1941,7 @@ def ingest_lingowhale(conn):
             'id': f'lw_{entry_id}',
             'platform': 'lingowhale',
             'source': source,
+            'channel_id': channel_id or None,
             'title': title,
             'content': content,
             'author_name': author_name,
@@ -1914,10 +2082,11 @@ def main():
         _run_platform('xiaohongshu', '📕 小红书', lambda: ingest_xiaohongshu(conn))
         _run_platform('bilibili', '📺 B站', lambda: ingest_bilibili(conn))
         _run_platform('rss', '📡 RSS', lambda: ingest_rss(conn))
+        _run_platform('wechat_rss', '🐋 公众号 RSS', lambda: ingest_wechat_rss(conn))
         _run_platform('hackernews', '🔶 Hacker News', lambda: ingest_hackernews(conn))
         _run_platform('reddit', '🤖 Reddit', lambda: ingest_reddit(conn))
         _run_platform('github', '🐙 GitHub Trending', lambda: ingest_github_trending(conn))
-        _run_platform('lingowhale', '🐋 公众号', lambda: ingest_lingowhale(conn))
+        _run_platform('lingowhale', '🐋 公众号 语鲸', lambda: ingest_lingowhale(conn))
         _run_platform('waytoagi', '🔖 WayToAGI', lambda: ingest_waytoagi(conn))
         # v16.0: keyword search is retired; do not advance legacy search
         # keyword bookkeeping during normal ingest.

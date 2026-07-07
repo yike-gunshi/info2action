@@ -657,6 +657,7 @@ def test_ingest_main_remote_writer_does_not_open_sqlite(monkeypatch):
     monkeypatch.setattr(ingest, "ingest_github_trending", fake_ingest("github"))
     monkeypatch.setattr(ingest, "ingest_lingowhale", fake_ingest("lingowhale"))
     monkeypatch.setattr(ingest, "ingest_waytoagi", fake_ingest("waytoagi"))
+    monkeypatch.setattr(ingest, "ingest_wechat_rss", fake_ingest("wechat_rss"))
 
     assert ingest.main() == 0
 
@@ -666,6 +667,7 @@ def test_ingest_main_remote_writer_does_not_open_sqlite(monkeypatch):
         "xiaohongshu": 0,
         "bilibili": 0,
         "rss": 0,
+        "wechat_rss": 0,
         "hackernews": 0,
         "reddit": 0,
         "github": 0,

@@ -27,7 +27,7 @@ from . import event_definitions
 
 LOGGER = logging.getLogger(__name__)
 
-LLM_MODEL = "MiniMax-M2.7"
+LLM_MODEL = "MiniMax-M3"
 LLM_API_BASE = "https://api.minimaxi.com/anthropic/v1"
 # v4 优化（2026-04-29）：4096 → 16384。
 # Why: v3 实测 MiniMax-M2.7 thinking 模式在 ~3200 token 输入下吃光 4096 max_tokens

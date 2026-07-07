@@ -26,7 +26,7 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.json")
 BATCH_SIZE = 20  # 每批 item 数
 MAX_WORKERS = 5  # 最大并发数
 _DEFAULT_MINIMAX_CHAT_BASE = "https://api.minimaxi.com/anthropic/v1"
-_DEFAULT_MINIMAX_CHAT_MODEL = "MiniMax-M2.7"
+_DEFAULT_MINIMAX_CHAT_MODEL = "MiniMax-M3"
 
 
 def load_config():

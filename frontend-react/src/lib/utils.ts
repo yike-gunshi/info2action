@@ -95,11 +95,12 @@ export function esc(s: string): string {
 /** Action type display name */
 export function actionTypeName(type: string): string {
   const map: Record<string, string> = {
-    research: '调研验证',
-    investigate: '调研验证',
-    implementation: '动手做',
-    implement: '动手做',
-    content: '创作内容',
+    research: '调研',
+    investigate: '调研',
+    implementation: '实践',
+    implement: '实践',
+    content: '创作',
+    track: '跟踪',
   }
   return map[type] || type
 }
@@ -112,6 +113,7 @@ export function actionTypeClass(type: string): string {
     implementation: 'text-primary bg-accent',
     implement: 'text-primary bg-accent',
     content: 'text-emerald bg-emerald-bg',
+    track: 'text-warm-600 bg-warm-200',
   }
   return map[type] || 'text-warm-600 bg-warm-200'
 }

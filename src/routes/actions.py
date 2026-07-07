@@ -19,7 +19,8 @@ import db
 import execute_action
 import remote_db
 import action_detail_read_model
-from authz import can_access_all, current_user_id, owner_scope_user_id, require_admin
+import action_quota
+from authz import can_access_all, current_user_id, owner_scope_user_id, require_admin, require_login
 from deps import BASE
 
 router = APIRouter()
@@ -35,10 +36,48 @@ def _load_json(path):
         return None
 
 
+def _load_user_profile(request):
+    """Load the requesting user's profile (local or remote). None if anonymous/missing."""
+    user_id = current_user_id(request)
+    if not user_id:
+        return None
+    if remote_db.app_state_to_remote():
+        return remote_db.get_user_profile_remote(user_id)
+    conn = db.get_conn()
+    try:
+        return db.get_user_profile(conn, user_id)
+    finally:
+        conn.close()
+
+
+def _build_profile_context(profile):
+    """v21.0: build per-user generation context from user_profiles.
+
+    Returns (manifest_text, tags_line, has_manifest). Replaces the single-user
+    server-file context (WORKSPACE-MANIFEST/PULSE/directions), which is retired.
+    """
+    if not profile:
+        return '', '', False
+    manifest = str(profile.get('manifest') or '').strip()
+    parts = []
+    role = profile.get('role')
+    if role:
+        parts.append(f"角色:{role}")
+    interests = profile.get('interests') or []
+    if isinstance(interests, list) and interests:
+        parts.append("关注:" + '/'.join(str(i) for i in interests))
+    tools = profile.get('tools') or []
+    if isinstance(tools, list) and tools:
+        parts.append("工具:" + '/'.join(str(t) for t in tools))
+    tags_line = ';'.join(parts)
+    return manifest, tags_line, bool(manifest)
+
+
 _ACTION_TYPE_LABELS = {
     'investigate': '调研',
-    'implement': '实施',
-    'content': '内容生成',
+    'implement': '实践',
+    'content': '创作',
+    'track': '跟踪',
 }
 _VALID_ACTION_TYPES = set(_ACTION_TYPE_LABELS.keys())
 _VALID_PRIORITIES = {'high', 'medium', 'low', 'bug'}
@@ -86,6 +125,7 @@ def _manual_fallback_prompt(item, action_type, user_hint):
         'investigate': '判断这条信息是否值得继续跟进，并列出下一步调研问题。',
         'implement': '判断这条信息是否能转成一个小的落地动作，并列出最小验证步骤。',
         'content': '判断这条信息是否适合转成内容素材，并给出可产出的角度。',
+        'track': '判断这条信息是否值得持续关注，并列出应盯住的关键信号与转为行动的触发条件。',
     }
     parts = [
         '这是一次用户手动触发的单条行动点生成。模型未返回可解析行动点，请给出保守但可执行的下一步。',
@@ -107,6 +147,7 @@ def _build_manual_fallback_action(item, item_id, req_action_type, req_user_hint)
         'investigate': '深入了解',
         'implement': '评估落地',
         'content': '围绕',
+        'track': '持续关注',
     }
     if action_type == 'content':
         title = f'{prefix_by_type[action_type]} {title_base} 创作内容'
@@ -131,7 +172,12 @@ def _normalize_manual_action(action, item, item_id, req_action_type, req_user_hi
 
     title = _one_line(normalized.get('title') or fallback['title'], limit=140)
     prompt = str(normalized.get('prompt') or fallback['prompt']).strip()
-    reason = str(normalized.get('reason') or fallback['reason']).strip()
+    # BF-0706-#3: 结构化 reason([{label,text}]) 必须存 JSON,不能 str() 成单引号 repr(前端 JSON.parse 不了 → 乱码)
+    _raw_reason = normalized.get('reason')
+    if isinstance(_raw_reason, (list, dict)):
+        reason = json.dumps(_raw_reason, ensure_ascii=False)
+    else:
+        reason = str(_raw_reason or fallback['reason']).strip()
     priority = str(normalized.get('priority') or 'medium').strip()
     if priority not in _VALID_PRIORITIES:
         priority = 'medium'
@@ -148,10 +194,23 @@ def _normalize_manual_action(action, item, item_id, req_action_type, req_user_hi
     if item_id not in source_ids:
         source_ids = [item_id] + source_ids
 
+    # v21.0: 结构化行动点(人看)。模型给了 steps 用之,否则留空由 read model 回退拆 prompt。
+    steps = normalized.get('steps')
+    if isinstance(steps, str):
+        try:
+            steps = json.loads(steps)
+        except (json.JSONDecodeError, TypeError):
+            steps = None
+    if isinstance(steps, list):
+        steps = [str(s).strip() for s in steps if str(s or '').strip()]
+    else:
+        steps = None
+
     normalized.update({
         'title': title,
         'action_type': action_type,
         'prompt': prompt,
+        'steps': steps,
         'reason': reason,
         'priority': priority,
         'source_item_ids': source_ids,
@@ -175,6 +234,7 @@ def _persist_manual_item_action(action, request):
             direction=action.get('direction') or '_uncategorized',
             direction_label=action.get('direction_label') or '待归类',
             user_id=current_user_id(request),
+            steps=action.get('steps'),
         )
         persisted = dict(action)
         persisted['id'] = action_id
@@ -196,6 +256,7 @@ def _persist_manual_item_action(action, request):
             direction=action.get('direction') or '_uncategorized',
             direction_label=action.get('direction_label') or '待归类',
             user_id=current_user_id(request),
+            steps=action.get('steps'),
         )
     finally:
         conn.close()
@@ -306,22 +367,37 @@ def _resolve_tag_ids(action):
     return tag_ids[:5]  # Discord limit: max 5 tags
 
 
-def _dispatch_to_discord(action, bot_token=None):
-    """Create a Discord Forum thread with Embed for this action.
-    Returns (thread_id, thread_url) or raises on error.
+def _discord_channel_is_forum(channel_id, bot_token=None):
+    """Return True if the channel is a Discord forum (type 15). Best-effort:
+    on API error, assume forum to preserve the legacy thread-creation path."""
+    try:
+        data = _discord_api('GET', f'/channels/{channel_id}', bot_token=bot_token)
+        return int(data.get('type', 15)) == 15
+    except Exception as exc:
+        print(f'[discord] channel type probe failed for {channel_id}: {exc}')
+        return True
+
+
+def _dispatch_to_discord(action, bot_token=None, channel_id=None):
+    """Dispatch an action to Discord as an Embed.
+
+    v21.0: `channel_id` per-user 覆盖(优先);未传时回退全局 config forum_channel_id。
+    forum channel(type 15)建 thread;普通 text channel 发消息。
+    Returns (thread_id_or_message_id, url) or raises on error.
     bot_token: per-user token override."""
     dcfg = _load_discord_config()
-    channel_id = dcfg.get('forum_channel_id', '')
+    channel_id = (channel_id or '').strip() or dcfg.get('forum_channel_id', '')
     manager_id = dcfg.get('manager_user_id', '')
     if not channel_id:
-        raise ValueError('discord.forum_channel_id not configured')
+        raise ValueError('Discord 派发频道未配置(用户 discord_channel_id 或全局 forum_channel_id)')
 
     prio_emoji = {'high': '\U0001f534', 'medium': '\U0001f7e1', 'low': '\U0001f7e2'}.get(
         action.get('priority', ''), '\u26aa')
     type_label = {
-        'implement': '\u2699\ufe0f 实施',
+        'implement': '\u2699\ufe0f 实践',
         'investigate': '\U0001f50d 调研',
-        'content': '\u270d\ufe0f 内容',
+        'content': '\u270d\ufe0f 创作',
+        'track': '\U0001f440 跟踪',
     }.get(action.get('action_type', ''), action.get('action_type', ''))
     dir_label = action.get('direction_label', '') or action.get('direction', '')
 
@@ -349,22 +425,31 @@ def _dispatch_to_discord(action, bot_token=None):
     mention = f'<@{manager_id}> ' if manager_id else ''
     content = f'{mention}新任务派发：{action.get("title", "")}'
 
-    tag_ids = _resolve_tag_ids(action)
-
-    payload = {
-        'name': (action.get('title', '') or 'Untitled')[:100],
-        'message': {
-            'content': content,
-            'embeds': [embed],
-        },
-        'applied_tags': tag_ids,
-    }
-    data = _discord_api('POST', f'/channels/{channel_id}/threads', payload, bot_token=bot_token)
-    thread_id = data.get('id', '')
-    guild_id = data.get('guild_id', '')
-    thread_url = (f'https://discord.com/channels/{guild_id}/{thread_id}'
-                  if guild_id else f'https://discord.com/channels/@me/{thread_id}')
-    return thread_id, thread_url
+    is_forum = _discord_channel_is_forum(channel_id, bot_token=bot_token)
+    if is_forum:
+        # Forum channel → 建 thread(可带 tag)。thread 自身 id 即链接目标。
+        payload = {
+            'name': (action.get('title', '') or 'Untitled')[:100],
+            'message': {
+                'content': content,
+                'embeds': [embed],
+            },
+            'applied_tags': _resolve_tag_ids(action),
+        }
+        data = _discord_api('POST', f'/channels/{channel_id}/threads', payload, bot_token=bot_token)
+        target_id = data.get('id', '')
+        guild_id = data.get('guild_id', '')
+        url = (f'https://discord.com/channels/{guild_id}/{target_id}'
+               if guild_id else f'https://discord.com/channels/@me/{target_id}')
+    else:
+        # 普通 text channel → 发消息(无 forum tag)。链接到 channel 下的 message。
+        payload = {'content': content, 'embeds': [embed]}
+        data = _discord_api('POST', f'/channels/{channel_id}/messages', payload, bot_token=bot_token)
+        target_id = data.get('id', '')
+        guild_id = data.get('guild_id', '')
+        url = (f'https://discord.com/channels/{guild_id}/{channel_id}/{target_id}'
+               if guild_id else f'https://discord.com/channels/@me/{channel_id}/{target_id}')
+    return target_id, url
 
 
 # ── SSE headers ──────────────────────────────────────────────
@@ -890,7 +975,7 @@ def _get_actions_by_item_local(item_id: str, user_id: str | None) -> list[dict[s
         if user_id:
             params.append(user_id)
         rows = conn.execute(f"""
-            SELECT id, title, action_type, priority, status, reason, created_at, source_item_ids
+            SELECT id, title, action_type, priority, status, reason, steps, created_at, source_item_ids
             FROM actions
             WHERE source_item_ids LIKE ? {scope_clause}
             ORDER BY created_at DESC
@@ -900,6 +985,13 @@ def _get_actions_by_item_local(item_id: str, user_id: str | None) -> list[dict[s
             d = dict(r)
             if item_id in _parse_action_source_ids(d.get('source_item_ids', '[]')):
                 d['source_item_ids'] = _parse_action_source_ids(d.get('source_item_ids', '[]'))
+                # v2 §14.3(T7): steps 供信息弹窗列表原位展示
+                raw_steps = d.get('steps')
+                if isinstance(raw_steps, str):
+                    try:
+                        d['steps'] = json.loads(raw_steps)
+                    except (json.JSONDecodeError, TypeError):
+                        d['steps'] = None
                 actions.append(d)
         return actions
     finally:
@@ -1179,6 +1271,15 @@ async def get_action_stream(action_id: str, request: Request, offset: int = Quer
     }
 
 
+@router.get('/api/user/action-quota')
+async def get_action_quota(request: Request):
+    """v21.0: 当日行动点生成配额快照。登录必需;admin 返回 unlimited。"""
+    err = require_login(request)
+    if err:
+        return err
+    return await run_in_threadpool(action_quota.usage_for_request, request)
+
+
 # ── POST endpoints ───────────────────────────────────────────
 
 
@@ -1203,7 +1304,8 @@ async def auto_generate_actions(request: Request):
 
 @router.post('/api/actions/generate-from-item')
 async def generate_from_item(request: Request):
-    err = require_admin(request)
+    # v21.0: 从 admin-only 放开到登录用户;配额在 item 存在校验后"发起即计"。
+    err = require_login(request)
     if err:
         return err
 
@@ -1227,6 +1329,18 @@ async def generate_from_item(request: Request):
     if not row:
         return JSONResponse({'error': 'Item not found'}, status_code=404)
     item = dict(row)
+
+    # v21.0 限额:非 admin 每日 5 次,发起即计(item 存在后、启动 LLM 前)。
+    allowed, quota = action_quota.try_consume_for_request(request)
+    if not allowed:
+        return JSONResponse(
+            {'error': f"今日生成次数已用完({quota['used']}/{quota['limit']}),明天再来", 'quota': quota},
+            status_code=429,
+        )
+
+    # v21.0 per-user 上下文:manifest + 基础画像标签,替代服务器本机单人文件。
+    profile = _load_user_profile(request)
+    manifest_text, profile_tags_line, has_manifest = _build_profile_context(profile)
 
     def generator():
         def sse(event, data):
@@ -1271,17 +1385,16 @@ async def generate_from_item(request: Request):
             ai = cfg.get('ai_summary', {})
             api_key, api_base, model = ga.resolve_minimax_chat_config(ai)
 
-            yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": "已读取 WORKSPACE-MANIFEST.md，获取项目定位与方向"}, ensure_ascii=False)}\n\n'
-            manifest = ga.load_manifest()
-            manifest_len = len(manifest) if manifest else 0
-            yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": f"已读取 WORKSPACE-PULSE.json，获取实时工作状态 ({manifest_len} chars)"}, ensure_ascii=False)}\n\n'
-            pulse_fields = ga.load_pulse()
-            active_work = pulse_fields.get('pulse_active_work', '')
-            if active_work:
-                first_line = active_work.split('\n')[0]
-                yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": f"当前活跃工作 {first_line}"}, ensure_ascii=False)}\n\n'
-            yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": "已读取 directions.yaml，获取行动方向框架"}, ensure_ascii=False)}\n\n'
-            _, directions_text = ga.load_directions()
+            # v21.0: per-user 画像上下文替代服务器本机单人文件(MANIFEST/PULSE/directions 已下线)。
+            if has_manifest:
+                yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": f"已读取个人画像({len(manifest_text)} 字符)"}, ensure_ascii=False)}\n\n'
+            else:
+                yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": "未使用个人画像(未配置),按通用上下文生成"}, ensure_ascii=False)}\n\n'
+            if profile_tags_line:
+                yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": f"基础画像 {profile_tags_line}"}, ensure_ascii=False)}\n\n'
+            manifest = manifest_text
+            if profile_tags_line:
+                manifest = (manifest + "\n\n基础画像：" + profile_tags_line).strip()
 
             user_guidance = ""
             if req_action_type or req_user_hint:
@@ -1295,7 +1408,7 @@ async def generate_from_item(request: Request):
                     yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": f"用户预期 {req_user_hint}"}, ensure_ascii=False)}\n\n'
                 parts.append("- **重要**：生成的行动点必须与用户指定的类型和预期方向一致。如果用户明确了方向，即使你认为其他方向更有价值，也应优先按用户意图生成。")
                 user_guidance = "\n".join(parts)
-            system_prompt = ga.build_analysis_prompt(manifest, "", directions_text, pulse_fields, user_guidance=user_guidance)
+            system_prompt = ga.build_analysis_prompt(manifest, "", "", {}, user_guidance=user_guidance)
             yield f'event: thinking\ndata: {json.dumps({"stage": 1, "text": f"上下文组装完成，prompt 共 {len(system_prompt)} 字符"}, ensure_ascii=False)}\n\n'
             yield f'event: stage\ndata: {json.dumps({"index": 1, "status": "done"})}\n\n'
             stages.append({'name': '读取项目上下文', 'duration_ms': int((time.time() - t1) * 1000)})
@@ -1424,6 +1537,7 @@ async def dispatch_action(action_id: str, request: Request):
         return JSONResponse({'error': 'Discord Token 解密失败，请重新配置'}, status_code=500)
 
     scope_user_id = owner_scope_user_id(request)
+    user_channel_id = user.get('discord_channel_id') or None  # v21.0 per-user 频道
 
     def _dispatch_blocking():
         conn = None
@@ -1437,7 +1551,8 @@ async def dispatch_action(action_id: str, request: Request):
                 return ('error', 404, 'Action not found')
             if action['status'] not in ('pending',):
                 return ('error', 400, f"Cannot dispatch action in status '{action['status']}'")
-            thread_id, thread_url = _dispatch_to_discord(action, bot_token=user_bot_token)
+            thread_id, thread_url = _dispatch_to_discord(
+                action, bot_token=user_bot_token, channel_id=user_channel_id)
             now = datetime.now().isoformat()
             if remote_db.app_state_to_remote():
                 remote_db.update_action_remote(
@@ -1476,6 +1591,103 @@ async def dispatch_action(action_id: str, request: Request):
     _, thread_id, thread_url = result
     await run_in_threadpool(_refresh_action_detail_read_model, action_id, request)
     return {'ok': True, 'thread_id': thread_id, 'thread_url': thread_url}
+
+
+@router.post('/api/actions/{action_id}/mark-executing')
+async def mark_action_executing(action_id: str, request: Request):
+    """v21.0 (E2): 用户把行动指令复制到本地执行后,询问式"标记为执行中"。
+
+    owner-scoped;pending → confirmed(进"执行中"泳道)。不触发服务器代执行
+    (与 admin-only 的 /confirm 区分,后者会 start_execution 起本机 CLI)。
+    """
+    err = require_login(request)
+    if err:
+        return err
+    try:
+        scope_user_id = owner_scope_user_id(request)
+        if remote_db.app_state_to_remote():
+            action = remote_db.get_action_remote(action_id, user_id=scope_user_id)
+        else:
+            conn = db.get_conn()
+            action = db.get_action(conn, action_id, user_id=scope_user_id)
+        if not action:
+            if not remote_db.app_state_to_remote():
+                conn.close()
+            return JSONResponse({'error': 'Action not found'}, status_code=404)
+        if action['status'] not in ('pending',):
+            if not remote_db.app_state_to_remote():
+                conn.close()
+            return JSONResponse(
+                {'error': f"只有待处理的行动点可标记为执行中(当前 '{action['status']}')"},
+                status_code=400,
+            )
+        now = datetime.now().isoformat()
+        if remote_db.app_state_to_remote():
+            remote_db.update_action_remote(
+                action_id, owner_user_id=scope_user_id,
+                status='confirmed', confirmed_at=now,
+            )
+            remote_db.log_action_event_remote(None, action_id, 'confirmed', {'via': 'local_copy'})
+        else:
+            db.update_action(conn, action_id, owner_user_id=scope_user_id,
+                             status='confirmed', confirmed_at=now)
+            db._log_action_event(conn, action_id, 'confirmed', {'via': 'local_copy'})
+            conn.close()
+        await run_in_threadpool(_refresh_action_detail_read_model, action_id, request)
+        return {'ok': True}
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+_ACTION_STATUS_TIMESTAMP = {
+    'confirmed': 'confirmed_at',
+    'done': 'completed_at',
+    'dismissed': 'dismissed_at',
+}
+_ACTION_SETTABLE_STATUSES = {'pending', 'confirmed', 'done', 'dismissed'}
+
+
+@router.post('/api/actions/{action_id}/status')
+async def set_action_status(action_id: str, request: Request):
+    """v21.0 v2 (§13.4): owner-scoped 状态切换,供行动详情顶部三段式 stepper 调用。
+    允许 pending/confirmed(执行中)/done(已完成)/dismissed(忽略)之间自由切换。"""
+    err = require_login(request)
+    if err:
+        return err
+    body = await request.json()
+    new_status = body.get('status', '')
+    if new_status not in _ACTION_SETTABLE_STATUSES:
+        return JSONResponse({'error': f'Invalid status: {new_status}'}, status_code=400)
+    try:
+        scope_user_id = owner_scope_user_id(request)
+        if remote_db.app_state_to_remote():
+            action = remote_db.get_action_remote(action_id, user_id=scope_user_id)
+        else:
+            conn = db.get_conn()
+            action = db.get_action(conn, action_id, user_id=scope_user_id)
+        if not action:
+            if not remote_db.app_state_to_remote():
+                conn.close()
+            return JSONResponse({'error': 'Action not found'}, status_code=404)
+        now = datetime.now().isoformat()
+        fields = {'status': new_status}
+        ts_field = _ACTION_STATUS_TIMESTAMP.get(new_status)
+        if ts_field:
+            fields[ts_field] = now
+        if new_status == 'pending':
+            fields['completed_at'] = None
+            fields['dismissed_at'] = None
+        if remote_db.app_state_to_remote():
+            remote_db.update_action_remote(action_id, owner_user_id=scope_user_id, **fields)
+            remote_db.log_action_event_remote(None, action_id, new_status, {'via': 'status_stepper'})
+        else:
+            db.update_action(conn, action_id, owner_user_id=scope_user_id, **fields)
+            db._log_action_event(conn, action_id, new_status, {'via': 'status_stepper'})
+            conn.close()
+        await run_in_threadpool(_refresh_action_detail_read_model, action_id, request)
+        return {'ok': True, 'status': new_status}
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @router.post('/api/actions/{action_id}/done')

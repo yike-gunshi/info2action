@@ -21,6 +21,7 @@ function actionTypeLabel(type: string) {
   if (type === 'investigate') return '调研验证'
   if (type === 'implement') return '动手做'
   if (type === 'content') return '创作内容'
+  if (type === 'track') return '跟踪关注'
   return type
 }
 

@@ -91,7 +91,8 @@ function getAppView(): AppView | null {
   if (params.get('v') === 'info-image2-lab') return 'info-image2-lab'
   if (params.get('v') === 'info-legacy-lab') return 'info-legacy-lab'
   if (hash === 'settings') return 'settings'
-  if (hash === 'admin') return 'admin'
+  // v23.0 admin-console: #admin 及子路由 #admin/overview|runs|subscriptions|access
+  if (hash === 'admin' || hash.startsWith('admin/')) return 'admin'
   if (hash === 'privacy') return 'privacy'
   if (hash === 'terms') return 'terms'
   // v18.0 nav-merge §Spec-3 D5: 全屏路由

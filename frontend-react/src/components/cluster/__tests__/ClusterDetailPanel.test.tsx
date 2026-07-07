@@ -73,6 +73,11 @@ vi.mock('../../shared/AuthGate', () => ({
   requireAuth: vi.fn(() => true),
 }))
 
+// v21.0: 事件弹窗内嵌 ClusterActionZone,本套件聚焦弹窗壳/媒体,行动区块存根即可。
+vi.mock('../ClusterActionZone', () => ({
+  ClusterActionZone: () => null,
+}))
+
 describe('ClusterDetailPanel v19 rebuild', () => {
   afterEach(() => {
     cluster.ai_summary =

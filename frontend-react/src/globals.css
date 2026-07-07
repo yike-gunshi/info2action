@@ -56,6 +56,23 @@
     --terminal-bg: #1A1A2E;
     --terminal-text: #4ade80;
     --terminal-muted: #6366F1;
+    /* v21.0 action code block — 暖炭底 + 米白字,融入纸面弹窗 */
+    --action-code-bg: #2B2420;
+    --action-code-text: #ECE1D0;
+    --action-code-faint: #A99A87;
+  }
+
+  /* v2 §13.2 生成中脉冲点 */
+  .analyze-dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--brand); opacity: .35;
+    animation: analyze-blink 1s infinite;
+  }
+  .analyze-dot:nth-child(2) { animation-delay: .15s; }
+  .analyze-dot:nth-child(3) { animation-delay: .3s; }
+  @keyframes analyze-blink { 0%, 100% { opacity: .3; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .analyze-dot { animation: none; } }
+  :root {
 
     /* v15.0 事件聚合语义 token (DESIGN.md §15.3) */
     --pulse-update: #F59E0B;            /* 有更新小圆点 (琥珀,语义=被动提醒) */
@@ -629,3 +646,50 @@
   content-visibility: auto;
   contain-intrinsic-size: auto 180px;
 }
+
+/* ============================================================
+   模块 20 (v23.1): Admin 总览台 —— 与主端一致的米黄体系
+   作用域 = .admin-scope（AdminPage 根节点）。
+   背景/卡片/边框/文字等**全部继承主端 :root 米黄 token**，不再覆盖。
+   仅两件事作用域化：① accent 家族重映射到暖铜 --brand（对齐 C 端 v19 选中态）；
+   ② 4 个健康红绿灯语义色（暖调，坐在米黄底上）。C 端不含 .admin-scope 故零影响。
+   ============================================================ */
+.admin-scope {
+  /* accent 家族 → 暖铜 --brand（tab 下划线 / 链接 / 选中行 / sparkline / focus ring） */
+  --primary: var(--brand);
+  --primary-foreground: var(--brand-foreground);
+  --accent: var(--brand-soft);
+  --accent-foreground: var(--brand);
+  --ring: var(--brand);
+
+  /* 健康语义色（红绿灯 / badge），暖调，与 accent 严格分离 */
+  --a-ok: #2E7D51;        --a-ok-soft: #E6F1E7;
+  --a-warn: #B26A00;      --a-warn-soft: #F8ECD8;
+  --a-crit: #C0392B;      --a-crit-soft: #FAE4E0;
+  --a-unknown: #8A857C;   --a-unknown-soft: #EFEBE4;
+}
+
+.dark .admin-scope {
+  /* 暗色下 accent 同样跟随主端暗色 --brand；背景等继承全局 .dark */
+  --primary: var(--brand);
+  --primary-foreground: var(--brand-foreground);
+  --accent: var(--brand-soft);
+  --accent-foreground: var(--brand);
+  --ring: var(--brand);
+
+  --a-ok: #6FBE92;        --a-ok-soft: #1E3226;
+  --a-warn: #E0A45A;      --a-warn-soft: #3A2E1C;
+  --a-crit: #EF6B5F;      --a-crit-soft: #3A211E;
+  --a-unknown: #A79D90;   --a-unknown-soft: #2A2620;
+}
+
+/* 健康语义工具类（OverviewTab 用）——符号+文字，不只靠颜色 */
+.admin-scope .a-text-ok { color: var(--a-ok); }
+.admin-scope .a-text-warn { color: var(--a-warn); }
+.admin-scope .a-text-crit { color: var(--a-crit); }
+.admin-scope .a-text-unknown { color: var(--a-unknown); }
+.admin-scope .a-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.admin-scope .a-pill-ok { background: var(--a-ok-soft); color: var(--a-ok); }
+.admin-scope .a-pill-warn { background: var(--a-warn-soft); color: var(--a-warn); }
+.admin-scope .a-pill-crit { background: var(--a-crit-soft); color: var(--a-crit); }
+.admin-scope .a-pill-unknown { background: var(--a-unknown-soft); color: var(--a-unknown); }

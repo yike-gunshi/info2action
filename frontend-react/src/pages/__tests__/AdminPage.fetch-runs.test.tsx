@@ -14,6 +14,15 @@ vi.mock('../../lib/api', () => ({
   getFetchRun: vi.fn(),
   getFetchRunItems: vi.fn(),
   getEmbeddingUsage: vi.fn(),
+  getAdminSources: vi.fn(),
+  validateAdminSource: vi.fn(),
+  createAdminSource: vi.fn(),
+  updateAdminSource: vi.fn(),
+  deleteAdminSource: vi.fn(),
+  reconcileLingowhaleSources: vi.fn(),
+  getAdminSourceAlgoParams: vi.fn(),
+  updateAdminSourceAlgoParams: vi.fn(),
+  getAdminConsoleSummary: vi.fn(),
 }))
 
 vi.mock('sonner', () => ({
@@ -25,6 +34,7 @@ vi.mock('sonner', () => ({
 
 import {
   createInviteCodes,
+  getAdminConsoleSummary,
   getAdminOverview,
   getEmbeddingUsage,
   getFetchRun,
@@ -33,6 +43,12 @@ import {
   getInviteCodes,
   type InviteCode,
 } from '../../lib/api'
+
+// v23.0: AdminPage 现为 4-tab；测试渲染后切到目标 tab（避开默认「总览」）
+function renderAdminAt(tab: 'runs' | 'access') {
+  window.location.hash = `admin/${tab}`
+  return render(<AdminPage />)
+}
 
 const run = {
   id: 7,
@@ -115,6 +131,7 @@ describe('AdminPage fetch runs', () => {
         },
       ],
     })
+    vi.mocked(getAdminConsoleSummary).mockResolvedValue({ available: false, reason: 'remote_required' })
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText: vi.fn().mockResolvedValue(undefined) },
@@ -124,12 +141,13 @@ describe('AdminPage fetch runs', () => {
   afterEach(() => {
     cleanup()
     vi.clearAllMocks()
+    window.location.hash = ''
   })
 
   it('shows fetch-run source drilldown and links titles to item detail', async () => {
-    render(<AdminPage />)
+    renderAdminAt('runs')
 
-    expect(await screen.findByText('抓取运行')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '抓取运行' })).toBeInTheDocument()
     expect(screen.getByText('#7')).toBeInTheDocument()
     expect(within(screen.getByTestId('run-row-7')).getByText('1/1')).toBeInTheDocument()
     expect(screen.getByText('following')).toBeInTheDocument()
@@ -177,7 +195,7 @@ describe('AdminPage fetch runs', () => {
     vi.mocked(getAdminOverview).mockResolvedValueOnce(adminOverviewFor([overviewRun]))
     vi.mocked(getFetchRun).mockResolvedValueOnce({ run: detailRun })
 
-    render(<AdminPage />)
+    renderAdminAt('runs')
 
     const row = await screen.findByTestId('run-row-1349')
     await waitFor(() => {
@@ -197,7 +215,7 @@ describe('AdminPage fetch runs', () => {
     vi.mocked(getAdminOverview).mockResolvedValueOnce(adminOverviewFor([run], 1))
     vi.mocked(getFetchRuns).mockResolvedValueOnce({ runs: [olderRun], limit: 50, offset: 1 })
 
-    render(<AdminPage />)
+    renderAdminAt('runs')
 
     const scroller = await screen.findByTestId('run-ledger-scroll')
     Object.defineProperty(scroller, 'scrollHeight', { value: 1000, configurable: true })
@@ -221,9 +239,9 @@ describe('AdminPage fetch runs', () => {
       ],
     })
 
-    render(<AdminPage />)
+    renderAdminAt('access')
 
-    expect(await screen.findByText('权限管理')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '权限管理' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('生成数量'), { target: { value: '3' } })
     fireEvent.change(screen.getByLabelText('每个码可用'), { target: { value: '2' } })
     fireEvent.click(screen.getByRole('button', { name: '生成' }))
@@ -243,7 +261,7 @@ describe('AdminPage fetch runs', () => {
       { ...inviteBase, code: 'EXPIRED1', max_uses: 1, used_count: 0, expires_at: '2000-01-01T00:00:00' },
     ]))
 
-    render(<AdminPage />)
+    renderAdminAt('access')
 
     expect(await screen.findByText('UNUSED01')).toBeInTheDocument()
     expect(screen.getByText('0/100')).toBeInTheDocument()

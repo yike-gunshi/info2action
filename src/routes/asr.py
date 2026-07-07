@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+from time_utils import parse_datetime
 
 from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -94,12 +96,12 @@ def _zombie_check(conn, item_id: str, state: dict) -> dict:
     attempted = state.get("asr_attempted_at")
     if not attempted:
         return state
-    try:
-        t = datetime.fromisoformat(attempted)
-    except ValueError:
+    # BF-0705-4: 统一走 parse_datetime(返回 aware UTC;兼容 Z 后缀——py3.10 的
+    # fromisoformat 不认 Z,生产上曾因此静默失效;legacy naive 按项目约定 +8 解释)。
+    t = parse_datetime(attempted)
+    if t is None:
         return state
-    now = datetime.now(t.tzinfo) if t.tzinfo else datetime.utcnow()
-    if now - t < timedelta(minutes=ZOMBIE_THRESHOLD_MIN):
+    if datetime.now(timezone.utc) - t < timedelta(minutes=ZOMBIE_THRESHOLD_MIN):
         return state
     if remote_db.app_state_to_remote():
         remote_db.update_item_asr_fields_remote(
@@ -151,11 +153,15 @@ async def trigger_asr(request: Request, item_id: str,
 
     conn = None if remote_db.app_state_to_remote() else db.get_conn()
     try:
-        state = _fetch_item_asr_state(conn, item_id)
+        # BF-0705-1: remote 模式远程往返外移线程,不阻塞事件循环(对齐 GET 的 BE-1)
+        state = await _fetch_item_asr_state_async(conn, item_id)
         if not state or not _can_access_item_asr(request, state):
             raise HTTPException(status_code=404, detail="item not found")
 
-        state = _zombie_check(conn, item_id, state)
+        if conn is None:
+            state = await run_in_threadpool(_zombie_check, None, item_id, state)
+        else:
+            state = _zombie_check(conn, item_id, state)
 
         # 缓存命中: success 且非 skip_transcript 直接返回
         if state["asr_status"] == "success" and not skip_transcript:
@@ -189,12 +195,18 @@ async def trigger_asr(request: Request, item_id: str,
 
         # 持久化 running 要早于 worker 内部下载/抽音频阶段:
         # 用户关闭弹窗再打开、刷新页面或换端访问时,都应该看到"转写中"而不是重新可点。
-        _write_route_asr_status(
-            conn,
-            item_id,
-            asr_status="running",
-            asr_failed_reason=None,
-        )
+        if conn is None:
+            await run_in_threadpool(
+                _write_route_asr_status, None, item_id,
+                asr_status="running", asr_failed_reason=None,
+            )
+        else:
+            _write_route_asr_status(
+                conn,
+                item_id,
+                asr_status="running",
+                asr_failed_reason=None,
+            )
     finally:
         if conn is not None:
             conn.close()
@@ -217,9 +229,9 @@ async def trigger_asr(request: Request, item_id: str,
             except Exception as e:  # noqa: BLE001
                 message = str(e)[:200]
                 try:
-                    _write_route_asr_status(
-                        None,
-                        item_id,
+                    # conn=None: 本地模式在线程内自建连接,remote 模式为 HTTP 往返,均可外移
+                    await run_in_threadpool(
+                        _write_route_asr_status, None, item_id,
                         asr_status="failed_asr",
                         asr_failed_reason=f"worker_crash: {message}",
                     )
@@ -243,7 +255,7 @@ async def retry_translate(request: Request, item_id: str):
         raise HTTPException(status_code=401, detail="login required")
 
     conn = None if remote_db.app_state_to_remote() else db.get_conn()
-    state = _fetch_item_asr_state(conn, item_id)
+    state = await _fetch_item_asr_state_async(conn, item_id)  # BF-0705-1
     if not state or not _can_access_item_asr(request, state):
         raise HTTPException(status_code=404, detail="item not found")
     if not state.get("asr_text"):
@@ -256,7 +268,8 @@ async def retry_translate(request: Request, item_id: str):
         if cn_segments and len(cn_segments) == len(segments):
             text_cn = "\n".join(s for s in cn_segments if s)
             if remote_db.app_state_to_remote():
-                remote_db.update_item_asr_fields_remote(
+                await run_in_threadpool(
+                    remote_db.update_item_asr_fields_remote,
                     item_id,
                     asr_text_cn=text_cn,
                     asr_segments_cn=cn_segments,
@@ -274,7 +287,8 @@ async def retry_translate(request: Request, item_id: str):
     if not text_cn:
         raise HTTPException(status_code=502, detail="translation failed")
     if remote_db.app_state_to_remote():
-        remote_db.update_item_asr_fields_remote(item_id, asr_text_cn=text_cn)
+        await run_in_threadpool(remote_db.update_item_asr_fields_remote,
+                                item_id, asr_text_cn=text_cn)
     else:
         conn.execute("UPDATE items SET asr_text_cn = ? WHERE id = ?", (text_cn, item_id))
         conn.commit()

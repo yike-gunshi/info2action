@@ -58,7 +58,7 @@ from backend_fetch_scheduler import (
 
 # ── Route imports ───────────────────────────────────────────
 from routes import feed, actions, submit, fetch, config, briefing, interests, health, terminal, context
-from routes import auth, admin, user, asr, media
+from routes import auth, admin, user, asr, media, sources
 from routes import clusters  # v15.0 event aggregation
 
 
@@ -461,7 +461,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
@@ -507,6 +507,7 @@ app.include_router(admin.router)
 app.include_router(user.router)
 app.include_router(asr.router)
 app.include_router(media.router)
+app.include_router(sources.router)
 app.include_router(clusters.router)  # v15.0 /api/feed/events, /api/clusters/..., /api/search
 
 # ── v12.2 ASR state: Semaphore(3) per user + SSE event buses per item ──

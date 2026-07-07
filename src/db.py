@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Info Radar — SQLite database module."""
 import json, os, sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import action_detail_read_model
 from category_taxonomy import canonicalize_category, expand_query_categories
@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS actions (
   action_type TEXT NOT NULL,
   related_project TEXT,
   prompt TEXT NOT NULL,
+  steps TEXT,
   reason TEXT,
   priority TEXT DEFAULT 'medium',
 
@@ -417,6 +418,19 @@ CREATE TABLE IF NOT EXISTS asr_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_asr_usage_date ON asr_usage(date_cst);
 
+-- v21.0 action-revival: 行动点生成每日配额表,按 (user_id, day_cst) 分片。
+-- day_cst: 北京时间日期 'YYYY-MM-DD'(自然日零点重置依赖此键)。
+-- count: 当日已发起的生成次数(item + cluster 合计;发起即计,失败/取消不退)。
+-- 与 actions 行数解耦 —— 删除行动点不释放配额。
+CREATE TABLE IF NOT EXISTS user_daily_generation (
+  user_id     TEXT NOT NULL,
+  day_cst     TEXT NOT NULL,
+  count       INTEGER NOT NULL DEFAULT 0,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (user_id, day_cst)
+);
+CREATE INDEX IF NOT EXISTS idx_user_daily_generation_day ON user_daily_generation(day_cst);
+
 -- v15.0 event-aggregation: 3 new tables (PRD §5.12 / §5.13 / §5.14)
 CREATE TABLE IF NOT EXISTS clusters (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,6 +492,25 @@ CREATE TABLE IF NOT EXISTS settings (
   value      TEXT,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- v22.0 subscription-config: 信源注册表(方案 B 单一真相源)。抓取管线改读此表;
+-- item 挂 source_id 归属;停用/删除只停增量,存量与展示不变(软删 status=deleted)。
+CREATE TABLE IF NOT EXISTS sources (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform     TEXT NOT NULL,            -- wechat_mp / x_user / rss / reddit / github_repo / bilibili_up
+  source_key   TEXT NOT NULL,            -- 平台内唯一标识: channel_id / handle / feed URL / subreddit / owner/repo / uid
+  display_name TEXT,
+  status       TEXT NOT NULL DEFAULT 'active',  -- active/paused/pending/broken/not_fetched/deleted
+  config_json  TEXT,                     -- per-source 参数(RSS slug / X 每轮条数等)
+  origin       TEXT,                     -- seed_import / admin_add / reconcile_import
+  validated_at TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_success_at TEXT,
+  last_error TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  UNIQUE(platform, source_key)
+);
 """
 
 
@@ -497,6 +530,38 @@ def get_conn():
     except Exception:
         pass
     conn.executescript(SCHEMA)
+    # v22.0 subscription-config: item 归属到 sources 注册表(反查 (platform, source_key) 回填)
+    try:
+        conn.execute("ALTER TABLE items ADD COLUMN source_id INTEGER")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # v22.0 subscription-config: per-source fetch failure tracking.
+    try:
+        conn.execute("ALTER TABLE sources ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE sources ADD COLUMN last_success_at TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE sources ADD COLUMN last_error TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    for _sql in (
+        "CREATE INDEX IF NOT EXISTS idx_sources_status ON sources(status)",
+        "CREATE INDEX IF NOT EXISTS idx_sources_platform ON sources(platform)",
+        "CREATE INDEX IF NOT EXISTS idx_items_source_id ON items(source_id) WHERE source_id IS NOT NULL",
+    ):
+        try:
+            conn.execute(_sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
     # Add ai_category column if it doesn't exist yet
     try:
         conn.execute("ALTER TABLE items ADD COLUMN ai_category TEXT")
@@ -659,6 +724,13 @@ def get_conn():
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+    # v21.0 action-revival: 每用户 Discord 派发目标频道(forum 或 text channel)
+    for col in ('discord_channel_id TEXT',):
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     # v12.2: Twitter video ASR fields on items
     # asr_status enum: running|success|failed_download|failed_extract|
     #                  failed_upload|failed_asr|failed_empty|failed_summary
@@ -722,6 +794,7 @@ def get_conn():
         'source_id TEXT',
         'cluster_version INTEGER',
         'is_stale INTEGER NOT NULL DEFAULT 0',
+        'steps TEXT',  # v21.0: 结构化行动点(人看),与自包含 prompt(机器执行)分离
     ):
         try:
             conn.execute(f"ALTER TABLE actions ADD COLUMN {col}")
@@ -997,9 +1070,209 @@ def bump_cluster_version_and_stale_actions(conn, cluster_id, new_version):
     conn.commit()
 
 
-def upsert_item(conn, item_dict):
-    """Insert or update an item. On conflict, update metrics and detail."""
-    cols = ['id', 'user_id', 'platform', 'source', 'fetch_run_id', 'title', 'content', 'author_name',
+# v22.0 subscription-config: 停用兜底——这些状态的源,其新 item 不入库(存量不动)。
+_SOURCE_DROP_STATUSES = frozenset({'paused', 'deleted', 'broken'})
+
+
+def _source_config_dict(raw_cfg):
+    if isinstance(raw_cfg, dict):
+        return raw_cfg
+    if raw_cfg:
+        try:
+            parsed = json.loads(raw_cfg)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def build_source_index_from_rows(rows):
+    """把 sources 注册表载入内存,供 ingest 时按 (platform, item.source) 反查。
+
+    返回 dict, 各平台一个子 map: 反查键 → (source_id, status)。
+    反查键因平台而异(item.source 是平台内子源串, 与 sources.source_key 语义不同):
+      rss    : config_json.slug   (item.source = 'feed:{slug}')
+      reddit : source_key(sub)    (item.source = 'r/{sub}')
+      github : source_key(owner/repo) (item.source = 'awesome:{owner/repo}')
+      wechat RSS : source_key(feed URL) (item.source = 'wechat:{url}')
+      wechat Lingowhale : source_key(channel_id) (item.source = 'lingowhale:{channel_id}')
+      x_user : source_key(handle)
+      bili   : source_key(uid)
+    """
+    idx = {
+        'rss_by_slug': {}, 'reddit_by_key': {}, 'github_by_key': {},
+        'wechat_by_url': {}, 'wechat_by_channel_id': {},
+        'x_by_handle': {}, 'bili_by_uid': {},
+    }
+    for row in rows:
+        sid, plat, key, status, cfg = (
+            row['id'], row['platform'], row['source_key'], row['status'], row['config_json'])
+        if plat == 'rss':
+            slug = _source_config_dict(cfg).get('slug')
+            if slug:
+                idx['rss_by_slug'][slug] = (sid, status)
+        elif plat == 'reddit':
+            idx['reddit_by_key'][key] = (sid, status)
+        elif plat == 'github_repo':
+            idx['github_by_key'][key] = (sid, status)
+        elif plat == 'wechat_mp':
+            backend = _source_config_dict(cfg).get('backend')
+            is_url = isinstance(key, str) and key.startswith(('http://', 'https://'))
+            if backend == 'lingowhale' or not is_url:
+                idx['wechat_by_channel_id'][key] = (sid, status)
+            else:
+                idx['wechat_by_url'][key] = (sid, status)
+        elif plat == 'x_user':
+            idx['x_by_handle'][key] = (sid, status)
+        elif plat == 'bilibili_up':
+            idx['bili_by_uid'][key] = (sid, status)
+    return idx
+
+
+def load_source_index(conn):
+    return build_source_index_from_rows(conn.execute(
+        "SELECT id, platform, source_key, status, config_json FROM sources"))
+
+
+def normalize_active_source_row(row):
+    return {
+        'id': row['id'],
+        'source_key': row['source_key'],
+        'display_name': row['display_name'],
+        'config_json': _source_config_dict(row['config_json']),
+    }
+
+
+def list_active_sources(conn, platform):
+    """Return active sources for one platform, with config_json parsed."""
+    rows = conn.execute(
+        """SELECT id, source_key, display_name, config_json
+           FROM sources
+           WHERE platform = ? AND status = 'active'
+           ORDER BY id""",
+        (platform,),
+    ).fetchall()
+    return [normalize_active_source_row(row) for row in rows]
+
+
+def _broken_after_threshold():
+    try:
+        with open(os.path.join(BASE, 'config', 'config.json'), encoding='utf-8') as f:
+            cfg = json.load(f)
+        raw = (cfg.get('sources') or {}).get('broken_after_failures', 5)
+        value = int(raw)
+        return value if value > 0 else 5
+    except Exception:
+        return 5
+
+
+def record_source_fetch_result(conn, source_id, *, ok, error=None, broken_after=5):
+    """Record one source fetch result without interrupting the fetch pipeline."""
+    try:
+        if source_id is None:
+            return
+        row = conn.execute(
+            "SELECT status, consecutive_failures FROM sources WHERE id = ?",
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            return
+        status = row['status']
+        if status not in {'active', 'broken'}:
+            return
+
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        if ok:
+            new_status = 'active' if status == 'broken' else status
+            conn.execute(
+                """UPDATE sources
+                      SET status = ?,
+                          consecutive_failures = 0,
+                          last_success_at = ?,
+                          last_error = NULL,
+                          updated_at = ?
+                    WHERE id = ?""",
+                (new_status, now, now, source_id),
+            )
+            conn.commit()
+            return
+
+        try:
+            threshold = int(broken_after)
+        except (TypeError, ValueError):
+            threshold = 5
+        if threshold <= 0:
+            threshold = 5
+        current_failures = int(row['consecutive_failures'] or 0)
+        failures = current_failures + 1
+        new_status = 'broken' if status == 'active' and failures >= threshold else status
+        last_error = None if error is None else str(error)[:500]
+        conn.execute(
+            """UPDATE sources
+                  SET status = ?,
+                      consecutive_failures = ?,
+                      last_error = ?,
+                      updated_at = ?
+                WHERE id = ?""",
+            (new_status, failures, last_error, now, source_id),
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[warn] failed to record source fetch result for source_id={source_id}: {exc}")
+
+
+def resolve_source(index, platform, source, *, channel_id=None, handle=None, uid=None):
+    """把 item 的 (platform, source) 映射到 (source_id, status)。
+
+    算法源/榜单(twitter following/for-you、hackernews、bili hot/rank、github trending、
+    xiaohongshu、waytoagi)不在注册表 → 返回 (None, None), 表示不归属、不过滤。
+    """
+    if not index:
+        return (None, None)
+    if platform == 'rss' and isinstance(source, str) and source.startswith('feed:'):
+        return index['rss_by_slug'].get(source[len('feed:'):], (None, None))
+    if platform == 'reddit' and isinstance(source, str) and source.startswith('r/'):
+        return index['reddit_by_key'].get(source[len('r/'):], (None, None))
+    if platform == 'github' and isinstance(source, str) and source.startswith('awesome:'):
+        return index['github_by_key'].get(source[len('awesome:'):], (None, None))
+    if platform == 'lingowhale':
+        if channel_id:
+            return index.get('wechat_by_channel_id', {}).get(channel_id, (None, None))
+        if isinstance(source, str) and source.startswith('lingowhale:'):
+            return index.get('wechat_by_channel_id', {}).get(
+                source[len('lingowhale:'):], (None, None))
+        if isinstance(source, str) and source.startswith('wechat:'):
+            return index.get('wechat_by_url', {}).get(source[len('wechat:'):], (None, None))
+    if platform == 'twitter' and isinstance(source, str) and source.startswith('user:'):
+        return index['x_by_handle'].get(source[len('user:'):], (None, None))
+    if platform == 'x_user' and handle:
+        return index['x_by_handle'].get(handle, (None, None))
+    if platform == 'bilibili' and uid:
+        return index['bili_by_uid'].get(uid, (None, None))
+    return (None, None)
+
+
+def upsert_item(conn, item_dict, source_index=None):
+    """Insert or update an item. On conflict, update metrics and detail.
+
+    v22.0: 若传入 source_index(load_source_index 产出), 则:
+      - 反查并回填 items.source_id(算法源为 None);
+      - 若源状态属停用集(paused/deleted/broken), 丢弃本 item 不入库, 返回 'dropped'。
+    不传 source_index 时行为与旧版一致(source_id 取 item_dict 里的值, 通常 None)。
+    """
+    if source_index is not None:
+        sid, status = resolve_source(
+            source_index, item_dict.get('platform'), item_dict.get('source'),
+            channel_id=item_dict.get('channel_id'),
+            handle=item_dict.get('author_handle') or item_dict.get('handle'),
+            uid=item_dict.get('author_id'),
+        )
+        if status in _SOURCE_DROP_STATUSES:
+            return 'dropped'
+        item_dict = dict(item_dict)
+        item_dict['source_id'] = sid
+    cols = ['id', 'user_id', 'platform', 'source', 'source_id', 'fetch_run_id', 'title', 'content', 'author_name',
             'author_id', 'author_avatar', 'url', 'cover_url', 'media_json',
             'metrics_json', 'tags_json', 'lang', 'detail_json', 'comments_json',
             'ai_summary', 'ai_key_points', 'relevance_score', 'fetched_at', 'published_at']
@@ -2241,19 +2514,24 @@ def create_action(conn, *, source_type, title, action_type, prompt,
                   source_item_ids=None, reason=None, priority='medium',
                   related_project=None, status='pending',
                   direction='_uncategorized', direction_label='待归类',
-                  user_id=None):
-    """Create a new action with v8.0 schema. Returns the new action UUID."""
+                  user_id=None, steps=None):
+    """Create a new action with v8.0 schema. Returns the new action UUID.
+
+    v21.0: `steps`(list|None)是人看的结构化行动点,与自包含 `prompt`(机器执行)分离;
+    存 JSON 文本,read model 优先读它、无则回退拆 prompt。
+    """
     action_id = str(_uuid.uuid4())
     source_ids_json = json.dumps(source_item_ids or [], ensure_ascii=False)
+    steps_json = json.dumps(steps, ensure_ascii=False) if isinstance(steps, list) and steps else None
     conn.execute("""
         INSERT INTO actions (id, user_id, source_type, source_item_ids,
             original_title, original_prompt, original_reason, original_priority,
-            title, action_type, related_project, prompt, reason, priority, status,
+            title, action_type, related_project, prompt, steps, reason, priority, status,
             direction, direction_label)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (action_id, user_id, source_type, source_ids_json,
           title, prompt, reason, priority,
-          title, action_type, related_project, prompt, reason, priority, status,
+          title, action_type, related_project, prompt, steps_json, reason, priority, status,
           direction, direction_label))
     conn.commit()
     # Log creation event
@@ -2959,7 +3237,7 @@ def update_user(conn, user_id, **fields):
     """Update user fields."""
     allowed = {'username', 'email', 'password_hash', 'role', 'discord_bot_token_enc', 'last_login_at',
                 'email_verified', 'verification_code', 'verification_code_expires',
-                'reset_token', 'reset_token_expires'}
+                'reset_token', 'reset_token_expires', 'discord_channel_id'}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
@@ -3235,3 +3513,100 @@ def consume_asr_quota(conn, duration_sec: int, user_id: int = 0) -> dict:
             pass
         raise
     return get_asr_usage_today(conn, user_id)
+
+
+# ── v21.0 action-revival: 行动点生成每日配额 ──────────────────────
+
+ACTION_GEN_DAILY_LIMIT_DEFAULT = 5
+
+
+def action_gen_daily_limit() -> int:
+    """每日生成上限(非 admin)。env `ACTION_GEN_DAILY_LIMIT` 可覆盖。"""
+    raw = os.environ.get('ACTION_GEN_DAILY_LIMIT', '').strip()
+    if not raw:
+        return ACTION_GEN_DAILY_LIMIT_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return ACTION_GEN_DAILY_LIMIT_DEFAULT
+
+
+def get_generation_usage_today(conn, user_id: str) -> dict:
+    """返回某用户今日(北京时间)的生成配额快照。
+
+    Returns:
+        {
+            'day_cst': '2026-07-04',
+            'used': 2,
+            'limit': 5,
+            'remaining': 3,
+            'over_limit': False,
+            'reset_at': 'YYYY-MM-DDT00:00:00+08:00',
+        }
+    """
+    from datetime import datetime, timedelta
+    today = _asr_today_cst()
+    limit = action_gen_daily_limit()
+    row = conn.execute(
+        "SELECT count FROM user_daily_generation WHERE user_id = ? AND day_cst = ?",
+        (str(user_id), today),
+    ).fetchone()
+    used = int(row['count']) if row and row['count'] else 0
+    try:
+        next_day = (datetime.strptime(today, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        reset_at = f"{next_day}T00:00:00+08:00"
+    except Exception:
+        reset_at = None
+    return {
+        'day_cst': today,
+        'used': used,
+        'limit': limit,
+        'remaining': max(0, limit - used),
+        'over_limit': used >= limit,
+        'reset_at': reset_at,
+    }
+
+
+def try_consume_generation_quota(conn, user_id: str) -> tuple[bool, dict]:
+    """原子地"发起即计":若今日未超限则 +1 并返回 (True, 新快照),否则 (False, 当前快照)。
+
+    用 BEGIN IMMEDIATE 拿写锁,避免并发多次生成刷额度的读-读-写竞态。
+    admin 豁免由调用方(路由层)判断,本函数只管计数。
+    """
+    from datetime import datetime
+    today = _asr_today_cst()
+    limit = action_gen_daily_limit()
+    now_iso = datetime.now().isoformat()
+    own_tx = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        own_tx = True
+    except sqlite3.OperationalError:
+        pass
+    try:
+        row = conn.execute(
+            "SELECT count FROM user_daily_generation WHERE user_id = ? AND day_cst = ?",
+            (str(user_id), today),
+        ).fetchone()
+        used = int(row['count']) if row and row['count'] else 0
+        if used >= limit:
+            if own_tx:
+                conn.rollback()
+            return False, get_generation_usage_today(conn, user_id)
+        conn.execute("""
+            INSERT INTO user_daily_generation (user_id, day_cst, count, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(user_id, day_cst) DO UPDATE SET
+                count = count + 1,
+                updated_at = excluded.updated_at
+        """, (str(user_id), today, now_iso))
+        if own_tx:
+            conn.commit()
+    except Exception:
+        try:
+            if own_tx:
+                conn.rollback()
+        except Exception:
+            pass
+        raise
+    return True, get_generation_usage_today(conn, user_id)

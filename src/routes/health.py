@@ -13,6 +13,7 @@ import db
 import remote_db
 from authz import require_admin
 from deps import BASE
+from health_freshness import classify_platform_freshness, platform_freshness_message
 
 router = APIRouter()
 
@@ -146,12 +147,13 @@ def get_health(recheck: str = Query(None)):
             try:
                 last_dt = datetime.fromisoformat(plat_info['last_fetch'])
                 age_hours = (datetime.now() - last_dt).total_seconds() / 3600
-                if age_hours > 72:
+                freshness_level = classify_platform_freshness(age_hours)
+                if freshness_level == 'crit':
                     plat_info['status'] = 'error'
-                    plat_info['message'] = f'已 {int(age_hours)}h 未更新'
-                elif age_hours > 24:
+                    plat_info['message'] = platform_freshness_message(age_hours)
+                elif freshness_level == 'warn':
                     plat_info['status'] = 'warning'
-                    plat_info['message'] = f'已 {int(age_hours)}h 未更新'
+                    plat_info['message'] = platform_freshness_message(age_hours)
                 else:
                     plat_info['status'] = 'ok'
                     plat_info['message'] = ''

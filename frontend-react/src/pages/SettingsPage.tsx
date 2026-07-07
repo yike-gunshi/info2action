@@ -1,9 +1,10 @@
 import { useEffect, useState, useCallback } from 'react'
-import { ArrowLeft, ArrowRight, Loader2, Lock, Eye, EyeOff, Check, Pencil, X } from 'lucide-react'
+import { ArrowLeft, ArrowRight, Loader2, Lock, Eye, EyeOff, Check, Pencil, X, Copy } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { useAuthStore } from '../store/authStore'
 import { getUserSettings, updateUserSettings, getUserProfile, updateUserProfile } from '../lib/api'
 import { ROLES, INTERESTS, TOOLS, getRoleLabel, getInterestLabels, getToolLabels } from '../lib/profileOptions'
+import { ACTION_PROFILE_PROMPT, PROFILE_PROMPT_MAX_CHARS } from '../lib/actionProfilePrompt'
 import { toast } from 'sonner'
 import { TopBar } from '../components/layout/TopBar'
 
@@ -23,15 +24,38 @@ export function SettingsPage() {
   const [profileLoading, setProfileLoading] = useState(true)
   const [editModalOpen, setEditModalOpen] = useState(false)
 
+  // v21.0 行动画像(manifest)
+  const [manifest, setManifest] = useState('')
+  const [manifestDraft, setManifestDraft] = useState('')
+  const [manifestEditing, setManifestEditing] = useState(false)
+  const [manifestSaving, setManifestSaving] = useState(false)
+
+  // v21.0 Discord per-user 频道
+  const [channelId, setChannelId] = useState('')
+  const [channelSaving, setChannelSaving] = useState(false)
+
   useEffect(() => {
     getUserSettings()
       .then((s) => {
         setMasked(s.discord_bot_token || '')
         setHasToken(s.has_discord_token)
+        setChannelId(s.discord_channel_id || '')
       })
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [])
+
+  const handleChannelSave = useCallback(async () => {
+    setChannelSaving(true)
+    try {
+      await updateUserSettings({ discord_channel_id: channelId.trim() })
+      toast.success('Discord 频道已保存')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setChannelSaving(false)
+    }
+  }, [channelId])
 
   useEffect(() => {
     getUserProfile()
@@ -40,11 +64,37 @@ export function SettingsPage() {
           setProfileRole(res.profile.role)
           setProfileInterests(res.profile.interests || [])
           setProfileTools(res.profile.tools || [])
+          setManifest(res.profile.manifest || '')
         }
       })
       .catch(() => {})
       .finally(() => setProfileLoading(false))
   }, [])
+
+  const handleCopyPrompt = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(ACTION_PROFILE_PROMPT)
+      toast.success('画像 Prompt 已复制,交给你的 AI 执行后把结果粘回来')
+    } catch {
+      toast.error('复制失败,请手动选择复制')
+    }
+  }, [])
+
+  const handleManifestSave = useCallback(async () => {
+    const value = manifestDraft.trim()
+    if (!value) return
+    setManifestSaving(true)
+    try {
+      await updateUserProfile({ manifest: value })
+      setManifest(value)
+      setManifestEditing(false)
+      toast.success('个人画像已保存')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '保存失败,请重试')
+    } finally {
+      setManifestSaving(false)
+    }
+  }, [manifestDraft])
 
   async function handleSave() {
     if (!token.trim()) return
@@ -167,6 +217,86 @@ export function SettingsPage() {
           )}
         </section>
 
+        {/* v21.0 行动画像(深度画像 manifest) */}
+        <section className="mb-5 rounded-[4px] border border-border bg-card p-5 shadow-none sm:p-6" data-testid="settings-manifest">
+          <h2 className="mb-1 font-event-title text-[18px] font-semibold leading-tight text-foreground">行动画像</h2>
+          <p className="mb-4 font-body-cjk text-[13px] leading-relaxed text-muted-foreground">
+            把你的背景交给 AI,行动点会更贴合你。复制下面的 Prompt,交给你常用的
+            GPT / Claude Code / Codex 执行,再把结果粘回来保存。
+          </p>
+
+          <button
+            type="button"
+            data-testid="manifest-copy-prompt"
+            onClick={handleCopyPrompt}
+            className="mb-4 inline-flex h-9 items-center gap-1.5 rounded-[4px] border border-[var(--brand-border)] bg-[var(--brand-soft)] px-3 font-body-cjk text-sm font-medium text-[var(--brand)] transition-colors hover:opacity-90"
+          >
+            <Copy className="h-3.5 w-3.5" />
+            复制画像 Prompt
+          </button>
+
+          {profileLoading ? (
+            <div className="flex items-center gap-2 font-body-cjk text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin text-[var(--brand)]" />
+              加载中...
+            </div>
+          ) : manifest && !manifestEditing ? (
+            <div data-testid="manifest-configured" className="space-y-3">
+              <div className="rounded-[4px] border border-border bg-muted/50 p-3">
+                <p className="line-clamp-6 whitespace-pre-line font-body-cjk text-[13px] leading-relaxed text-foreground">
+                  {manifest}
+                </p>
+              </div>
+              <button
+                type="button"
+                data-testid="manifest-edit"
+                onClick={() => { setManifestDraft(manifest); setManifestEditing(true) }}
+                className="inline-flex items-center gap-1.5 font-body-cjk text-sm font-medium text-[var(--brand)] hover:underline"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+                编辑画像
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <textarea
+                data-testid="manifest-textarea"
+                value={manifestDraft}
+                onChange={(e) => setManifestDraft(e.target.value.slice(0, PROFILE_PROMPT_MAX_CHARS))}
+                rows={8}
+                placeholder="把 AI 生成的个人画像粘贴到这里..."
+                className="w-full resize-y rounded-[4px] border border-input bg-background px-3 py-2 font-body-cjk text-sm leading-relaxed text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+              <div className="flex items-center justify-between">
+                <span className={cn('font-body-cjk text-[12px]', manifestDraft.length >= PROFILE_PROMPT_MAX_CHARS ? 'text-destructive' : 'text-muted-foreground')}>
+                  {manifestDraft.length}/{PROFILE_PROMPT_MAX_CHARS}
+                </span>
+                <div className="flex gap-2">
+                  {manifest && (
+                    <button
+                      type="button"
+                      onClick={() => { setManifestEditing(false); setManifestDraft('') }}
+                      className="rounded-[4px] px-3 py-1.5 font-body-cjk text-sm text-muted-foreground hover:text-foreground"
+                    >
+                      取消
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="manifest-save"
+                    disabled={!manifestDraft.trim() || manifestSaving}
+                    onClick={handleManifestSave}
+                    className="inline-flex items-center gap-1.5 rounded-[4px] bg-[var(--brand)] px-4 py-1.5 font-body-cjk text-sm font-semibold text-[var(--brand-foreground)] transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {manifestSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    保存画像
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
         {/* Discord Token */}
         <section className="rounded-[4px] border border-border bg-card p-5 shadow-none sm:p-6">
           <h2 className="font-event-title text-[18px] font-semibold leading-tight text-foreground">Discord Bot Token</h2>
@@ -233,6 +363,38 @@ export function SettingsPage() {
                 <Lock className="h-3 w-3" />
                 Token 以 AES-256-GCM 加密存储
               </p>
+
+              {/* v21.0 派发目标频道 */}
+              <div className="mt-5 border-t border-border pt-5">
+                <h3 className="font-event-title text-[15px] font-semibold text-foreground">派发频道</h3>
+                <p className="mb-3 mt-1 font-body-cjk text-[13px] text-muted-foreground">
+                  行动点将派发到这个 Discord 频道 ID(论坛频道建帖 / 文字频道发消息)。留空则用平台默认频道。
+                </p>
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={channelId}
+                    data-testid="discord-channel-input"
+                    onChange={(e) => setChannelId(e.target.value)}
+                    placeholder="Discord Channel ID(纯数字)"
+                    className="auth-input flex-1"
+                  />
+                  <button
+                    onClick={handleChannelSave}
+                    data-testid="discord-channel-save"
+                    disabled={channelSaving}
+                    className={cn(
+                      'inline-flex h-11 items-center justify-center gap-2 rounded-[4px] px-5 font-body-cjk text-sm font-semibold transition-colors',
+                      'bg-[var(--brand)] text-[var(--brand-foreground)] hover:brightness-95',
+                      'disabled:opacity-50 disabled:cursor-not-allowed',
+                    )}
+                  >
+                    {channelSaving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    保存频道
+                  </button>
+                </div>
+              </div>
             </>
           )}
         </section>

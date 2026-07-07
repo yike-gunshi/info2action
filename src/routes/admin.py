@@ -179,6 +179,25 @@ async def admin_overview(request: Request, include_embedding: bool = False):
         conn.close()
 
 
+@router.get("/api/admin/console/summary")
+async def admin_console_summary(request: Request):
+    _, err = _require_admin(request)
+    if err:
+        return err
+
+    if not remote_db.app_state_to_remote():
+        return {'available': False, 'reason': 'remote_required'}
+
+    try:
+        return remote_db.admin_console_summary_remote()
+    except Exception as exc:
+        return JSONResponse({
+            'available': False,
+            'reason': 'remote_error',
+            'error': str(exc),
+        }, status_code=503)
+
+
 @router.get("/api/admin/remote-db/status")
 async def remote_database_status(request: Request):
     _, err = _require_admin(request)

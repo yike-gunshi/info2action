@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -222,7 +223,10 @@ async def doubao_poll_until_done(
     base_percent = 30  # submit 完成后起点
     while time.monotonic() - start < max_wait_sec:
         await asyncio.sleep(poll_interval)
-        api_status, body = doubao_query(request_id, api_key, resource_id)
+        # BF-0705-1: 同步 HTTP 外移线程,不阻塞事件循环
+        api_status, body = await asyncio.to_thread(
+            doubao_query, request_id, api_key, resource_id,
+        )
         elapsed = int(time.monotonic() - start)
         if api_status == "20000000":
             return body, elapsed, None
@@ -242,8 +246,35 @@ async def doubao_poll_until_done(
 # ---------- MiniMax 摘要(复用 generate_summaries.call_minimax)----------
 
 def load_minimax_config() -> dict:
+    """BF-0705-6: env/.env 优先(oss-release F3c,对齐 resolve_minimax_*_config)。
+
+    config.json 是 git 空模板(部署会覆盖),密钥真源在 .env;本函数曾是唯一
+    只读 config 的 MiniMax 消费者 → 生产 ASR 摘要/翻译全 401。
+    """
+    from env_utils import load_project_env
+
     with open(BASE / "config" / "config.json") as f:
-        return json.load(f)["ai_summary"]
+        cfg = dict(json.load(f)["ai_summary"])
+    project_env = load_project_env(BASE)
+    cfg["api_key"] = (
+        os.environ.get("MINIMAX_API_KEY")
+        or project_env.get("MINIMAX_API_KEY")
+        or cfg.get("api_key")
+        or ""
+    ).strip()
+    cfg["api_base"] = (
+        os.environ.get("MINIMAX_API_BASE")
+        or project_env.get("MINIMAX_API_BASE")
+        or cfg.get("api_base")
+        or ""
+    ).strip().rstrip("/")
+    cfg["model"] = (
+        os.environ.get("MINIMAX_MODEL")
+        or project_env.get("MINIMAX_MODEL")
+        or cfg.get("model")
+        or ""
+    ).strip()
+    return cfg
 
 
 def regenerate_summary_from_transcript(transcript: str, tweet_title: str, tweet_text: str,
@@ -299,7 +330,9 @@ def _update_asr_fields(conn, item_id: str, **fields) -> None:
 
 def _write_asr_status(conn, item_id: str, **fields) -> None:
     """把 ASR 相关字段一把写入 items 表."""
-    fields["asr_attempted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    # BF-0705-4: 统一 UTC Z 规范格式(与 time_utils.to_utc_iso 同款)。
+    # 本地 naive 会被 remote 规范化按 +8 猜测、被 _zombie_check 按 UTC 比较,时区差即误判量。
+    fields["asr_attempted_at"] = datetime.now(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _update_asr_fields(conn, item_id, **fields)
 
 
@@ -771,6 +804,17 @@ def run_asr_inline(
 
 # ---------- 异步版本(保留 HTTP/SSE 路径使用) ----------
 
+async def _db_io(fn, *args, **kwargs):
+    """BF-0705-1: DB 辅助函数的异步包装。
+
+    remote 模式下这些函数是远程 HTTP 往返,必须外移线程;
+    本地 sqlite 连接线程绑定(check_same_thread)且写入微秒级,留原线程执行(对齐 routes/asr.py BE-1)。
+    """
+    if remote_db.app_state_to_remote():
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return fn(*args, **kwargs)
+
+
 async def transcribe_and_summarize(
     item_id: str,
     user_id: int,
@@ -790,7 +834,7 @@ async def transcribe_and_summarize(
     if not remote_db.app_state_to_remote():
         import db
         conn = db.get_conn()
-    row = _fetch_asr_worker_item(conn, item_id)
+    row = await _db_io(_fetch_asr_worker_item, conn, item_id)
     if not row:
         raise ValueError(f"item {item_id} not found")
 
@@ -804,35 +848,36 @@ async def transcribe_and_summarize(
         transcript = row["asr_text"]
         if not transcript:
             return AsrResult("failed_summary", None, None, None, "no existing transcript")
-        _write_asr_status(conn, item_id, asr_status="running")
+        await _db_io(_write_asr_status, conn, item_id, asr_status="running")
         try:
             duration = row["asr_duration_sec"] or 0
-            summary = regenerate_summary_from_transcript(
+            summary = await asyncio.to_thread(
+                regenerate_summary_from_transcript,
                 transcript, row["title"] or "", row["content"] or "",
                 duration_min=duration / 60.0 if duration else 0.0,
             )
             if not _is_valid_summary(summary):
-                _write_asr_status(conn, item_id, asr_status="failed_summary",
-                                  asr_failed_reason="summary format invalid")
+                await _db_io(_write_asr_status, conn, item_id, asr_status="failed_summary",
+                             asr_failed_reason="summary format invalid")
                 return AsrResult("failed_summary", transcript, duration, None, "format invalid")
-            _update_asr_fields(conn, item_id, ai_summary=summary)
-            _write_asr_status(conn, item_id, asr_status="success", asr_failed_reason=None)
+            await _db_io(_update_asr_fields, conn, item_id, ai_summary=summary)
+            await _db_io(_write_asr_status, conn, item_id, asr_status="success", asr_failed_reason=None)
             await _emit("summary_updated", {"ai_summary": summary})
             await _emit("done", {"status": "success"})
             return AsrResult("success", transcript, duration, None)
         except Exception as e:
-            _write_asr_status(conn, item_id, asr_status="failed_summary",
-                              asr_failed_reason=str(e)[:200])
+            await _db_io(_write_asr_status, conn, item_id, asr_status="failed_summary",
+                         asr_failed_reason=str(e)[:200])
             await _emit("error", {"code": "summary_failed", "message": str(e)[:200]})
             return AsrResult("failed_summary", transcript, row["asr_duration_sec"], None, str(e)[:200])
 
     mp4_url = _extract_mp4_url(row["media_json"])
     if not mp4_url:
-        _write_asr_status(conn, item_id, asr_status="failed_empty",
-                          asr_failed_reason="no video in media_json")
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_empty",
+                     asr_failed_reason="no video in media_json")
         return AsrResult("failed_empty", None, None, None, "no video")
 
-    _write_asr_status(conn, item_id, asr_status="running")
+    await _db_io(_write_asr_status, conn, item_id, asr_status="running")
 
     mp4_tmp = f"/tmp/asr_{item_id}.mp4"
     mp3_tmp = f"/tmp/asr_{item_id}.mp3"
@@ -840,45 +885,45 @@ async def transcribe_and_summarize(
     # 1. 下载 mp4
     await _emit("progress", {"phase": "download", "message": "下载视频中", "percent": 5})
     try:
-        download_mp4(mp4_url, mp4_tmp)
+        await asyncio.to_thread(download_mp4, mp4_url, mp4_tmp)
     except Exception as e:
-        _write_asr_status(conn, item_id, asr_status="failed_download",
-                          asr_failed_reason=str(e)[:200])
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_download",
+                     asr_failed_reason=str(e)[:200])
         await _emit("error", {"code": "download_failed", "message": str(e)[:200]})
         return AsrResult("failed_download", None, None, None, str(e)[:200])
 
     # 2. ffmpeg 抽 mp3
     await _emit("progress", {"phase": "extract", "message": "提取音频中", "percent": 15})
     try:
-        ffmpeg_extract_mp3(mp4_tmp, mp3_tmp)
-        duration_sec = int(ffprobe_duration(mp3_tmp))
+        await asyncio.to_thread(ffmpeg_extract_mp3, mp4_tmp, mp3_tmp)
+        duration_sec = int(await asyncio.to_thread(ffprobe_duration, mp3_tmp))
     except NoAudioStreamError as e:
-        _write_asr_status(conn, item_id, asr_status="failed_empty",
-                          asr_failed_reason=str(e))
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_empty",
+                     asr_failed_reason=str(e))
         await _emit("error", {"code": "empty_transcript", "message": "视频无语音内容"})
         return AsrResult("failed_empty", None, None, None, str(e))
     except Exception as e:
-        _write_asr_status(conn, item_id, asr_status="failed_extract",
-                          asr_failed_reason=str(e)[:200])
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_extract",
+                     asr_failed_reason=str(e)[:200])
         await _emit("error", {"code": "extract_failed", "message": str(e)[:200]})
         return AsrResult("failed_extract", None, None, None, str(e)[:200])
 
     # 3. 上传 OSS
     await _emit("progress", {"phase": "upload", "message": "上传音频中", "percent": 25})
     try:
-        audio_url, _oss_key, _up_sec = upload_to_oss(mp3_tmp, item_id)
+        audio_url, _oss_key, _up_sec = await asyncio.to_thread(upload_to_oss, mp3_tmp, item_id)
     except Exception as e:
-        _write_asr_status(conn, item_id, asr_status="failed_upload",
-                          asr_failed_reason=str(e)[:200])
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_upload",
+                     asr_failed_reason=str(e)[:200])
         await _emit("error", {"code": "upload_failed", "message": str(e)[:200]})
         return AsrResult("failed_upload", None, duration_sec, None, str(e)[:200])
 
     # 4. 豆包 submit
     await _emit("progress", {"phase": "asr_submit", "message": "AI 识别中", "percent": 30})
-    req_id, err = doubao_submit(audio_url, api_key, resource_id)
+    req_id, err = await asyncio.to_thread(doubao_submit, audio_url, api_key, resource_id)
     if not req_id:
-        _write_asr_status(conn, item_id, asr_status="failed_asr",
-                          asr_failed_reason=f"submit: {err}")
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_asr",
+                     asr_failed_reason=f"submit: {err}")
         await _emit("error", {"code": "submit_failed", "message": str(err)[:200]})
         return AsrResult("failed_asr", None, duration_sec, None, f"submit: {err}")
 
@@ -887,8 +932,8 @@ async def transcribe_and_summarize(
         req_id, api_key, resource_id, emit_progress=_emit,
     )
     if not body:
-        _write_asr_status(conn, item_id, asr_status="failed_asr",
-                          asr_failed_reason=f"poll: {err_code}")
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_asr",
+                     asr_failed_reason=f"poll: {err_code}")
         await _emit("error", {"code": "poll_failed", "message": f"poll: {err_code}"})
         return AsrResult("failed_asr", None, duration_sec, None, f"poll: {err_code}")
 
@@ -904,12 +949,12 @@ async def transcribe_and_summarize(
     cost_yuan = round(duration_sec * DOUBAO_PRICE_PER_SEC, 4)
 
     if len(transcript) < 20:
-        _write_asr_status(conn, item_id, asr_status="failed_empty",
-                          asr_duration_sec=duration_sec, asr_cost_yuan=cost_yuan,
-                          asr_failed_reason="transcript too short")
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_empty",
+                     asr_duration_sec=duration_sec, asr_cost_yuan=cost_yuan,
+                     asr_failed_reason="transcript too short")
         # BF-0419-10: failed_empty 态豆包已计费,配额必须计入
         try:
-            _consume_asr_quota(conn, duration_sec, user_id=user_id)
+            await _db_io(_consume_asr_quota, conn, duration_sec, user_id=user_id)
         except Exception as _e:
             print(f"[transcribe_and_summarize] consume_asr_quota (failed_empty) non-fatal: {_e}", flush=True)
         await _emit("error", {"code": "empty_transcript",
@@ -917,7 +962,8 @@ async def transcribe_and_summarize(
         return AsrResult("failed_empty", None, duration_sec, cost_yuan, "too short")
 
     # 写 transcript + segments
-    _update_asr_fields(
+    await _db_io(
+        _update_asr_fields,
         conn,
         item_id,
         asr_text=transcript,
@@ -929,7 +975,7 @@ async def transcribe_and_summarize(
     # BF-0419-10: 手动触发路径(本函数)也必须计入配额消耗(非致命)
     # 违反 PRD F52/R5.3:"手动触发计入但不拦,余额可负"
     try:
-        _consume_asr_quota(conn, duration_sec, user_id=user_id)
+        await _db_io(_consume_asr_quota, conn, duration_sec, user_id=user_id)
     except Exception as _e:
         print(f"[transcribe_and_summarize] consume_asr_quota non-fatal: {_e}", flush=True)
 
@@ -940,57 +986,60 @@ async def transcribe_and_summarize(
         "char_count": len(transcript),
     })
 
-    # 6. MiniMax 重跑摘要
+    # 6. 逐段翻译(BF-0705-2: 前移至摘要之前,与摘要结果解耦——翻译只依赖 transcript/segments,
+    # 摘要格式校验失败不得连带丢翻译。翻译失败非致命。)
+    # v12.3 方案 B: 逐段带标号翻译,前端 zh Tab 可复用 segments 时间戳渲染
+    # BF-0419-15: 原文已是中文则跳过翻译(避免 MiniMax 中译中冗余)
+    await _emit("progress", {"phase": "translate", "message": "翻译中", "percent": 90})
+    try:
+        if _is_mostly_chinese(transcript):
+            print(f"[transcribe_and_summarize] skip translate for chinese item {item_id}", flush=True)
+            cn_segments = None
+        else:
+            cn_segments = await asyncio.to_thread(translate_segments_cn, segments) if segments else None
+        if cn_segments and len(cn_segments) == len(segments):
+            transcript_cn = "\n".join(s for s in cn_segments if s)
+            await _db_io(
+                _update_asr_fields,
+                conn,
+                item_id,
+                asr_text_cn=transcript_cn,
+                asr_segments_cn=cn_segments,
+            )
+            await _emit("transcript_cn", {
+                "text": transcript_cn,
+                "segments_cn": cn_segments,
+            })
+        else:
+            # 无 segments(极罕见)或逐段翻译失败 → 回退整段翻译
+            transcript_cn = await asyncio.to_thread(translate_transcript_cn, transcript)
+            if transcript_cn:
+                await _db_io(_update_asr_fields, conn, item_id, asr_text_cn=transcript_cn)
+                await _emit("transcript_cn", {"text": transcript_cn, "segments_cn": None})
+    except Exception as e:
+        print(f"[asr_worker] translate non-fatal: {e}", flush=True)
+
+    # 7. MiniMax 重跑摘要
     await _emit("progress", {"phase": "summary", "message": "摘要更新中", "percent": 95})
     try:
-        summary = regenerate_summary_from_transcript(
+        summary = await asyncio.to_thread(
+            regenerate_summary_from_transcript,
             transcript, row["title"] or "", row["content"] or "",
             duration_min=duration_sec / 60.0,
         )
         if not _is_valid_summary(summary):
-            _write_asr_status(conn, item_id, asr_status="failed_summary",
-                              asr_failed_reason="summary format invalid")
+            await _db_io(_write_asr_status, conn, item_id, asr_status="failed_summary",
+                         asr_failed_reason="summary format invalid")
             await _emit("error", {"code": "summary_format_invalid", "message": "摘要格式异常"})
             return AsrResult("failed_summary", transcript, duration_sec, cost_yuan, "format invalid")
-        _update_asr_fields(conn, item_id, ai_summary=summary)
-        _write_asr_status(conn, item_id, asr_status="success", asr_failed_reason=None)
+        await _db_io(_update_asr_fields, conn, item_id, ai_summary=summary)
+        await _db_io(_write_asr_status, conn, item_id, asr_status="success", asr_failed_reason=None)
         await _emit("summary_updated", {"ai_summary": summary})
-
-        # v12.3 方案 B: 逐段带标号翻译,前端 zh Tab 可复用 segments 时间戳渲染
-        # 翻译失败非致命,保持 ASR success
-        # BF-0419-15: 原文已是中文则跳过翻译(避免 MiniMax 中译中冗余)
-        await _emit("progress", {"phase": "translate", "message": "翻译中", "percent": 98})
-        try:
-            if _is_mostly_chinese(transcript):
-                print(f"[transcribe_and_summarize] skip translate for chinese item {item_id}", flush=True)
-                cn_segments = None
-            else:
-                cn_segments = translate_segments_cn(segments) if segments else None
-            if cn_segments and len(cn_segments) == len(segments):
-                transcript_cn = "\n".join(s for s in cn_segments if s)
-                _update_asr_fields(
-                    conn,
-                    item_id,
-                    asr_text_cn=transcript_cn,
-                    asr_segments_cn=cn_segments,
-                )
-                await _emit("transcript_cn", {
-                    "text": transcript_cn,
-                    "segments_cn": cn_segments,
-                })
-            else:
-                # 无 segments(极罕见)或逐段翻译失败 → 回退整段翻译
-                transcript_cn = translate_transcript_cn(transcript)
-                if transcript_cn:
-                    _update_asr_fields(conn, item_id, asr_text_cn=transcript_cn)
-                    await _emit("transcript_cn", {"text": transcript_cn, "segments_cn": None})
-        except Exception as e:
-            print(f"[asr_worker] translate non-fatal: {e}", flush=True)
 
         await _emit("done", {"status": "success"})
         return AsrResult("success", transcript, duration_sec, cost_yuan)
     except Exception as e:
-        _write_asr_status(conn, item_id, asr_status="failed_summary",
-                          asr_failed_reason=str(e)[:200])
+        await _db_io(_write_asr_status, conn, item_id, asr_status="failed_summary",
+                     asr_failed_reason=str(e)[:200])
         await _emit("error", {"code": "summary_failed", "message": str(e)[:200]})
         return AsrResult("failed_summary", transcript, duration_sec, cost_yuan, str(e)[:200])

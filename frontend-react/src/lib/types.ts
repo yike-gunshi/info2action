@@ -147,8 +147,8 @@ export interface ActionSourceItem {
 export interface ActionItem {
   id: string
   title: string
-  type: 'research' | 'implementation' | 'investigate' | 'implement' | 'content'
-  action_type?: 'research' | 'implementation' | 'investigate' | 'implement' | 'content'
+  type: 'research' | 'implementation' | 'investigate' | 'implement' | 'content' | 'track'
+  action_type?: 'research' | 'implementation' | 'investigate' | 'implement' | 'content' | 'track'
   status: ActionStatus
   priority?: ActionPriority
   steps?: string[]
@@ -165,6 +165,8 @@ export interface ActionItem {
   direction_label?: string
   reason?: string
   score?: number
+  source_type?: string
+  source_id?: string | number
   created_at: string
   updated_at?: string
   completed_at?: string
@@ -415,6 +417,7 @@ export interface ClusterAction {
   title: string
   action_type: string
   prompt: string
+  steps?: string[]
   priority: string
   status: ActionStatus
   cluster_version: number | null

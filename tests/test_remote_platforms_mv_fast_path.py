@@ -554,6 +554,8 @@ class _InfoReadModelBuildConn:
         self.sqls.append(sql)
         self.params.append(params or {})
         normalized = " ".join(sql.split())
+        if "pg_try_advisory_lock" in normalized:  # BF-0706-4 单飞锁
+            return _FakeOneResult({"locked": True})
         if normalized.startswith("SET LOCAL"):
             return _FakeResult([])
         if "SELECT count(*) AS n FROM remote_poc.info_scope_items" in normalized:
@@ -580,6 +582,8 @@ class _InfoReadModelIncrementalConn(_InfoReadModelBuildConn):
         self.sqls.append(sql)
         self.params.append(params or {})
         normalized = " ".join(sql.split())
+        if "pg_try_advisory_lock" in normalized:  # BF-0706-4 单飞锁
+            return _FakeOneResult({"locked": True})
         if normalized.startswith("SET LOCAL"):
             return _FakeResult([])
         if "FROM remote_poc.info_read_model_state s" in normalized:
@@ -608,6 +612,8 @@ class _InfoReadModelSortPolicyMigrationConn(_InfoReadModelBuildConn):
         self.sqls.append(sql)
         self.params.append(params or {})
         normalized = " ".join(sql.split())
+        if "pg_try_advisory_lock" in normalized:  # BF-0706-4 单飞锁
+            return _FakeOneResult({"locked": True})
         if normalized.startswith("SET LOCAL"):
             return _FakeResult([])
         if "FROM remote_poc.info_read_model_state s" in normalized:
@@ -644,6 +650,8 @@ class _InfoReadModelFreshnessConn:
         self.sqls.append(sql)
         self.params.append(params or {})
         normalized = " ".join(sql.split())
+        if "pg_try_advisory_lock" in normalized:  # BF-0706-4 单飞锁
+            return _FakeOneResult({"locked": True})
         if normalized.startswith("SET LOCAL"):
             return _FakeResult([])
         if "FROM remote_poc.info_read_model_state s" in normalized:
@@ -2658,7 +2666,9 @@ def test_refresh_info_read_model_uses_configurable_build_timeout(monkeypatch):
 
     remote_db.refresh_info_read_model(sample_limit=150, min_github_stars=50)
 
-    assert conn.sqls[0] == "SET LOCAL statement_timeout = '240000ms'"
+    # BF-0706-4: sqls[0] 现在是单飞锁 pg_try_advisory_lock,SET LOCAL 顺延到 [1]
+    assert "pg_try_advisory_lock" in conn.sqls[0]
+    assert conn.sqls[1] == "SET LOCAL statement_timeout = '240000ms'"
 
     remote_db.clear_feed_cache_keys()
 

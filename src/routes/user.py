@@ -34,6 +34,7 @@ async def get_settings(request: Request):
         'email': user['email'],
         'discord_bot_token': discord_masked,
         'has_discord_token': bool(user.get('discord_bot_token_enc')),
+        'discord_channel_id': user.get('discord_channel_id') or '',
     }
 
 
@@ -50,6 +51,8 @@ async def update_settings(request: Request):
             if 'discord_bot_token' in body:
                 token = body['discord_bot_token']
                 updates['discord_bot_token_enc'] = encrypt(token) if token else None
+            if 'discord_channel_id' in body:
+                updates['discord_channel_id'] = (body['discord_channel_id'] or '').strip() or None
             if updates:
                 await run_in_threadpool(remote_db.update_user_remote, user['id'], **updates)  # BE-1
             return {'ok': True}
@@ -69,6 +72,10 @@ async def update_settings(request: Request):
             else:
                 # Clear token
                 updates['discord_bot_token_enc'] = None
+
+        # v21.0: per-user Discord 派发频道
+        if 'discord_channel_id' in body:
+            updates['discord_channel_id'] = (body['discord_channel_id'] or '').strip() or None
 
         if updates:
             db.update_user(conn, user['id'], **updates)

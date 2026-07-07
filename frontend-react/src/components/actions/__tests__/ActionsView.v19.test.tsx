@@ -109,15 +109,6 @@ function boardResponse(): ActionsBoardResponse {
   }
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res
-    reject = rej
-  })
-  return { promise, resolve, reject }
-}
 
 describe('ActionsView v19 visual constraints', () => {
   beforeEach(() => {
@@ -149,7 +140,7 @@ describe('ActionsView v19 visual constraints', () => {
     vi.clearAllMocks()
   })
 
-  it('renders the shared L2 token with time plus optional priority filters and three fixed lanes', async () => {
+  it('renders the shared L2 token with time filters and three fixed lanes (BF-0706-6: 无优先级筛选)', async () => {
     render(<ActionsView />)
 
     expect(screen.queryByText('我的行动')).toBeNull()
@@ -161,11 +152,10 @@ describe('ActionsView v19 visual constraints', () => {
     expect(screen.getByTestId('actions-date-tab-all').className).toContain('border-[var(--brand)]')
     expect(screen.getByTestId('actions-date-tab-all').className).toContain('font-event-title')
     expect(screen.getByTestId('actions-date-tab-all').className).toContain('text-[16px]')
-    expect(screen.getByTestId('actions-l2-divider')).toHaveTextContent('|')
-    expect(screen.getByTestId('actions-priority-tab-P0')).toHaveTextContent('P0')
-    expect(screen.getByTestId('actions-priority-tab-P1')).toHaveTextContent('P1')
-    expect(screen.getByTestId('actions-priority-tab-P2')).toHaveTextContent('P2')
-    expect(screen.getByTestId('actions-priority-tab-P0')).toHaveAttribute('aria-pressed', 'false')
+    // BF-0706-6: 优先级下线 — 无优先级 tab、无分隔符
+    expect(screen.queryByTestId('actions-l2-divider')).toBeNull()
+    expect(screen.queryByTestId('actions-priority-tab-P0')).toBeNull()
+    expect(screen.queryByTestId('actions-priority-tab-P1')).toBeNull()
     expect(screen.queryByTestId('actions-status-tab-all')).toBeNull()
     expect(screen.queryByTestId('action-section-pill-bar')).toBeNull()
     expect(screen.queryByRole('combobox')).toBeNull()
@@ -179,18 +169,6 @@ describe('ActionsView v19 visual constraints', () => {
     expect(within(lanes[1]).getByRole('heading', { name: '执行中' })).toBeInTheDocument()
     expect(within(lanes[2]).getByRole('heading', { name: '已完成' })).toBeInTheDocument()
     expect(screen.getByText('暂无已完成行动')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByTestId('actions-priority-tab-P0'))
-    await waitFor(() => expect(mockFetchActionsBoard).toHaveBeenLastCalledWith(expect.objectContaining({
-      priority: 'P0',
-      limit_per_direction: 20,
-    })))
-
-    fireEvent.click(screen.getByTestId('actions-priority-tab-P0'))
-    await waitFor(() => expect(mockFetchActionsBoard).toHaveBeenLastCalledWith(expect.objectContaining({
-      priority: undefined,
-      limit_per_direction: 20,
-    })))
   })
 
   it('shows lane-shaped skeletons while loading data', async () => {
@@ -203,61 +181,6 @@ describe('ActionsView v19 visual constraints', () => {
     expect(screen.getByText('执行中')).toBeInTheDocument()
     expect(screen.getByText('已完成')).toBeInTheDocument()
     expect(screen.queryByTestId('actions-lane-grid')).toBeNull()
-  })
-
-  it('does not keep stale lane counts under a newly selected uncached L2 priority', async () => {
-    const p2Board = deferred<ActionsBoardResponse>()
-    mockFetchActionsBoard.mockImplementation((params?: { priority?: string }) => {
-      if (params?.priority === 'P2') return p2Board.promise
-      return Promise.resolve({
-        ...boardResponse(),
-        counts: { total: 312, pending: 312, in_progress: 0, done: 0 },
-        directions: [
-          {
-            slug: 'pending',
-            label: '待处理',
-            count: 312,
-            has_more: true,
-            next_offset: 20,
-            items: [makeAction({ id: 'act-p1', status: 'pending', priority: 'P1', title: 'P1 旧数据' })],
-          },
-          { slug: 'in_progress', label: '执行中', count: 0, has_more: false, next_offset: null, items: [] },
-          { slug: 'done', label: '已完成', count: 0, has_more: false, next_offset: null, items: [] },
-        ],
-      })
-    })
-
-    render(<ActionsView />)
-
-    expect(await screen.findByText('P1 旧数据')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByTestId('actions-priority-tab-P2'))
-
-    await waitFor(() => expect(screen.getByTestId('actions-priority-tab-P2')).toHaveAttribute('aria-pressed', 'true'))
-    expect(screen.getByTestId('actions-board-skeleton')).toBeInTheDocument()
-    expect(screen.queryByText('P1 旧数据')).toBeNull()
-    expect(screen.queryByText('312')).toBeNull()
-
-    p2Board.resolve({
-      ...boardResponse(),
-      counts: { total: 202, pending: 202, confirmed: 0, executing: 0, dispatched: 0, in_progress: 0, done: 0, failed: 0, dismissed: 0 },
-      directions: [
-        {
-          slug: 'pending',
-          label: '待处理',
-          count: 202,
-          has_more: true,
-          next_offset: 20,
-          items: [makeAction({ id: 'act-p2', status: 'pending', priority: 'P2', title: 'P2 新数据' })],
-        },
-        { slug: 'in_progress', label: '执行中', count: 0, has_more: false, next_offset: null, items: [] },
-        { slug: 'done', label: '已完成', count: 0, has_more: false, next_offset: null, items: [] },
-      ],
-    })
-
-    await waitFor(() => expect(screen.getByText('P2 新数据')).toBeInTheDocument())
-    expect(screen.queryByText('P1 旧数据')).toBeNull()
-    expect(screen.getByText('202')).toBeInTheDocument()
   })
 
   it('keeps action cards at 1px border, 4px radius, no shadow, and small warm status pills', async () => {
@@ -275,28 +198,20 @@ describe('ActionsView v19 visual constraints', () => {
       expect(card.className).not.toContain('rounded-lg')
     }
 
-    const statusPill = screen.getAllByTestId('action-status-pill')[0]
-    expect(statusPill.className).toContain('rounded-full')
-    expect(statusPill.className).toContain('text-[12px]')
-    expect(statusPill.className).toContain('bg-[var(--brand-soft)]')
-
-    const typePill = screen.getAllByTestId('action-type-pill')[0]
-    expect(typePill.className).toContain('bg-[var(--brand-soft)]')
+    // BF-0706-6: 卡片删除 类型/方向/优先级/状态 徽章(状态与列头重复,优先级下线)
+    expect(screen.queryByTestId('action-status-pill')).toBeNull()
+    expect(screen.queryByTestId('action-type-pill')).toBeNull()
     const createdAt = screen.getAllByTestId('action-card-created-at')[0]
     expect(createdAt).toHaveTextContent('2026-05-18')
     expect(createdAt).not.toHaveTextContent('16:00')
-    expect(typePill.compareDocumentPosition(createdAt) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(screen.queryByText('来自 16:00')).toBeNull()
     expect(screen.queryByText('2026-05-18 16:00')).toBeNull()
     expect(screen.queryByText('来自 2026-05-18 16:00')).toBeNull()
     expect(screen.getAllByText('来自 1 条信息')[0]).toBeInTheDocument()
     expect(screen.queryByText('关联信息')).toBeNull()
-    expect(screen.queryByText('📄')).toBeNull()
-    expect(screen.queryByText('⚡')).toBeNull()
 
-    const confirmedCard = screen.getByText('判断投资线索优先级').closest('[data-testid="action-card"]')
-    expect(confirmedCard).toBeTruthy()
-    expect(within(confirmedCard as HTMLElement).getByTestId('action-status-pill')).toHaveTextContent('执行中')
+    // 状态在列头(不在卡片),卡片不再显示 已确认/已派发 文案
+    expect(screen.getByText('判断投资线索优先级').closest('[data-testid="action-card"]')).toBeTruthy()
     expect(screen.queryByText('已确认')).toBeNull()
     expect(screen.queryByText('已派发')).toBeNull()
   })
@@ -461,7 +376,9 @@ describe('ActionsView v19 visual constraints', () => {
     await waitFor(() => expect(mockFetchActionsBoard).toHaveBeenCalledTimes(2))
     const doneLane = screen.getAllByTestId('action-lane')[2]
     await waitFor(() => expect(within(doneLane).getByText('验证行动卡片的克制视觉')).toBeInTheDocument())
+    // BF-0706-6: 状态由所在列头表达(卡片已删状态药丸)——卡片落在「已完成」列即代表完成
     const doneCard = within(doneLane).getByText('验证行动卡片的克制视觉').closest('[data-testid="action-card"]')
-    expect(within(doneCard as HTMLElement).getByTestId('action-status-pill')).toHaveTextContent('已完成')
+    expect(doneCard).toBeTruthy()
+    expect(within(doneCard as HTMLElement).queryByTestId('action-status-pill')).toBeNull()
   })
 })

@@ -14,7 +14,7 @@
 
 **中文** · [English](docs/README.en.md)
 
-[它长什么样](#-它长什么样) · [核心能力](#-核心能力) · [架构](#-架构) · [Quick Start](#-quick-start) · [自部署](#-self-hosting) · [Community](#-community)
+[核心能力](#-核心能力) · [能力全景](#-能力全景) · [架构](#-架构) · [Quick Start](#-quick-start) · [自部署](#-self-hosting) · [Community](#-community)
 
 <br>
 
@@ -30,11 +30,11 @@
 
 **Info2Action 想把这件事翻过来**：让 AI 先替你读完全部喧嚣——预读、分类、评分，把散落各处的报道折叠成一条事件——然后只把两样东西交还给你：**值得知道的，和值得去做的**。值得做的那部分，会被翻译成「打开哪个链接 / 写哪条评论 / 派发哪个任务」级别的可执行行动。
 
-> 它最初只是我写给自己的早读工具：受够了在十几个 App 之间打捞同一件事，索性让 AI 替我先读一遍。后来它慢慢长出了事件聚合、精选评分、行动派发，也长出了多用户能力。现在把它开源，是希望你也能拥有一条**只属于自己的信息流**。
+> 做它，是因为我自己每天早上都被 FOMO 逼着读一堆 AI 新闻——X、公众号、各种源。读本身就很耗神：每篇是好是坏，都得花上一两分钟、动一次脑子才判断得出来。可读完还不算完——还要接着想「这条对我到底有什么用」，再把需求讲清楚、交给 Claude Code 或 Codex 去执行，又是一轮注意力和表达。跨好几个 App、好几段流程，耗掉我大量的注意力和表达力，一条信息才算真正为我所用。这个过程对我来说太痛苦了，所以我想把它自动化：**让信息直接流向行动**。而如果最后那个行动对我没价值，那就不是要不要做的问题，而是我该去优化整条链路的问题。
 
 **对开发者**：这是一套完整的「多源采集 → LLM 增强 → embedding 召回 + LLM 精判聚类 → 精选评分 → 行动派发」全栈 pipeline 实现。FastAPI + React，SQLite 单机可跑，Supabase 可上多用户生产，**prompt 全部开源可改**——这个产品的品味一半藏在 prompt 里，欢迎改成你自己的。
 
-## 👀 它长什么样
+## ✨ 核心能力
 
 <table>
   <tr>
@@ -49,8 +49,8 @@
   </tr>
   <tr>
     <td width="50%">
-      <img src="docs/assets/readme/info-modal-video.png" alt="信息弹窗，支持视频播放与 AI 转写">
-      <p align="center"><sub><b>视频理解</b> — 弹窗内直接播放视频，一键 AI 转写生成双语字幕和要点</sub></p>
+      <img src="docs/assets/readme/action-generate.png" alt="行动生成 — 一键把事件变成可执行行动卡">
+      <p align="center"><sub><b>行动生成</b> — 一键把事件变成可执行行动卡，AI 拆解步骤并产出自包含 prompt，复制即可交给 Claude Code / Codex 执行</sub></p>
     </td>
     <td width="50%">
       <img src="docs/assets/readme/actions.png" alt="行动页三泳道">
@@ -59,44 +59,84 @@
   </tr>
   <tr>
     <td width="50%">
-      <img src="docs/assets/readme/dark-mode.png" alt="暗色模式">
-      <p align="center"><sub><b>暗色模式</b> — 全站双主题，跟随系统或手动切换</sub></p>
+      <img src="docs/assets/readme/info-modal-video.png" alt="信息弹窗，支持视频播放与 AI 转写">
+      <p align="center"><sub><b>视频理解</b> — 弹窗内直接播放视频，一键 AI 转写生成双语字幕和要点</sub></p>
     </td>
     <td width="50%">
       <img src="docs/assets/readme/submit-link.png" alt="手动提交链接并 AI 分析">
       <p align="center"><sub><b>手动投喂</b> — 粘贴任意链接，AI 抓取并分析入流</sub></p>
     </td>
   </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/dark-mode.png" alt="暗色模式">
+      <p align="center"><sub><b>暗色模式</b> — 全站双主题，跟随系统或手动切换</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/event-page.png" alt="事件落地页">
+      <p align="center"><sub><b>事件落地页</b> — 每条事件都有独立可分享页面，综述、要点、多源出处一屏读完</sub></p>
+    </td>
+  </tr>
 </table>
 
 <details>
-<summary><b>🖼 更多界面</b>（事件落地页 / 收藏 / 历史 / 设置 / 登录）</summary>
+<summary><b>🖼 更多界面</b>（收藏 / 历史 / 设置 / 登录）</summary>
 <br>
 
 | | |
 |---|---|
-| ![事件落地页](docs/assets/readme/event-page.png) | ![我的收藏](docs/assets/readme/starred.png) |
-| ![浏览历史](docs/assets/readme/history.png) | ![个人设置](docs/assets/readme/settings.png) |
-
-<p align="center"><img src="docs/assets/readme/login.png" alt="登录页" width="420"></p>
+| ![我的收藏](docs/assets/readme/starred.png) | ![浏览历史](docs/assets/readme/history.png) |
+| ![个人设置](docs/assets/readme/settings.png) | ![登录页](docs/assets/readme/login.png) |
 
 </details>
 
-## ✨ 核心能力
+## 🧭 能力全景
 
 没有一项是为了演示而做的——每一项都来自「自己每天要用」的真实需要：
 
-| 能力 | 简介 |
-|---|---|
-| **多源统一采集** | X/Twitter · Reddit · Hacker News · RSS · B 站 · 微信公众号 · GitHub（Trending / Release / 仓库追踪）· YouTube · 小红书 · 手动提交，cron 定时自动跑 |
-| **AI 预读增强** | LLM 一次性产出摘要、要点、内容分类、内容类型、质量分、关键词；prompt 可读可改（[`prompts/`](prompts/)） |
-| **跨源事件聚合** | 两阶段聚类：embedding 粗召回 + LLM 精判「同一事件」；事件级综述重喂原文生成，聚合过程可审计 |
-| **AI 精选** | item 级 LLM verdict（featured / borderline / drop）+ cluster 级聚合，直出「应该立即看到的高价值内容」时间线 |
-| **个性化排序** | 注册 onboarding 画像（角色 / 关注方向 / 常用工具），`quality × engagement × freshness × match` 纯计算排序，不额外烧 LLM |
-| **信息→行动闭环** | LLM 把「值得做的信号」翻译成可执行行动卡，支持 Discord Forum 派发或浏览器直跳 |
-| **视频理解** | YouTube / Twitter / B 站视频字幕优先 + 豆包 ASR 兜底，segment 级双语字幕 |
-| **多用户** | 开放浏览（不登录可读）+ 邀请注册 + 邮箱验证，登录解锁个性化 / 收藏 / 历史 / 行动 |
-| **双存储模式** | 本地 SQLite 单机全功能；Supabase Postgres + Storage 承载多用户生产（远程 read model + pgvector 召回） |
+<table>
+  <thead>
+    <tr><th width="150" align="left">能力</th><th align="left">简介</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td width="150"><b>多源统一采集</b></td>
+      <td>X/Twitter · Reddit · Hacker News · RSS · B 站 · 微信公众号 · GitHub（Trending / Release / 仓库追踪）· YouTube · 小红书 · 手动提交，cron 定时自动跑</td>
+    </tr>
+    <tr>
+      <td width="150"><b>AI 预读增强</b></td>
+      <td>LLM 一次性产出摘要、要点、内容分类、内容类型、质量分、关键词；prompt 可读可改（<a href="prompts/"><code>prompts/</code></a>）</td>
+    </tr>
+    <tr>
+      <td width="150"><b>跨源事件聚合</b></td>
+      <td>两阶段聚类：embedding 粗召回 + LLM 精判「同一事件」；事件级综述重喂原文生成，聚合过程可审计</td>
+    </tr>
+    <tr>
+      <td width="150"><b>AI 精选</b></td>
+      <td>item 级 LLM verdict（featured / borderline / drop）+ cluster 级聚合，直出「应该立即看到的高价值内容」时间线</td>
+    </tr>
+    <tr>
+      <td width="150"><b>个性化排序</b></td>
+      <td>注册 onboarding 画像（角色 / 关注方向 / 常用工具），<code>quality × engagement × freshness × match</code> 纯计算排序，不额外烧 LLM</td>
+    </tr>
+    <tr>
+      <td width="150"><b>信息→行动闭环</b></td>
+      <td>LLM 把「值得做的信号」翻译成可执行行动卡，支持 Discord Forum 派发或浏览器直跳</td>
+    </tr>
+    <tr>
+      <td width="150"><b>视频理解</b></td>
+      <td>YouTube / Twitter / B 站视频字幕优先 + 豆包 ASR 兜底，segment 级双语字幕</td>
+    </tr>
+    <tr>
+      <td width="150"><b>多用户</b></td>
+      <td>开放浏览（不登录可读）+ 邀请注册 + 邮箱验证，登录解锁个性化 / 收藏 / 历史 / 行动</td>
+    </tr>
+    <tr>
+      <td width="150"><b>双存储模式</b></td>
+      <td>本地 SQLite 单机全功能；Supabase Postgres + Storage 承载多用户生产（远程 read model + pgvector 召回）</td>
+    </tr>
+  </tbody>
+</table>
 
 ## 🏗 架构
 

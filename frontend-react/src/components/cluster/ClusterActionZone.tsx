@@ -8,30 +8,28 @@
  * Fast Refresh 硬约束：本文件只导出 ClusterActionZone (其他 helper local-only).
  */
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { Plus, ArrowRight } from 'lucide-react'
-import { cn } from '../../lib/utils'
+import { Plus, ArrowRight, RotateCcw } from 'lucide-react'
+import { toast } from 'sonner'
+import { deleteAction } from '../../lib/api'
 import { navigateToActionCard } from '../../lib/actionNavigation'
 import { useClusterDetailStore } from '../../store/clusterDetailStore'
-import { useDetailStore } from '../../store/detailStore'
 import { requireAuth } from '../shared/AuthGate'
 import { TypewriterLine } from '../shared/TypewriterLine'
+import { ActionGenHint } from '../shared/ActionGenHint'
 
-const STAGE_LABELS = ['内容分析', '组装事件上下文', 'AI 综合', '整理结果']
-const ACTION_TYPES = [
-  { key: 'investigate', label: '调研验证' },
-  { key: 'implement', label: '动手做' },
-  { key: 'content', label: '创作内容' },
-]
+
+// v21.0: 行动类型现由 AI 自动判定,这里仅作徽章标签映射(4 类)。
+const ACTION_TYPE_LABELS: Record<string, string> = {
+  investigate: '调研',
+  implement: '实践',
+  content: '创作',
+  track: '跟踪',
+}
 
 function actionTypeLabel(type: string) {
-  return ACTION_TYPES.find((item) => item.key === type)?.label || type
+  return ACTION_TYPE_LABELS[type] || type
 }
 
-function promptPreview(prompt?: string) {
-  const text = (prompt || '').trim()
-  if (text.length <= 260) return text
-  return `${text.slice(0, 260).trim()}...`
-}
 
 type GenState = 'idle' | 'form' | 'generating' | 'done' | 'error'
 
@@ -44,7 +42,6 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
   const startGenerate = useClusterDetailStore((s) => s.startGenerate)
   const cancelGenerate = useClusterDetailStore((s) => s.cancelGenerate)
   const generating = useClusterDetailStore((s) => s.generating)
-  const stages = useClusterDetailStore((s) => s.generateStages)
   const thinkingLines = useClusterDetailStore((s) => s.generateThinkingLines)
   const generatedAction = useClusterDetailStore((s) => s.generateAction)
   const generateError = useClusterDetailStore((s) => s.generateError)
@@ -54,7 +51,6 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
 
   const [genState, setGenState] = useState<GenState>('idle')
   const [userHint, setUserHint] = useState('')
-  const [selectedType, setSelectedType] = useState('investigate')
   const [visibleCount, setVisibleCount] = useState(0)
   const streamRef = useRef<HTMLDivElement>(null)
 
@@ -99,7 +95,6 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
     if (!requireAuth('生成行动')) return
     resetGenerate()
     setGenState('form')
-    setSelectedType('investigate')
     setUserHint('')
     setVisibleCount(0)
   }
@@ -108,7 +103,7 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
     if (!requireAuth('生成行动')) return
     resetGenerate()
     setVisibleCount(0)
-    startGenerate(clusterId, userHint.trim() || undefined, selectedType)
+    startGenerate(clusterId, userHint.trim() || undefined)
   }
 
   const handleCancel = () => {
@@ -122,66 +117,64 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
     setVisibleCount(0)
   }
 
-  const openActionDetail = useCallback((actionId: string) => {
-    useDetailStore.getState().openAction(actionId)
-  }, [])
+  // v2 §14.3(T3): 重新生成 = 作废当前已生成行动(删库)+ 重开表单。
+  const handleRegenerate = async () => {
+    const current = generatedAction
+    resetGenerate()
+    setVisibleCount(0)
+    setGenState('form')
+    setUserHint('')
+    if (current?.id) {
+      try {
+        await deleteAction(current.id)
+        loadActions(clusterId)
+      } catch {
+        toast.error('作废旧行动点失败,可到行动页手动删除')
+      }
+    }
+  }
 
-  const lastStageLabel = (() => {
-    const idx = stages.findIndex((s) => s === 1)
-    return idx >= 0 ? STAGE_LABELS[idx] : STAGE_LABELS[3]
-  })()
+  // v21.0 (模块 C): 「查看行动详情」统一走 navigateToActionCard —— 切行动 Tab + 高亮 + 开弹窗。
+  const openActionDetail = useCallback((actionId: string) => {
+    navigateToActionCard(actionId)
+  }, [])
 
   return (
     <div className="w-full mt-2">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-sm font-medium text-muted-foreground">行动点</span>
+      {/* Header — 品牌色小标题 + 醒目 CTA(v21.0 redesign) */}
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="reading-section leading-none text-[var(--brand)]">行动点</h3>
         {genState === 'idle' && !generatedAction && (
           <button
             type="button"
             onClick={handleShowForm}
-            className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
             data-testid="cluster-action-trigger"
+            className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--brand-border)] px-3.5 py-2 text-[13px] font-semibold text-[var(--brand)] transition-colors hover:bg-[var(--brand-soft)]"
           >
-            <Plus className="w-3 h-3" />
-            {actions.length > 0 ? '新建' : '生成行动点'}
+            <Plus className="w-3.5 h-3.5" />
+            {actions.length > 0 ? '新建行动点' : '生成行动点'}
           </button>
         )}
       </div>
 
-      {/* Pre-generation form */}
+      {/* Pre-generation form — 纸面弹窗风格 */}
       {genState === 'form' && (
-        <div className="rounded-lg border border-border bg-card p-3 mb-3">
-          <p className="text-sm font-medium text-foreground mb-2">选择行动类型</p>
-          <div className="flex gap-2 mb-3">
-            {ACTION_TYPES.map((at) => (
-              <button
-                key={at.key}
-                type="button"
-                onClick={() => setSelectedType(at.key)}
-                className={cn(
-                  'text-sm px-3 py-1.5 rounded-md border transition-colors',
-                  selectedType === at.key
-                    ? 'border-primary bg-accent text-primary font-semibold'
-                    : 'border-border text-muted-foreground hover:border-foreground/30',
-                )}
-              >
-                {at.label}
-              </button>
-            ))}
-          </div>
+        <div className="rounded-[10px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] p-3.5 mb-3">
+          <ActionGenHint />
+          <p className="font-event-title text-[14px] font-semibold text-[var(--modal-text)] mb-1">补充说明（可选）</p>
+          <p className="font-event-title text-[13px] text-[var(--modal-text-muted)] mb-2.5">AI 会自动判定行动类型;想指定角度就写一句。</p>
           <textarea
             value={userHint}
             onChange={(e) => setUserHint(e.target.value)}
             placeholder="补充说明（可选）：告诉 AI 你关注的角度..."
-            className="w-full text-sm bg-muted border border-input rounded-md px-2.5 py-2 mb-3 resize-none focus:outline-none focus:ring-1 focus:ring-ring"
+            className="w-full font-event-title text-[14px] bg-[var(--modal-surface)] border border-[var(--modal-border-soft)] rounded-[8px] px-3 py-2.5 mb-3 resize-none text-[var(--modal-text)] placeholder:text-[var(--modal-text-faint)] focus:outline-none focus:ring-1 focus:ring-[var(--brand-border)]"
             rows={2}
           />
           <div className="flex justify-end gap-2">
             <button
               type="button"
               onClick={() => setGenState('idle')}
-              className="text-sm text-muted-foreground hover:text-foreground px-3 py-1 rounded-md hover:bg-muted transition-colors"
+              className="text-[13px] text-[var(--modal-text-muted)] hover:text-[var(--modal-text)] px-3 py-1.5 rounded-[7px] hover:bg-[var(--modal-hover)] transition-colors"
             >
               取消
             </button>
@@ -189,7 +182,7 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
               type="button"
               onClick={handleGenerate}
               data-testid="cluster-action-start"
-              className="text-sm font-semibold text-primary-foreground bg-primary px-4 py-1.5 rounded-md hover:bg-primary/90 transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--brand-border)] px-4 py-2 text-[13px] font-semibold text-[var(--brand)] transition-colors hover:bg-[var(--brand-soft)]"
             >
               开始生成
             </button>
@@ -197,44 +190,24 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
         </div>
       )}
 
-      {/* Generating: thinking stream + 4 stage labels */}
+      {/* Generating: 暖色分析面板(v2 §13.2)—— 去阶段标签,人话标题 */}
       {(genState === 'generating' || (genState === 'done' && thinkingLines.length > 0)) && (
         <div
-          className="rounded-lg p-3 mb-3"
-          style={{ background: 'var(--terminal-bg, #1f1f1f)' }}
+          className="rounded-[10px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface)] p-3.5 mb-3"
           data-testid="cluster-action-stream"
         >
-          <div className="flex items-center gap-2 mb-2">
-            <span
-              className="text-xs font-mono opacity-60"
-              style={{ color: 'var(--terminal-text, #d4d4d4)' }}
-            >
-              {lastStageLabel}
+          <div className="flex items-center gap-2 mb-2.5">
+            <span className="inline-flex items-center gap-2 text-[13px] font-semibold text-[var(--brand)]">
+              正在分析这个事件
+              <span className="inline-flex gap-1" aria-hidden="true">
+                <span className="analyze-dot" /><span className="analyze-dot" /><span className="analyze-dot" />
+              </span>
             </span>
-            {/* stage bar */}
-            <div className="flex gap-1 ml-2">
-              {STAGE_LABELS.map((label, idx) => (
-                <span
-                  key={label}
-                  title={label}
-                  data-testid={`cluster-stage-${idx}-${stages[idx] === 2 ? 'done' : stages[idx] === 1 ? 'active' : 'pending'}`}
-                  className={cn(
-                    'inline-block rounded-full',
-                    stages[idx] === 2
-                      ? 'bg-green-500'
-                      : stages[idx] === 1
-                        ? 'bg-yellow-400 animate-pulse'
-                        : 'bg-gray-500',
-                  )}
-                  style={{ width: 6, height: 6 }}
-                />
-              ))}
-            </div>
             {generating && (
               <button
                 type="button"
                 onClick={handleCancel}
-                className="ml-auto text-xs text-warm-500 hover:text-foreground"
+                className="ml-auto reading-caption text-[var(--modal-text-muted)] hover:text-[var(--modal-text)]"
               >
                 取消
               </button>
@@ -242,17 +215,14 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
           </div>
           <div
             ref={streamRef}
-            className="max-h-[220px] overflow-y-auto scrollbar-hide space-y-0.5"
+            className="max-h-[220px] overflow-y-auto scrollbar-hide space-y-0.5 rounded-[8px] bg-[var(--action-code-bg)] px-3.5 py-3 font-mono text-[12px] leading-relaxed"
           >
             {thinkingLines.slice(0, visibleCount).map((line, i) => {
               const isLastLine = i === visibleCount - 1
               return (
                 <div
                   key={i}
-                  className={cn(
-                    'text-xs font-mono leading-relaxed',
-                    line.ai ? 'text-[var(--terminal-text-ai,#7fffd4)]' : 'text-[var(--terminal-text,#d4d4d4)]',
-                  )}
+                  className={line.ai ? 'text-[var(--action-code-text)]' : 'text-[var(--action-code-faint)]'}
                 >
                   <TypewriterLine
                     text={line.text || ''}
@@ -268,23 +238,17 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
         </div>
       )}
 
-      {/* Result card after done */}
+      {/* Result card after done — 纸面弹窗风格,展示 steps 行动点 */}
       {genState === 'done' && generatedAction && (
         <div
-          className="rounded-lg border border-border bg-card p-3 mb-3"
+          className="rounded-[10px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] p-3.5 mb-3"
           data-testid="cluster-action-result"
         >
           <div className="flex items-start gap-2">
-            <span
-              className="px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0"
-              style={{
-                background: 'var(--accent)',
-                color: 'var(--accent-foreground)',
-              }}
-            >
+            <span className="shrink-0 rounded-[5px] bg-[var(--brand-soft)] px-2 py-0.5 text-[11px] font-semibold text-[var(--brand)]">
               {actionTypeLabel(generatedAction.action_type)}
             </span>
-            <h3 className="flex-1 text-sm font-semibold text-foreground leading-snug">
+            <h3 className="flex-1 font-event-title text-[15px] font-semibold leading-snug text-[var(--modal-text)]">
               {generatedAction.title}
             </h3>
           </div>
@@ -294,42 +258,37 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
             </p>
           )}
           {generatedAction.reason && (
-            <p className="mt-2 text-[12px] text-muted-foreground leading-relaxed">
+            <p className="mt-2 font-event-title text-[13.5px] leading-relaxed text-[var(--modal-text-muted)]">
               {generatedAction.reason}
             </p>
           )}
-          {generatedAction.prompt && (
-            <div
-              className="mt-3 rounded-md border border-border bg-muted/60 p-2.5"
-              data-testid="cluster-action-prompt"
-            >
-              <div className="mb-1 text-[11px] font-semibold text-muted-foreground">行动内容</div>
-              <p className="whitespace-pre-line text-[12px] leading-relaxed text-foreground">
-                {promptPreview(generatedAction.prompt)}
-              </p>
-            </div>
+          {generatedAction.steps && generatedAction.steps.length > 0 && (
+            <ul className="mt-3 space-y-1.5" data-testid="cluster-action-steps">
+              {generatedAction.steps.map((step, i) => (
+                <li key={i} className="flex min-w-0 items-start gap-2 font-event-title text-[13.5px] leading-relaxed text-[var(--modal-text)]">
+                  <span aria-hidden="true" className="mt-[0.6em] h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--brand)]" />
+                  <span className="min-w-0">{step}</span>
+                </li>
+              ))}
+            </ul>
           )}
-          <div className="mt-3 flex items-center gap-2">
+          <div className="mt-3.5 flex items-center gap-2.5">
             <button
               type="button"
               onClick={() => openActionDetail(generatedAction.id)}
-              className="text-xs font-medium text-primary px-2 py-1 rounded hover:bg-accent"
+              className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--brand-border)] px-3.5 py-2 text-[13px] font-semibold text-[var(--brand)] transition-colors hover:bg-[var(--brand-soft)]"
             >
+              <ArrowRight className="h-3.5 w-3.5" />
               查看行动详情
             </button>
             <button
               type="button"
-              onClick={handleClose}
-              className="text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-muted"
+              data-testid="cluster-action-regenerate"
+              onClick={handleRegenerate}
+              className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--modal-border-soft)] px-3.5 py-2 text-[13px] font-semibold text-[var(--modal-text-muted)] transition-colors hover:border-[var(--brand-border)] hover:text-[var(--brand)]"
             >
-              收起
-            </button>
-            <button
-              type="button"
-              onClick={handleShowForm}
-              className="text-xs text-primary hover:underline px-2 py-1"
-            >
-              再生成一个
+              <RotateCcw className="h-3.5 w-3.5" />
+              重新生成
             </button>
           </div>
         </div>
@@ -351,16 +310,16 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
 
       {/* Existing actions list */}
       {showExistingActions && actions.length > 0 && genState === 'idle' && (
-        <div className="space-y-1" data-testid="cluster-action-list">
+        <div className="space-y-0.5" data-testid="cluster-action-list">
           {actions.map((action) => (
             <button
               key={action.id}
               type="button"
               aria-label={`打开行动点: ${action.title}`}
               onClick={() => navigateToActionCard(action.id)}
-              className="w-full flex items-center gap-2 text-left text-sm text-foreground hover:text-primary py-1.5 px-2 -mx-2 rounded-md hover:bg-muted transition-colors group"
+              className="w-full flex items-center gap-2 text-left text-[14px] text-[var(--modal-text)] hover:text-[var(--brand)] py-2 px-2.5 -mx-2.5 rounded-[7px] hover:bg-[var(--modal-hover)] transition-colors group"
             >
-              <ArrowRight className="w-3.5 h-3.5 text-warm-400 group-hover:text-primary shrink-0" />
+              <ArrowRight className="w-3.5 h-3.5 text-[var(--modal-text-faint)] group-hover:text-[var(--brand)] shrink-0" />
               <span className="truncate flex-1">{action.title}</span>
               {action.is_stale ? (
                 <span

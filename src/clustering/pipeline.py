@@ -473,7 +473,7 @@ def resolve_minimax_chat_runtime_config(
         os.environ.get('MINIMAX_MODEL')
         or project_env.get('MINIMAX_MODEL')
         or ai_config.get('model')
-        or 'MiniMax-M2.7'
+        or 'MiniMax-M3'
     )
     return api_key, api_base, model
 
@@ -2713,7 +2713,7 @@ def run_pipeline(
     top_k_judge: Callable[[Any, list[dict]], dict] | None = None,
     api_key: str = '',
     api_base: str | None = None,
-    model: str = 'MiniMax-M2.7',
+    model: str = 'MiniMax-M3',
     tau_hours: float = _TAU_HOURS_DEFAULT,
     candidate_window_days: int = _CANDIDATE_WINDOW_DAYS_DEFAULT,
     summary_max_docs: int = 20,

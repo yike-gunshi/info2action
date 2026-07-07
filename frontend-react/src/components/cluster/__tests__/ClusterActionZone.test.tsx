@@ -75,15 +75,16 @@ describe('ClusterActionZone', () => {
 
   afterEach(cleanup)
 
-  it('生成结果卡展示可执行 prompt 摘要和 fallback 提示,并可打开行动详情', async () => {
+  it('生成结果卡展示行动点(steps)和 fallback 提示,并可打开行动详情', async () => {
     const user = userEvent.setup()
-    setStoreState({ generateAction: makeAction() })
+    setStoreState({ generateAction: makeAction({ steps: ['盘点事件背景', '对比各来源差异', '输出决策建议'] }) })
 
     render(<ClusterActionZone clusterId={42} />)
 
-    const result = await screen.findByTestId('cluster-action-result')
-    expect(result).toHaveTextContent('行动内容')
-    expect(screen.getByTestId('cluster-action-prompt')).toHaveTextContent('盘点事件背景')
+    await screen.findByTestId('cluster-action-result')
+    // v21.0: 结果卡展示 steps 行动点,而非原始 prompt
+    expect(screen.getByTestId('cluster-action-steps')).toHaveTextContent('盘点事件背景')
+    expect(screen.queryByTestId('cluster-action-prompt')).toBeNull()
     expect(screen.getByText(/保守兜底/)).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '查看行动详情' }))

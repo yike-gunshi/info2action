@@ -168,10 +168,13 @@ def test_regular_user_cannot_trigger_host_sensitive_action_controls(admin_gate_e
     client = _logged_in_client(admin_gate_env['app'], 'regular@test.local')
     action_id = admin_gate_env['action_id']
 
+    # v21.0 action-revival: generate-from-item 已从 admin-only 放开到登录用户
+    # (per-user 上下文取代了服务器本机单人文件依赖,不再是 host-sensitive;
+    # 其权限/配额单测见 test_actions_generate_from_item.py)。真正会驱动服务器
+    # 本机执行/子进程的控制项仍必须 admin-only。
     checks = [
         ('GET', f'/api/actions/{action_id}/stream', None),
         ('POST', '/api/actions/auto-generate', {}),
-        ('POST', '/api/actions/generate-from-item', {}),
         ('POST', f'/api/actions/{action_id}/confirm', {'tool': 'codex'}),
         ('POST', f'/api/actions/{action_id}/execute', {'tool': 'codex'}),
         ('PATCH', f'/api/actions/{action_id}', {'title': 'Retargeted', 'prompt': 'evil'}),

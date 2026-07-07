@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Fetch RSS, Hacker News, Reddit, and GitHub Trending into JSON files.
-Usage: python3 fetch_feeds.py [--rss] [--hn] [--reddit] [--github]
-  No flags = fetch all four.
+"""Fetch RSS, WeChat RSS, Hacker News, Reddit, and GitHub Trending into JSON files.
+Usage: python3 fetch_feeds.py [--rss] [--wechat] [--hn] [--reddit] [--github]
+  No flags = fetch all.
 """
 import json, logging, os, sys, time, hashlib
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -23,6 +24,182 @@ with open(os.path.join(BASE, 'config', 'config.json')) as f:
 logger = logging.getLogger(__name__)
 
 
+def _registry_sources(platform, conn=None):
+    import db
+    import remote_db
+
+    if remote_db.fetch_write_to_remote():
+        return remote_db.list_active_sources_remote(platform)
+
+    own_conn = conn is None
+    if conn is None:
+        conn = db.get_conn()
+    try:
+        return db.list_active_sources(conn, platform)
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _log_registry_count(platform, count):
+    msg = f"从注册表读到 {count} 个 active {platform} 源"
+    logger.info(msg)
+    print(f"  ℹ️  {msg}")
+
+
+def _log_registry_fallback(platform, reason):
+    msg = f"{platform} 注册表{reason}，回退 config"
+    logger.warning(msg)
+    print(f"  ⚠️  {msg}")
+
+
+def _without_source_id(rows):
+    out = []
+    for row in rows:
+        if isinstance(row, dict):
+            item = dict(row)
+            item.pop('source_id', None)
+            out.append(item)
+        else:
+            out.append(row)
+    return out
+
+
+def _record_source_fetch_result(source_id, ok, error=None):
+    if source_id is None:
+        return
+    try:
+        import ingest
+
+        ingest.record_source_fetch_result_current_backend(source_id, ok=ok, error=error)
+    except Exception as e:
+        print(f"  ⚠️  source result tracking skipped for {source_id}: {e}")
+
+
+def _is_http_feed_url(value):
+    parsed = urlparse(str(value or ""))
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _config_rss_feeds():
+    return CONFIG.get('rss', {}).get('feeds', [])
+
+
+def _active_rss_feed_sources(conn=None):
+    fallback = _config_rss_feeds()
+    try:
+        sources = _registry_sources('rss', conn)
+        if not sources:
+            _log_registry_fallback('rss', '为空')
+            return fallback
+        _log_registry_count('rss', len(sources))
+        feeds = []
+        for source in sources:
+            url = source['source_key']
+            name = source.get('display_name') or url
+            slug = (source.get('config_json') or {}).get('slug')
+            if not slug:
+                slug = name.replace(' ', '_').replace('/', '_')[:50]
+            feeds.append({'source_id': source.get('id'), 'name': name, 'slug': slug, 'url': url})
+        return feeds
+    except Exception as e:
+        _log_registry_fallback('rss', f'异常: {e}')
+        return fallback
+
+
+def _active_rss_feeds(conn=None):
+    return _without_source_id(_active_rss_feed_sources(conn))
+
+
+def _config_reddit_subreddits():
+    return CONFIG.get('reddit', {}).get('subreddits', [])
+
+
+def _active_reddit_sources(conn=None):
+    fallback = [{'subreddit': sub} for sub in _config_reddit_subreddits()]
+    try:
+        sources = _registry_sources('reddit', conn)
+        if not sources:
+            _log_registry_fallback('reddit', '为空')
+            return fallback
+        _log_registry_count('reddit', len(sources))
+        return [
+            {'source_id': source.get('id'), 'subreddit': source['source_key']}
+            for source in sources
+        ]
+    except Exception as e:
+        _log_registry_fallback('reddit', f'异常: {e}')
+        return fallback
+
+
+def _active_reddit_subreddits(conn=None):
+    return [source['subreddit'] for source in _active_reddit_sources(conn)]
+
+
+def _active_github_awesome_repo_sources(conn=None, tracking_cfg=None):
+    tracking_cfg = tracking_cfg or {}
+    fallback = [{'full_name': repo} for repo in (tracking_cfg.get('awesome_repos', []) or [])]
+    try:
+        sources = _registry_sources('github_repo', conn)
+        if not sources:
+            _log_registry_fallback('github_repo', '为空')
+            return fallback
+        _log_registry_count('github_repo', len(sources))
+        return [
+            {'source_id': source.get('id'), 'full_name': source['source_key']}
+            for source in sources
+        ]
+    except Exception as e:
+        _log_registry_fallback('github_repo', f'异常: {e}')
+        return fallback
+
+
+def _active_github_awesome_repos(conn=None, tracking_cfg=None):
+    return [
+        source['full_name']
+        for source in _active_github_awesome_repo_sources(conn, tracking_cfg)
+    ]
+
+
+def _active_wechat_feed_sources(conn=None):
+    try:
+        sources = _registry_sources('wechat_mp', conn)
+        if not sources:
+            msg = "wechat_mp 注册表为空，跳过公众号 RSS"
+            logger.info(msg)
+            print(f"  ℹ️  {msg}")
+            return []
+        _log_registry_count('wechat_mp', len(sources))
+        feeds = []
+        for source in sources:
+            url = source['source_key']
+            config = source.get('config_json') or {}
+            backend = config.get('backend') if isinstance(config, dict) else None
+            if backend == 'lingowhale' or not _is_http_feed_url(url):
+                continue
+            name = source.get('display_name') or url
+            feeds.append({'source_id': source.get('id'), 'name': name, 'url': url})
+        return feeds
+    except Exception as e:
+        msg = f"wechat_mp 注册表异常: {e}，跳过公众号 RSS"
+        logger.warning(msg)
+        print(f"  ⚠️  {msg}")
+        return []
+
+
+def _active_wechat_feeds(conn=None):
+    return _without_source_id(_active_wechat_feed_sources(conn))
+
+
+def _wechat_feed_safe_name(name, url):
+    base = ''.join(
+        ch if ch.isalnum() or ch in ('_', '-') else '_'
+        for ch in (name or 'wechat')
+    ).strip('_')[:40] or 'wechat'
+    digest = hashlib.md5(url.encode()).hexdigest()[:12]
+    return f'{base}_{digest}'
+
+
 # ============================================================
 # RSS
 # ============================================================
@@ -30,7 +207,7 @@ def fetch_rss():
     """Fetch all configured RSS feeds."""
     import feedparser, requests
 
-    feeds_cfg = CONFIG.get('rss', {}).get('feeds', [])
+    feeds_cfg = _active_rss_feed_sources()
     if not feeds_cfg:
         print("  ⚠️  No RSS feeds in config.json → rss.feeds")
         return
@@ -39,6 +216,7 @@ def fetch_rss():
     os.makedirs(out_dir, exist_ok=True)
 
     for feed_cfg in feeds_cfg:
+        source_id = feed_cfg.get('source_id') if isinstance(feed_cfg, dict) else None
         url = feed_cfg['url']
         name = feed_cfg.get('name', url)
         safe_name = feed_cfg.get('slug') or name.replace(' ', '_').replace('/', '_')[:50]
@@ -47,6 +225,7 @@ def fetch_rss():
         try:
             # Use requests to fetch (handles SSL properly), then parse content
             r = requests.get(url, headers={'User-Agent': 'info2action/1.0'}, timeout=15)
+            r.raise_for_status()
             d = feedparser.parse(r.content)
             items = []
             for entry in d.entries:
@@ -72,8 +251,68 @@ def fetch_rss():
                     'feed_url': url,
                     'items': items,
                 }, f, ensure_ascii=False, indent=2)
+            _record_source_fetch_result(source_id, True)
             print(f"  ✅ {name}: {len(items)} items")
         except Exception as e:
+            _record_source_fetch_result(source_id, False, e)
+            print(f"  ❌ {name}: {e}")
+
+
+# ============================================================
+# WECHAT RSS
+# ============================================================
+def fetch_wechat_rss():
+    """Fetch active WeChat MP RSS feeds from the sources registry."""
+    import feedparser, requests
+
+    feeds_cfg = _active_wechat_feed_sources()
+    if not feeds_cfg:
+        print("  ⚠️  No active wechat_mp RSS feeds in sources registry")
+        return
+
+    out_dir = source_dir('wechat')
+    os.makedirs(out_dir, exist_ok=True)
+
+    for feed_cfg in feeds_cfg:
+        source_id = feed_cfg.get('source_id') if isinstance(feed_cfg, dict) else None
+        url = feed_cfg['url']
+        name = feed_cfg.get('name', url)
+        safe_name = _wechat_feed_safe_name(name, url)
+
+        print(f"  Fetching {name}...")
+        try:
+            r = requests.get(url, headers={'User-Agent': 'info2action/1.0'}, timeout=15)
+            r.raise_for_status()
+            d = feedparser.parse(r.content)
+            items = []
+            for entry in d.entries:
+                content_val = ''
+                if entry.get('content'):
+                    content_val = entry['content'][0].get('value', '')
+
+                items.append({
+                    'id': entry.get('id', entry.get('link', '')),
+                    'title': entry.get('title', ''),
+                    'link': entry.get('link', ''),
+                    'summary': entry.get('summary', ''),
+                    'content': content_val,
+                    'author': entry.get('author', d.feed.get('title', name)),
+                    'published': entry.get('published', ''),
+                    'tags': [t.get('term', '') for t in entry.get('tags', [])],
+                })
+
+            out_path = os.path.join(out_dir, f'{safe_name}.json')
+            with open(out_path, 'w') as f:
+                json.dump({
+                    'feed_title': d.feed.get('title', name),
+                    'feed_url': url,
+                    'source_name': name,
+                    'items': items,
+                }, f, ensure_ascii=False, indent=2)
+            _record_source_fetch_result(source_id, True)
+            print(f"  ✅ {name}: {len(items)} items")
+        except Exception as e:
+            _record_source_fetch_result(source_id, False, e)
             print(f"  ❌ {name}: {e}")
 
 
@@ -120,7 +359,7 @@ def fetch_reddit():
     """Fetch hot posts from configured subreddits."""
     import requests
 
-    subs = CONFIG.get('reddit', {}).get('subreddits', [])
+    subs = _active_reddit_sources()
     count = CONFIG.get('reddit', {}).get('count', 25)
     if not subs:
         print("  ⚠️  No subreddits in config.json → reddit.subreddits")
@@ -130,7 +369,9 @@ def fetch_reddit():
     os.makedirs(out_dir, exist_ok=True)
     headers = {'User-Agent': 'info2action/1.0'}
 
-    for sub in subs:
+    for source in subs:
+        source_id = source.get('source_id') if isinstance(source, dict) else None
+        sub = source['subreddit'] if isinstance(source, dict) else source
         print(f"  Fetching r/{sub}...")
         try:
             r = requests.get(
@@ -143,6 +384,7 @@ def fetch_reddit():
             # 和 fetch_runs.error_msg。Reddit OAuth 是长期解,见 docs/ops/runbook §5
             if r.status_code != 200:
                 print(f"  ❌ r/{sub}: HTTP {r.status_code} (Reddit may block this IP — see runbook §5.6 Reddit IP block)")
+                _record_source_fetch_result(source_id, False, f"HTTP {r.status_code}")
                 continue
             data = r.json()
             posts = []
@@ -186,9 +428,11 @@ def fetch_reddit():
             out_path = os.path.join(out_dir, f'{sub}.json')
             with open(out_path, 'w') as f:
                 json.dump(posts, f, ensure_ascii=False, indent=2)
+            _record_source_fetch_result(source_id, True)
             print(f"  ✅ r/{sub}: {len(posts)} posts")
             time.sleep(2)  # Reddit rate limit
         except Exception as e:
+            _record_source_fetch_result(source_id, False, e)
             print(f"  ❌ r/{sub}: {e}")
 
 
@@ -360,7 +604,7 @@ def fetch_github_awesome_repos():
         print(f"  ❌ github_tracking.json parse error: {e}")
         return []
 
-    awesome_list = tracking_cfg.get('awesome_repos', []) or []
+    awesome_list = _active_github_awesome_repo_sources(tracking_cfg=tracking_cfg)
     if not awesome_list:
         logger.warning("github_tracking.json has empty awesome_repos list")
         return []
@@ -372,9 +616,12 @@ def fetch_github_awesome_repos():
     os.makedirs(out_dir, exist_ok=True)
 
     items = []
-    for full_name in awesome_list:
+    for source in awesome_list:
+        source_id = source.get('source_id') if isinstance(source, dict) else None
+        full_name = source['full_name'] if isinstance(source, dict) else source
         if '/' not in full_name:
             logger.warning("invalid awesome repo entry: %s", full_name)
+            _record_source_fetch_result(source_id, False, "invalid github repo entry")
             continue
         owner, repo = full_name.split('/', 1)
         api_url = f'https://api.github.com/repos/{full_name}'
@@ -388,6 +635,7 @@ def fetch_github_awesome_repos():
             )
             if r.status_code != 200:
                 print(f"  ❌ {full_name}: HTTP {r.status_code}")
+                _record_source_fetch_result(source_id, False, f"HTTP {r.status_code}")
                 continue
             data = r.json() or {}
             readme_text, readme_err = _fetch_readme(full_name)
@@ -406,8 +654,10 @@ def fetch_github_awesome_repos():
                 'readme': readme_safe,
                 'readme_error': readme_err,
             })
+            _record_source_fetch_result(source_id, True)
             time.sleep(1)
         except Exception as e:
+            _record_source_fetch_result(source_id, False, e)
             print(f"  ❌ {full_name}: {e}")
             continue
 
@@ -484,12 +734,16 @@ if __name__ == '__main__':
     run_all = not flags
 
     print("=" * 60)
-    print("  信息雷达 — RSS/HN/Reddit/GitHub 抓取")
+    print("  信息雷达 — RSS/公众号/HN/Reddit/GitHub 抓取")
     print("=" * 60)
 
     if run_all or '--rss' in flags:
         print("\n📡 RSS Feeds...")
         fetch_rss()
+
+    if run_all or '--wechat' in flags:
+        print("\n🐋 公众号 RSS...")
+        fetch_wechat_rss()
 
     if run_all or '--hn' in flags:
         print("\n🔶 Hacker News...")

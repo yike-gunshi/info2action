@@ -167,6 +167,7 @@ export function ClusterFullPage({ clusterId }: ClusterFullPageProps) {
                   cluster={cluster}
                   sources={sources}
                   actions={actions}
+                  showActions
                   className="h-full"
                 />
               </section>

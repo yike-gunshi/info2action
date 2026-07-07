@@ -91,6 +91,174 @@ def _admin_client(app) -> TestClient:
     return client
 
 
+def _regular_client(app, *, username='alice'):
+    """Create a non-admin verified user, return (client, user_id)."""
+    conn = db_mod.get_conn()
+    try:
+        uid = str(uuid.uuid4())
+        hashed = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()
+        db_mod.create_user(conn, uid, username, f'{username}@test.local', hashed, role='user')
+        db_mod.update_user(conn, uid, email_verified=1)
+        conn.commit()
+    finally:
+        conn.close()
+    client = TestClient(app)
+    resp = client.post('/api/auth/login', json={'login': f'{username}@test.local', 'password': PASSWORD})
+    assert resp.status_code == 200, resp.text
+    return client, uid
+
+
+def _ok_process(item, api_key, api_base, model, system_prompt, on_thinking=None):
+    return {
+        'title': '生成的行动',
+        'action_type': 'investigate',
+        'prompt': '去做这件事。',
+        'reason': '值得跟进。',
+        'priority': 'medium',
+    }, None, 'test-log.json'
+
+
+class TestGenerationPermissionAndQuota:
+    def test_regular_user_can_generate(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client, _ = _regular_client(single_item_action_env['app'])
+        resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        assert resp.status_code == 200, resp.text
+        result = next(e for e in _parse_sse(resp.text) if e['type'] == 'result')
+        assert result['action']['title'] == '生成的行动'
+
+    def test_anonymous_is_rejected(self, single_item_action_env, monkeypatch):
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client = TestClient(single_item_action_env['app'])
+        resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        assert resp.status_code == 401, resp.text
+
+    def test_quota_blocks_after_limit(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setenv('ACTION_GEN_DAILY_LIMIT', '2')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client, _ = _regular_client(single_item_action_env['app'])
+        for _ in range(2):
+            resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+            assert resp.status_code == 200, resp.text
+        blocked = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        assert blocked.status_code == 429, blocked.text
+        body = blocked.json()
+        assert body['quota']['used'] == 2 and body['quota']['remaining'] == 0
+
+    def test_admin_is_exempt_from_quota(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setenv('ACTION_GEN_DAILY_LIMIT', '1')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client = _admin_client(single_item_action_env['app'])
+        for _ in range(3):
+            resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+            assert resp.status_code == 200, resp.text
+
+    def test_quota_endpoint_reflects_usage(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setenv('ACTION_GEN_DAILY_LIMIT', '5')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client, _ = _regular_client(single_item_action_env['app'])
+        before = client.get('/api/user/action-quota').json()
+        assert before['limit'] == 5 and before['used'] == 0 and before['remaining'] == 5
+        client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        after = client.get('/api/user/action-quota').json()
+        assert after['used'] == 1 and after['remaining'] == 4
+
+    def test_admin_quota_endpoint_unlimited(self, single_item_action_env):
+        client = _admin_client(single_item_action_env['app'])
+        snap = client.get('/api/user/action-quota').json()
+        assert snap.get('unlimited') is True
+
+    def test_manifest_profile_injected_into_context(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client, uid = _regular_client(single_item_action_env['app'], username='bob')
+        conn = db_mod.get_conn()
+        try:
+            db_mod.upsert_user_profile(conn, uid, manifest='我在做 info2action', role='developer',
+                                       interests=['ai-coding'], tools=['claude-code'])
+            conn.commit()
+        finally:
+            conn.close()
+        resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        assert resp.status_code == 200, resp.text
+        thinking = [e.get('text', '') for e in _parse_sse(resp.text) if e['type'] == 'thinking']
+        assert any('已读取个人画像' in t for t in thinking)
+        assert any('基础画像' in t for t in thinking)
+
+    def test_no_profile_shows_generic_context(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client, _ = _regular_client(single_item_action_env['app'], username='carol')
+        resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        assert resp.status_code == 200, resp.text
+        thinking = [e.get('text', '') for e in _parse_sse(resp.text) if e['type'] == 'thinking']
+        assert any('未使用个人画像' in t for t in thinking)
+
+    def test_generated_steps_stored_separately_from_prompt(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        steps = ['访问 https://x 获取全文', '对比现有实现', '输出结论清单']
+
+        def fake(item, api_key, api_base, model, system_prompt, on_thinking=None):
+            return {
+                'title': '带步骤的行动',
+                'action_type': 'investigate',
+                'prompt': '背景:...这是自包含的可执行指令,含来源URL与期望产出...',
+                'steps': steps,
+                'reason': '值得做',
+                'priority': 'medium',
+            }, None, 'log.json'
+
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', fake)
+        client, _ = _regular_client(single_item_action_env['app'], username='erin')
+        resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        result = next(e for e in _parse_sse(resp.text) if e['type'] == 'result')['action']
+        # steps 与 prompt 分离:SSE result 带结构化 steps,prompt 是自包含指令
+        assert result['steps'] == steps
+        assert '自包含' in result['prompt']
+        # 详情读模型优先返回结构化 steps(而非拆 prompt)
+        detail = client.get(f"/api/actions/{result['id']}").json()
+        assert detail.get('steps') == steps
+
+    def test_status_stepper_endpoint_transitions(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client, _ = _regular_client(single_item_action_env['app'], username='frank')
+        resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        action = next(e for e in _parse_sse(resp.text) if e['type'] == 'result')['action']
+        aid = action['id']
+
+        def status_of():
+            visible = client.get('/api/actions/by-item?item_id=doc-low-value').json()['actions']
+            return visible[0]['status']
+
+        for target in ('confirmed', 'done', 'dismissed', 'pending'):
+            r = client.post(f'/api/actions/{aid}/status', json={'status': target})
+            assert r.status_code == 200, r.text
+            assert status_of() == target
+        # 非法状态被拒
+        bad = client.post(f'/api/actions/{aid}/status', json={'status': 'bogus'})
+        assert bad.status_code == 400
+
+    def test_mark_executing_moves_pending_to_confirmed(self, single_item_action_env, monkeypatch):
+        monkeypatch.setenv('MINIMAX_API_KEY', 'env-test-key')
+        monkeypatch.setattr(generate_actions_mod, 'process_single_item_streaming', _ok_process)
+        client, _ = _regular_client(single_item_action_env['app'], username='dave')
+        resp = client.post('/api/actions/generate-from-item', json={'item_id': 'doc-low-value'})
+        action = next(e for e in _parse_sse(resp.text) if e['type'] == 'result')['action']
+        # owner 标记执行中 → pending → confirmed
+        marked = client.post(f"/api/actions/{action['id']}/mark-executing")
+        assert marked.status_code == 200, marked.text
+        visible = client.get('/api/actions/by-item?item_id=doc-low-value').json()['actions']
+        assert visible[0]['status'] == 'confirmed'
+        # 非 pending 再标记 → 400
+        again = client.post(f"/api/actions/{action['id']}/mark-executing")
+        assert again.status_code == 400
+
+
 class TestGenerateFromItem:
     def test_generate_from_item_prefers_env_minimax_key(
         self,

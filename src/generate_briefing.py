@@ -26,7 +26,7 @@ from env_utils import load_project_env
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.json")
 USER_CONTEXT_PATH = os.path.join(BASE_DIR, "config", "user_context.json")
 _DEFAULT_MINIMAX_CHAT_BASE = "https://api.minimaxi.com/anthropic/v1"
-_DEFAULT_MINIMAX_CHAT_MODEL = "MiniMax-M2.7"
+_DEFAULT_MINIMAX_CHAT_MODEL = "MiniMax-M3"
 
 
 def load_config():

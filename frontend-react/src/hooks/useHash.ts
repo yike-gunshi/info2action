@@ -92,6 +92,7 @@ export function useHash() {
   const setL1 = useUIStore((s) => s.setL1)
   const setExpandedKey = useUIStore((s) => s.setExpandedKey)
   const openItem = useDetailStore((s) => s.openItem)
+  const openAction = useDetailStore((s) => s.openAction)
   const setFocusedActionId = useActionStore((s) => s.setFocusedActionId)
 
   // Parse hash on mount and hash change
@@ -115,8 +116,10 @@ export function useHash() {
         setL1(mapLegacyL1(rawView))
       }
       if (action) {
+        // v21.0 (C2): 深链/刷新 #v=actions&a=<id> 直接打开行动弹窗(openAction 幂等去重)。
         setL1('actions')
         setFocusedActionId(action)
+        openAction(action)
       } else {
         setFocusedActionId(null)
       }
@@ -134,7 +137,7 @@ export function useHash() {
     parseHash()
     window.addEventListener('hashchange', parseHash)
     return () => window.removeEventListener('hashchange', parseHash)
-  }, [setL1, setExpandedKey, openItem, setFocusedActionId])
+  }, [setL1, setExpandedKey, openItem, openAction, setFocusedActionId])
 
   // Update hash when state changes
   const updateHash = useCallback((params: {

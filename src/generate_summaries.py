@@ -301,7 +301,7 @@ def main():
         or ai_config.get("api_base", "")
         or "https://api.minimaxi.com/anthropic/v1"
     ).strip()
-    model = ai_config.get("model", "MiniMax-M2.7")
+    model = ai_config.get("model", "MiniMax-M3")
     print(f"Provider: {provider}, Model: {model}", flush=True)
     if provider == "minimax":
         try:

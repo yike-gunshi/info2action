@@ -17,6 +17,16 @@ def require_admin(request: Request):
     return None
 
 
+def require_login(request: Request):
+    """Return a 401 response unless the request is authenticated (any role)."""
+    if getattr(request.state, 'legacy_authenticated', False):
+        return None
+    user = getattr(request.state, 'user', None)
+    if not user:
+        return JSONResponse({'error': 'Not authenticated'}, status_code=401)
+    return None
+
+
 def current_user_id(request: Request):
     """Return the authenticated JWT user's id, or None for legacy/anonymous requests."""
     user = getattr(request.state, 'user', None)

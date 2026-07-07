@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import urllib.error
 import urllib.request
 import uuid
@@ -20,10 +21,12 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo
 
 import action_detail_read_model
 from category_taxonomy import ACTIVE_CATEGORY_IDS, canonicalize_category, expand_query_categories
 from env_utils import load_project_env
+from health_freshness import classify_platform_freshness
 from time_utils import parse_datetime, sort_key, to_utc_iso
 
 BASE = Path(__file__).resolve().parents[1]
@@ -87,6 +90,7 @@ REMOTE_ITEM_WRITE_COLUMNS = (
     "user_id",
     "platform",
     "source",
+    "source_id",
     "fetch_run_id",
     "title",
     "content",
@@ -185,6 +189,9 @@ REMOTE_RUNNING_FETCH_MAX_AGE_MIN_ENV = "INFO2ACTION_REMOTE_RUNNING_FETCH_MAX_AGE
 FETCH_RUN_HEARTBEAT_GRACE_SEC_ENV = "INFO2ACTION_FETCH_RUN_HEARTBEAT_GRACE_SEC"
 INFO_READ_MODEL_ENV = "INFO2ACTION_INFO_READ_MODEL"
 INFO_READ_MODEL_REFRESH_ENV = "INFO2ACTION_INFO_READ_MODEL_REFRESH"
+# BF-0706-4: 跨进程单飞锁 —— 防止一次重建跑过 min_interval 时新请求并发再起一次重建
+# 造成叠加风暴(Supabase compute 被压崩)。pg advisory lock 会话级,连接关闭自动释放。
+_INFO_READ_MODEL_BUILD_LOCK_KEY = 517070604
 INFO_READ_MODEL_REFRESH_TIMEOUT_MS_ENV = "INFO2ACTION_INFO_READ_MODEL_REFRESH_TIMEOUT_MS"
 INFO_READ_MODEL_INCREMENTAL_ENV = "INFO2ACTION_INFO_READ_MODEL_INCREMENTAL"
 INFO_READ_MODEL_PREWARM_SCOPES_ENV = "INFO2ACTION_INFO_READ_MODEL_PREWARM_SCOPES"
@@ -690,6 +697,118 @@ def remote_schema() -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
         raise RemoteDBConfigError(f"Invalid {REMOTE_SCHEMA_ENV}: {schema!r}")
     return schema
+
+
+def load_source_index_remote(pg_conn: Any | None = None) -> dict[str, Any] | None:
+    """Load the remote sources registry index. Fail open for fetch/ingest paths."""
+    try:
+        if pg_conn is None:
+            with connect() as conn:
+                return load_source_index_remote(conn)
+        import db
+
+        rows = pg_conn.execute(
+            f"SELECT id, platform, source_key, status, config_json FROM {remote_schema()}.sources"
+        ).fetchall()
+        return db.build_source_index_from_rows(rows)
+    except Exception:
+        return None
+
+
+def list_active_sources_remote(platform: str, pg_conn: Any | None = None) -> list[dict[str, Any]]:
+    """Return active remote sources for one platform. Fail open to config fallback."""
+    try:
+        if pg_conn is None:
+            with connect() as conn:
+                return list_active_sources_remote(platform, conn)
+        import db
+
+        rows = pg_conn.execute(
+            f"""SELECT id, source_key, display_name, config_json
+                FROM {remote_schema()}.sources
+                WHERE platform=%s AND status='active'
+                ORDER BY id""",
+            (platform,),
+        ).fetchall()
+        return [db.normalize_active_source_row(row) for row in rows]
+    except Exception:
+        return []
+
+
+def record_source_fetch_result_remote(
+    source_id: int | None,
+    ok: bool,
+    error: Any = None,
+    broken_after: int = 5,
+    pg_conn: Any | None = None,
+) -> None:
+    """Record one remote source fetch result without interrupting the fetch pipeline."""
+    try:
+        if source_id is None:
+            return
+        if pg_conn is None:
+            with connect() as conn:
+                record_source_fetch_result_remote(
+                    source_id,
+                    ok,
+                    error=error,
+                    broken_after=broken_after,
+                    pg_conn=conn,
+                )
+                return
+
+        schema = remote_schema()
+        row = pg_conn.execute(
+            f"SELECT status, consecutive_failures FROM {schema}.sources WHERE id = %s",
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            return
+        status = row["status"]
+        if status not in {"active", "broken"}:
+            return
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if ok:
+            new_status = "active" if status == "broken" else status
+            pg_conn.execute(
+                f"""UPDATE {schema}.sources
+                      SET status = %s,
+                          consecutive_failures = 0,
+                          last_success_at = %s,
+                          last_error = NULL,
+                          updated_at = %s
+                    WHERE id = %s""",
+                (new_status, now, now, source_id),
+            )
+            commit = getattr(pg_conn, "commit", None)
+            if commit:
+                commit()
+            return
+
+        try:
+            threshold = int(broken_after)
+        except (TypeError, ValueError):
+            threshold = 5
+        if threshold <= 0:
+            threshold = 5
+        failures = int(row["consecutive_failures"] or 0) + 1
+        new_status = "broken" if status == "active" and failures >= threshold else status
+        last_error = None if error is None else str(error)[:500]
+        pg_conn.execute(
+            f"""UPDATE {schema}.sources
+                  SET status = %s,
+                      consecutive_failures = %s,
+                      last_error = %s,
+                      updated_at = %s
+                WHERE id = %s""",
+            (new_status, failures, last_error, now, source_id),
+        )
+        commit = getattr(pg_conn, "commit", None)
+        if commit:
+            commit()
+    except Exception:
+        return
 
 
 def database_url() -> str:
@@ -2356,6 +2475,12 @@ def refresh_info_read_model_incremental(
     _record_step(current_step, step_t0)
 
     with connect() as conn:
+        # BF-0706-4: 单飞锁 —— 已有重建在跑就跳过,避免并发叠加压崩 compute。
+        got_lock = conn.execute(
+            "SELECT pg_try_advisory_lock(%s) AS locked", (_INFO_READ_MODEL_BUILD_LOCK_KEY,)
+        ).fetchone()["locked"]
+        if not got_lock:
+            return {"ok": True, "skipped": "build_in_progress"}
         try:
             _set_short_statement_timeout(conn, refresh_timeout_ms)
             current_step = "create_version"
@@ -2770,6 +2895,12 @@ def refresh_info_read_model(*, sample_limit: int = 200, min_github_stars: int = 
         timings_ms[step] = int((time.time() - started_at) * 1000)
 
     with connect() as conn:
+        # BF-0706-4: 单飞锁 —— 已有重建在跑就跳过,避免并发叠加压崩 compute。
+        got_lock = conn.execute(
+            "SELECT pg_try_advisory_lock(%s) AS locked", (_INFO_READ_MODEL_BUILD_LOCK_KEY,)
+        ).fetchone()["locked"]
+        if not got_lock:
+            return {"ok": True, "skipped": "build_in_progress"}
         try:
             _set_short_statement_timeout(conn, refresh_timeout_ms)
             current_step = "create_version"
@@ -5846,6 +5977,541 @@ def get_embedding_usage_audit_remote(
     }
 
 
+ADMIN_CONSOLE_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _admin_console_now(now: datetime | None = None) -> datetime:
+    if now is None:
+        return datetime.now(ADMIN_CONSOLE_TZ).replace(microsecond=0)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(ADMIN_CONSOLE_TZ).replace(microsecond=0)
+
+
+def _admin_console_to_shanghai_iso(value: Any) -> str | None:
+    if not value:
+        return None
+    dt = value if isinstance(value, datetime) else parse_datetime(str(value))
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ADMIN_CONSOLE_TZ).replace(microsecond=0).isoformat()
+
+
+def _admin_console_age_hours(value: Any, now_utc: datetime) -> float | None:
+    if not value:
+        return None
+    dt = value if isinstance(value, datetime) else parse_datetime(str(value))
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (now_utc - dt.astimezone(timezone.utc)).total_seconds() / 3600)
+
+
+def _admin_console_age_text(value: Any, now_utc: datetime) -> str:
+    age = _admin_console_age_hours(value, now_utc)
+    if age is None:
+        return "时间未知"
+    if age < 1:
+        return f"{max(0, int(age * 60))}m 前"
+    return f"{int(age)}h 前"
+
+
+def _admin_console_percent(value: float) -> str:
+    percent = value * 100
+    if abs(percent - round(percent)) < 0.05:
+        return f"{int(round(percent))}%"
+    return f"{percent:.1f}%"
+
+
+def _admin_console_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _admin_console_float(value: Any) -> float | None:
+    return None if value is None else float(value)
+
+
+def _admin_console_table_has_columns(
+    conn: Any,
+    schema: str,
+    table_name: str,
+    column_names: set[str],
+) -> bool:
+    rows = conn.execute(
+        """SELECT column_name
+             FROM information_schema.columns
+            WHERE table_schema = %(schema_name)s
+              AND table_name = %(table_name)s
+              AND column_name = ANY(%(column_names)s)""",
+        {
+            "schema_name": schema,
+            "table_name": table_name,
+            "column_names": sorted(column_names),
+        },
+    ).fetchall()
+    found = {str(row["column_name"]) for row in rows}
+    return column_names.issubset(found)
+
+
+def _admin_console_date_points(now_shanghai: datetime, days: int, value: Any) -> list[dict[str, Any]]:
+    start = now_shanghai.date() - timedelta(days=days - 1)
+    return [
+        {"date": (start + timedelta(days=idx)).isoformat(), "value": value}
+        for idx in range(days)
+    ]
+
+
+def _admin_console_trend(rows: list[Any], now_shanghai: datetime, days: int, default: Any) -> list[dict[str, Any]]:
+    values = {str(row["date"]): row.get("value") for row in rows}
+    points = _admin_console_date_points(now_shanghai, days, default)
+    for point in points:
+        if point["date"] in values:
+            value = values[point["date"]]
+            point["value"] = None if value is None else value
+    return points
+
+
+def _admin_console_embedding_signal(total_calls: int | None, failed_calls: int | None) -> dict[str, Any]:
+    signal = {
+        "key": "embedding",
+        "level": "unknown",
+        "label": "Embedding",
+        "detail": "24h 无 embedding 调用",
+        "link": "runs",
+    }
+    if total_calls is None:
+        signal["detail"] = "embedding 数据不可用"
+        return signal
+    if total_calls <= 0:
+        return signal
+    failed = int(failed_calls or 0)
+    failure_rate = failed / total_calls
+    if failure_rate == 0:
+        level = "ok"
+    elif failure_rate < 0.10:
+        level = "warn"
+    else:
+        level = "crit"
+    signal.update({
+        "level": level,
+        "detail": f"24h 失败率 {_admin_console_percent(failure_rate)}（{total_calls} 次）",
+    })
+    return signal
+
+
+def _admin_console_disk_signal(used_percent: float | None, db_size: str | None = None) -> dict[str, Any]:
+    signal = {
+        "key": "disk",
+        "level": "unknown",
+        "label": "磁盘",
+        "detail": "磁盘信息不可用",
+        "link": None,
+    }
+    if used_percent is None:
+        return signal
+    if used_percent > 90:
+        level = "crit"
+    elif used_percent >= 80:
+        level = "warn"
+    else:
+        level = "ok"
+    db_text = db_size or "DB 未知"
+    signal.update({
+        "level": level,
+        "detail": f"已用 {int(round(used_percent))}% · DB {db_text}",
+    })
+    return signal
+
+
+def _admin_console_pipeline_signal(
+    latest_run: dict[str, Any] | None,
+    counts: dict[str, Any] | None,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    signal = {
+        "key": "pipeline",
+        "level": "unknown",
+        "label": "抓取 Pipeline",
+        "detail": "无任何 run 记录",
+        "link": "runs",
+    }
+    if not latest_run:
+        return signal
+
+    status_text = str(latest_run.get("status") or "unknown").lower()
+    success_24h = int((counts or {}).get("success_runs_24h") or 0)
+    success_48h = int((counts or {}).get("success_runs_48h") or 0)
+    total_24h = int((counts or {}).get("total_runs_24h") or 0)
+    run_time = latest_run.get("finished_at") or latest_run.get("started_at")
+    detail = f"run #{latest_run.get('id')} {status_text} · {_admin_console_age_text(run_time, now_utc)}"
+
+    if status_text in {"failed", "error"} or status_text.startswith("failed") or success_48h == 0:
+        level = "crit"
+    elif "partial" in status_text or total_24h == 0 or success_24h == 0:
+        level = "warn"
+    elif status_text == "success" and success_24h > 0:
+        level = "ok"
+    else:
+        level = "warn"
+    signal.update({"level": level, "detail": detail})
+    return signal
+
+
+def _admin_console_freshness_signal(rows: list[Any], now_utc: datetime) -> dict[str, Any]:
+    signal = {
+        "key": "freshness",
+        "level": "unknown",
+        "label": "平台新鲜度",
+        "detail": "无平台抓取记录",
+        "link": "runs",
+    }
+    platform_ages: list[tuple[str, float, Any]] = []
+    for row in rows:
+        platform = str(row.get("platform") or "unknown")
+        last_fetched_at = row.get("last_fetched_at")
+        age = _admin_console_age_hours(last_fetched_at, now_utc)
+        if age is not None:
+            platform_ages.append((platform, age, last_fetched_at))
+    if not platform_ages:
+        return signal
+
+    worst = max(platform_ages, key=lambda item: item[1])
+    level = classify_platform_freshness(worst[1])
+    signal.update({
+        "level": level,
+        "detail": f"{worst[0]} 最近抓取 {int(worst[1])}h 前",
+    })
+    return signal
+
+
+def _admin_console_remote_db_signal(started_at: float) -> dict[str, Any]:
+    status()
+    elapsed_ms = max(0, int(round((time.monotonic() - started_at) * 1000)))
+    return {
+        "key": "remote_db",
+        "level": "ok",
+        "label": "远程 DB",
+        "detail": f"可达 · {elapsed_ms}ms",
+        "link": None,
+    }
+
+
+def _admin_console_incidents(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    incidents = [
+        {
+            "severity": signal["level"],
+            "text": f"{signal['label']}：{signal['detail']}",
+            "link": signal.get("link"),
+        }
+        for signal in signals
+        if signal.get("level") in {"warn", "crit"}
+    ]
+    incidents.sort(key=lambda item: 0 if item["severity"] == "crit" else 1)
+    return incidents[:5]
+
+
+def _admin_console_db_size(conn: Any) -> str | None:
+    row = conn.execute(
+        "SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size"
+    ).fetchone()
+    return (row or {}).get("db_size")
+
+
+def _admin_console_disk_usage_percent() -> float | None:
+    try:
+        usage = shutil.disk_usage("/")
+    except Exception:
+        return None
+    total = getattr(usage, "total", 0) or 0
+    if total <= 0:
+        return None
+    return (float(getattr(usage, "used", 0) or 0) / float(total)) * 100
+
+
+def admin_console_summary_remote(*, now: datetime | None = None) -> dict[str, Any]:
+    now_shanghai = _admin_console_now(now)
+    now_utc = now_shanghai.astimezone(timezone.utc)
+    today = now_shanghai.date().isoformat()
+    start_14d = (now_shanghai.date() - timedelta(days=13)).isoformat()
+    start_7d = (now_shanghai.date() - timedelta(days=6)).isoformat()
+    since_1d = now_utc - timedelta(days=1)
+    since_7d = now_utc - timedelta(days=7)
+    since_24h = now_utc - timedelta(hours=24)
+    since_48h = now_utc - timedelta(hours=48)
+
+    c_metrics = {
+        "total_users": None,
+        "new_users_today": None,
+        "new_users_7d": None,
+        "active_users_1d": None,
+        "active_users_7d": None,
+        "info_click_users_7d": None,
+        "info_click_items_7d": None,
+        "info_click_items_total": None,
+        "highlight_click_users_7d": None,
+        "highlight_click_events_7d": None,
+        "highlight_click_events_total": None,
+    }
+    interactions_detail = {
+        "starred_users": None,
+        "starred_total": None,
+        "read_users_7d": None,
+        "read_items_7d": None,
+        "latest_signup": None,
+    }
+    cost = {
+        "embedding_cost_yuan_24h": None,
+        "embedding_calls_24h": None,
+    }
+    embedding_calls = None
+    embedding_failed = None
+    schema = remote_schema()
+    remote_started_at = time.monotonic()
+
+    with connect() as conn:
+        users_ok = _admin_console_table_has_columns(conn, schema, "users", {"id", "username", "created_at"})
+        item_status_ok = _admin_console_table_has_columns(
+            conn, schema, "item_status", {"user_id", "item_id", "read_at", "clicked_at", "starred_at"}
+        )
+        cluster_status_ok = _admin_console_table_has_columns(
+            conn, schema, "cluster_status", {"user_id", "cluster_id", "clicked_at", "starred_at"}
+        )
+        fetch_runs_ok = _admin_console_table_has_columns(
+            conn, schema, "fetch_runs", {"id", "started_at", "finished_at", "status", "error_msg"}
+        )
+        items_ok = _admin_console_table_has_columns(conn, schema, "items", {"platform", "fetched_at"})
+        embedding_ok = _admin_console_table_has_columns(
+            conn, schema, "embedding_usage_logs", {"created_at", "status", "estimated_cost_yuan"}
+        )
+
+        if users_ok:
+            row = conn.execute(
+                f"""SELECT COUNT(*) AS total_users,
+                           COUNT(*) FILTER (
+                             WHERE timezone('Asia/Shanghai', created_at)::date = %(today)s::date
+                           ) AS new_users_today,
+                           COUNT(*) FILTER (
+                             WHERE created_at >= %(since_7d)s
+                           ) AS new_users_7d
+                      FROM {schema}.users""",
+                {"today": today, "since_7d": since_7d},
+            ).fetchone()
+            c_metrics["total_users"] = _admin_console_int((row or {}).get("total_users"))
+            c_metrics["new_users_today"] = _admin_console_int((row or {}).get("new_users_today"))
+            c_metrics["new_users_7d"] = _admin_console_int((row or {}).get("new_users_7d"))
+
+            latest = conn.execute(
+                f"""SELECT username, created_at
+                      FROM {schema}.users
+                     ORDER BY created_at DESC
+                     LIMIT 1"""
+            ).fetchone()
+            if latest:
+                interactions_detail["latest_signup"] = {
+                    "username": latest.get("username"),
+                    "created_at": _admin_console_to_shanghai_iso(latest.get("created_at")),
+                }
+
+        if item_status_ok and cluster_status_ok:
+            for key, since in (("active_users_1d", since_1d), ("active_users_7d", since_7d)):
+                row = conn.execute(
+                    f"""SELECT COUNT(DISTINCT user_id) AS active_users
+                          FROM (
+                            SELECT user_id
+                              FROM {schema}.item_status
+                             WHERE read_at >= %(since)s
+                                OR clicked_at >= %(since)s
+                                OR starred_at >= %(since)s
+                            UNION
+                            SELECT user_id
+                              FROM {schema}.cluster_status
+                             WHERE clicked_at >= %(since)s
+                                OR starred_at >= %(since)s
+                          ) active_users""",
+                    {"since": since},
+                ).fetchone()
+                c_metrics[key] = _admin_console_int((row or {}).get("active_users"))
+
+        if item_status_ok:
+            row = conn.execute(
+                f"""SELECT COUNT(DISTINCT user_id) FILTER (
+                             WHERE clicked_at >= %(since_7d)s
+                           ) AS info_click_users_7d,
+                           COUNT(DISTINCT item_id) FILTER (
+                             WHERE clicked_at >= %(since_7d)s
+                           ) AS info_click_items_7d,
+                           COUNT(DISTINCT item_id) FILTER (
+                             WHERE clicked_at IS NOT NULL
+                           ) AS info_click_items_total
+                      FROM {schema}.item_status""",
+                {"since_7d": since_7d},
+            ).fetchone()
+            c_metrics["info_click_users_7d"] = _admin_console_int((row or {}).get("info_click_users_7d"))
+            c_metrics["info_click_items_7d"] = _admin_console_int((row or {}).get("info_click_items_7d"))
+            c_metrics["info_click_items_total"] = _admin_console_int((row or {}).get("info_click_items_total"))
+
+            row = conn.execute(
+                f"""SELECT COUNT(DISTINCT user_id) FILTER (
+                             WHERE starred_at IS NOT NULL
+                           ) AS starred_users,
+                           COUNT(DISTINCT item_id) FILTER (
+                             WHERE starred_at IS NOT NULL
+                           ) AS starred_total,
+                           COUNT(DISTINCT user_id) FILTER (
+                             WHERE read_at >= %(since_7d)s
+                           ) AS read_users_7d,
+                           COUNT(DISTINCT item_id) FILTER (
+                             WHERE read_at >= %(since_7d)s
+                           ) AS read_items_7d
+                      FROM {schema}.item_status""",
+                {"since_7d": since_7d},
+            ).fetchone()
+            interactions_detail["starred_users"] = _admin_console_int((row or {}).get("starred_users"))
+            interactions_detail["starred_total"] = _admin_console_int((row or {}).get("starred_total"))
+            interactions_detail["read_users_7d"] = _admin_console_int((row or {}).get("read_users_7d"))
+            interactions_detail["read_items_7d"] = _admin_console_int((row or {}).get("read_items_7d"))
+
+        if cluster_status_ok:
+            row = conn.execute(
+                f"""SELECT COUNT(DISTINCT user_id) FILTER (
+                             WHERE clicked_at >= %(since_7d)s
+                           ) AS highlight_click_users_7d,
+                           COUNT(DISTINCT cluster_id) FILTER (
+                             WHERE clicked_at >= %(since_7d)s
+                           ) AS highlight_click_events_7d,
+                           COUNT(DISTINCT cluster_id) FILTER (
+                             WHERE clicked_at IS NOT NULL
+                           ) AS highlight_click_events_total
+                      FROM {schema}.cluster_status""",
+                {"since_7d": since_7d},
+            ).fetchone()
+            c_metrics["highlight_click_users_7d"] = _admin_console_int((row or {}).get("highlight_click_users_7d"))
+            c_metrics["highlight_click_events_7d"] = _admin_console_int((row or {}).get("highlight_click_events_7d"))
+            c_metrics["highlight_click_events_total"] = _admin_console_int((row or {}).get("highlight_click_events_total"))
+
+        if embedding_ok:
+            row = conn.execute(
+                f"""SELECT COUNT(*) AS embedding_calls_24h,
+                           COUNT(*) FILTER (
+                             WHERE status != 'success'
+                           ) AS embedding_failed_24h,
+                           COALESCE(SUM(estimated_cost_yuan), 0.0) AS embedding_cost_yuan_24h
+                      FROM {schema}.embedding_usage_logs
+                     WHERE created_at >= %(since_24h)s""",
+                {"since_24h": since_24h},
+            ).fetchone()
+            embedding_calls = _admin_console_int((row or {}).get("embedding_calls_24h"))
+            embedding_failed = _admin_console_int((row or {}).get("embedding_failed_24h"))
+            cost["embedding_calls_24h"] = embedding_calls
+            cost["embedding_cost_yuan_24h"] = _admin_console_float((row or {}).get("embedding_cost_yuan_24h"))
+
+        latest_run = None
+        pipeline_counts = None
+        if fetch_runs_ok:
+            latest_run = conn.execute(
+                f"""SELECT id, started_at, finished_at, status, error_msg
+                      FROM {schema}.fetch_runs
+                     ORDER BY id DESC
+                     LIMIT 1"""
+            ).fetchone()
+            pipeline_counts = conn.execute(
+                f"""SELECT COUNT(*) FILTER (
+                             WHERE COALESCE(finished_at, started_at) >= %(since_24h)s
+                           ) AS total_runs_24h,
+                           COUNT(*) FILTER (
+                             WHERE status = 'success'
+                               AND COALESCE(finished_at, started_at) >= %(since_24h)s
+                           ) AS success_runs_24h,
+                           COUNT(*) FILTER (
+                             WHERE status = 'success'
+                               AND COALESCE(finished_at, started_at) >= %(since_48h)s
+                           ) AS success_runs_48h
+                      FROM {schema}.fetch_runs""",
+                {"since_24h": since_24h, "since_48h": since_48h},
+            ).fetchone()
+
+        freshness_rows = []
+        if items_ok:
+            freshness_rows = conn.execute(
+                f"""SELECT platform, MAX(fetched_at) AS last_fetched_at
+                      FROM {schema}.items
+                     WHERE platform IS NOT NULL
+                     GROUP BY platform"""
+            ).fetchall()
+
+        db_size = _admin_console_db_size(conn)
+
+        if users_ok:
+            user_trend_rows = conn.execute(
+                f"""SELECT to_char(days.day, 'YYYY-MM-DD') AS date,
+                           COALESCE(counts.value, 0)::int AS value
+                      FROM generate_series(%(start_date)s::date, %(end_date)s::date, interval '1 day') AS days(day)
+                 LEFT JOIN (
+                           SELECT timezone('Asia/Shanghai', created_at)::date AS day,
+                                  COUNT(*)::int AS value
+                             FROM {schema}.users
+                            WHERE timezone('Asia/Shanghai', created_at)::date >= %(start_date)s::date
+                         GROUP BY day
+                      ) counts ON counts.day = days.day
+                  ORDER BY days.day""",
+                {"start_date": start_14d, "end_date": today},
+            ).fetchall()
+            new_users_14d = _admin_console_trend(user_trend_rows, now_shanghai, 14, 0)
+        else:
+            new_users_14d = _admin_console_date_points(now_shanghai, 14, None)
+
+        if fetch_runs_ok:
+            fetch_trend_rows = conn.execute(
+                f"""SELECT to_char(days.day, 'YYYY-MM-DD') AS date,
+                           CASE
+                             WHEN counts.total_runs IS NULL OR counts.total_runs = 0 THEN NULL
+                             ELSE counts.success_runs::float / counts.total_runs
+                           END AS value
+                      FROM generate_series(%(start_date)s::date, %(end_date)s::date, interval '1 day') AS days(day)
+                 LEFT JOIN (
+                           SELECT timezone('Asia/Shanghai', COALESCE(finished_at, started_at))::date AS day,
+                                  COUNT(*)::int AS total_runs,
+                                  COUNT(*) FILTER (WHERE status = 'success')::int AS success_runs
+                             FROM {schema}.fetch_runs
+                            WHERE COALESCE(finished_at, started_at) IS NOT NULL
+                              AND timezone('Asia/Shanghai', COALESCE(finished_at, started_at))::date >= %(start_date)s::date
+                         GROUP BY day
+                      ) counts ON counts.day = days.day
+                  ORDER BY days.day""",
+                {"start_date": start_7d, "end_date": today},
+            ).fetchall()
+            fetch_success_rate_7d = _admin_console_trend(fetch_trend_rows, now_shanghai, 7, None)
+        else:
+            fetch_success_rate_7d = _admin_console_date_points(now_shanghai, 7, None)
+
+    signals = [
+        _admin_console_pipeline_signal(dict(latest_run) if latest_run else None, dict(pipeline_counts) if pipeline_counts else None, now_utc),
+        _admin_console_freshness_signal(freshness_rows, now_utc),
+        _admin_console_embedding_signal(embedding_calls, embedding_failed),
+        _admin_console_remote_db_signal(remote_started_at),
+        _admin_console_disk_signal(_admin_console_disk_usage_percent(), db_size),
+    ]
+
+    return {
+        "available": True,
+        "generated_at": now_shanghai.isoformat(),
+        "c_metrics": c_metrics,
+        "interactions_detail": interactions_detail,
+        "cost": cost,
+        "health": {
+            "signals": signals,
+            "incidents": _admin_console_incidents(signals),
+        },
+        "trends": {
+            "new_users_14d": new_users_14d,
+            "fetch_success_rate_7d": fetch_success_rate_7d,
+        },
+    }
+
+
 def admin_overview_remote(
     *,
     fetch_run_limit: int = 20,
@@ -6170,6 +6836,7 @@ def _item_upsert_sql(schema: str, *, row_count: int = 1) -> str:
               cover_url = COALESCE(excluded.cover_url, target.cover_url),
               author_name = COALESCE(NULLIF(excluded.author_name, ''), target.author_name),
               source = COALESCE(NULLIF(excluded.source, ''), target.source),
+              source_id = COALESCE(excluded.source_id, target.source_id),
               fetch_run_id = COALESCE(excluded.fetch_run_id, target.fetch_run_id),
               fetched_at = CASE
                 WHEN excluded.fetch_run_id IS NOT NULL
@@ -6216,6 +6883,7 @@ def _item_upsert_noop_guard(refresh_change_condition: str) -> str:
                 OR COALESCE(excluded.cover_url, target.cover_url) IS DISTINCT FROM target.cover_url
                 OR COALESCE(NULLIF(excluded.author_name, ''), target.author_name) IS DISTINCT FROM target.author_name
                 OR COALESCE(NULLIF(excluded.source, ''), target.source) IS DISTINCT FROM target.source
+                OR COALESCE(excluded.source_id, target.source_id) IS DISTINCT FROM target.source_id
                 OR (
                   excluded.fetch_run_id IS NOT NULL
                   AND {refresh_change_condition}
@@ -7719,6 +8387,7 @@ def create_action_remote(
     user_id: str | None = None,
     source_id: str | None = None,
     cluster_version: int | None = None,
+    steps: list[str] | None = None,
 ) -> str:
     if pg_conn is None:
         with connect() as conn:
@@ -7738,17 +8407,19 @@ def create_action_remote(
                 user_id=user_id,
                 source_id=source_id,
                 cluster_version=cluster_version,
+                steps=steps,
             )
     action_id = str(uuid.uuid4())
+    steps_text = json.dumps(steps, ensure_ascii=False) if isinstance(steps, list) and steps else None
     pg_conn.execute(
         f"""INSERT INTO {remote_schema()}.actions
               (id, user_id, source_type, source_item_ids, source_id,
                cluster_version, original_title, original_prompt,
                original_reason, original_priority, title, action_type,
-               related_project, prompt, reason, priority, status,
+               related_project, prompt, steps, reason, priority, status,
                direction, direction_label)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (
             action_id,
             user_id,
@@ -7764,6 +8435,7 @@ def create_action_remote(
             action_type,
             related_project,
             prompt,
+            steps_text,
             reason,
             priority,
             status,
@@ -9071,12 +9743,43 @@ def get_actions_by_item_remote(item_id: str, *, user_id: str | None = None) -> l
         params["user_id"] = user_id
     with connect() as conn:
         rows = conn.execute(
-            f"""SELECT id, title, action_type, priority, status, reason,
+            f"""SELECT id, title, action_type, priority, status, reason, steps,
                       created_at, source_item_ids
                  FROM {remote_schema()}.actions
                  {_where_sql(where)}
                 ORDER BY created_at DESC""",
             params,
+        ).fetchall()
+    result = []
+    for row in rows:
+        d = _normalize_action_row(row)
+        # v2 §14.3(T7): steps 供信息弹窗列表原位展示
+        raw_steps = d.get('steps')
+        if isinstance(raw_steps, str):
+            try:
+                d['steps'] = json.loads(raw_steps)
+            except (json.JSONDecodeError, TypeError):
+                d['steps'] = None
+        result.append(d)
+    return result
+
+
+def get_cluster_actions_remote(cluster_id: int, *, user_id: str) -> list[dict[str, Any]]:
+    """BF-0706-3: 事件弹窗行动列表的 remote 分支(镜像 clusters.cluster_actions_list 本地查询)。
+
+    Why: cluster_actions_list 之前只读本地 sqlite,生产走 Supabase 时事件下已生成行动
+    点一个都不显示。按 source_type='cluster' AND source_id AND user_id 查。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            f"""SELECT id, title, action_type, prompt, priority, status,
+                      cluster_version, is_stale, created_at
+                 FROM {remote_schema()}.actions
+                WHERE source_type = 'cluster'
+                  AND source_id = %(source_id)s
+                  AND user_id = %(user_id)s
+                ORDER BY created_at DESC""",
+            {"source_id": str(cluster_id), "user_id": user_id},
         ).fetchall()
     return [_normalize_action_row(row) for row in rows]
 
@@ -9825,6 +10528,7 @@ def update_user_remote(user_id: str, **fields: Any) -> None:
         "username", "email", "password_hash", "role", "discord_bot_token_enc",
         "last_login_at", "email_verified", "verification_code",
         "verification_code_expires", "reset_token", "reset_token_expires",
+        "discord_channel_id",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -10524,6 +11228,81 @@ def consume_asr_quota_remote(
     )
     _commit_if_supported(pg_conn)
     return get_asr_usage_today_remote(pg_conn, user_id=user_id)
+
+
+# ── v21.0 action-revival: 行动点生成每日配额(remote 镜像 db.* 同名函数)──
+
+def _generation_usage_snapshot(day_cst: str, used: int, limit: int) -> dict[str, Any]:
+    from datetime import datetime, timedelta
+    try:
+        next_day = (datetime.strptime(day_cst, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        reset_at = f"{next_day}T00:00:00+08:00"
+    except Exception:
+        reset_at = None
+    used = max(0, int(used))
+    return {
+        'day_cst': day_cst,
+        'used': used,
+        'limit': int(limit),
+        'remaining': max(0, int(limit) - used),
+        'over_limit': used >= int(limit),
+        'reset_at': reset_at,
+    }
+
+
+def get_generation_usage_today_remote(
+    pg_conn: Any | None = None,
+    *,
+    user_id: str,
+    limit: int,
+) -> dict[str, Any]:
+    """Return today's generation quota snapshot from Supabase."""
+    if pg_conn is None:
+        with connect() as conn:
+            return get_generation_usage_today_remote(conn, user_id=user_id, limit=limit)
+    today = _asr_today_cst()
+    row = pg_conn.execute(
+        f"""SELECT count
+              FROM {remote_schema()}.user_daily_generation
+             WHERE user_id = %s AND day_cst = %s""",
+        (str(user_id), today),
+    ).fetchone()
+    used = int(_row_get(row, "count", 0) or 0) if row else 0
+    return _generation_usage_snapshot(today, used, limit)
+
+
+def try_consume_generation_quota_remote(
+    pg_conn: Any | None,
+    *,
+    user_id: str,
+    limit: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Atomically consume one generation credit if under `limit`.
+
+    Uses an upsert whose DO UPDATE is guarded by a WHERE on the existing count,
+    so a row at the limit yields no RETURNING row (not consumed). New rows insert
+    at count=1. Returns (allowed, snapshot).
+    """
+    if pg_conn is None:
+        with connect() as conn:
+            return try_consume_generation_quota_remote(conn, user_id=user_id, limit=limit)
+    today = _asr_today_cst()
+    schema = remote_schema()
+    row = pg_conn.execute(
+        f"""INSERT INTO {schema}.user_daily_generation
+              (user_id, day_cst, count, updated_at)
+            VALUES (%s, %s, 1, now())
+            ON CONFLICT (user_id, day_cst) DO UPDATE SET
+              count = {schema}.user_daily_generation.count + 1,
+              updated_at = now()
+            WHERE {schema}.user_daily_generation.count < %s
+            RETURNING count""",
+        (str(user_id), today, int(limit)),
+    ).fetchone()
+    _commit_if_supported(pg_conn)
+    if row is not None:
+        return True, _generation_usage_snapshot(today, int(_row_get(row, "count", 1) or 1), limit)
+    return False, get_generation_usage_today_remote(pg_conn, user_id=user_id, limit=limit)
 
 
 def get_item_asr_state_remote(item_id: str) -> dict[str, Any] | None:

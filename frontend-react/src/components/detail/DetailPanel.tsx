@@ -1,17 +1,19 @@
 import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import type { CSSProperties } from 'react'
-import { X, ExternalLink, ArrowLeft, ChevronDown, Share2, Bookmark, ImageOff, Ban, CalendarDays, CheckCircle2, RotateCcw, Send } from 'lucide-react'
+import { X, ExternalLink, ArrowLeft, ChevronDown, Share2, Bookmark, ImageOff, Ban, CalendarDays, CheckCircle2, RotateCcw, Send, Copy } from 'lucide-react'
 import { toast } from 'sonner'
 import { useDetailStore } from '../../store/detailStore'
+import { useClusterDetailStore } from '../../store/clusterDetailStore'
 import { useFeedStore } from '../../store/feedStore'
 import { useActionStore } from '../../store/actionStore'
 import { useAuthStore } from '../../store/authStore'
-import { dismissAction, dispatchAction, fetchAction, markActionDone, setItemStatus, updateAction } from '../../lib/api'
-import { cn, eventPlatformName, platformClass, relativeTime, actionTypeName, stripMd } from '../../lib/utils'
+import { dispatchAction, fetchAction, setActionStatus, setItemStatus } from '../../lib/api'
+import { cn, eventPlatformName, platformClass, relativeTime, stripMd } from '../../lib/utils'
 import { PlatformBrandIcon } from '../shared/PlatformIcon'
 import { requireAuth } from '../shared/AuthGate'
 import { VideoPlayer } from './VideoPlayer'
 import { YoutubePlayer } from './YoutubePlayer'
+import { ActionZone } from './ActionZone'
 import { renderMarkdownInline } from '../../lib/markdown-lite'
 import { TranscriptPanel } from './TranscriptPanel'
 import { SummaryUpdatedBadge } from './SummaryUpdatedBadge'
@@ -461,9 +463,6 @@ function ActionModalHeader({
   goBack: () => void
   handleClose: () => void
 }) {
-  const priorityLabel = action.priority || ''
-  const statusLabel = ACTION_STATUS_LABELS[action.status] || action.status
-
   return (
     <header
       data-testid="detail-modal-header"
@@ -496,18 +495,6 @@ function ActionModalHeader({
             data-testid="action-modal-meta"
             className="reading-meta mt-3 flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1"
           >
-            <span className="font-semibold text-[var(--brand)]">{actionTypeName(action.type)}</span>
-            {priorityLabel && (
-              <>
-                <span className="text-[var(--modal-text-subtle)]" aria-hidden="true">·</span>
-                <span className={cn('font-semibold', priorityLabel === 'P0' ? 'text-[#D94B45]' : 'text-[var(--modal-text-muted)]')}>
-                  {priorityLabel}
-                </span>
-              </>
-            )}
-            <span className="text-[var(--modal-text-subtle)]" aria-hidden="true">·</span>
-            <span className="font-semibold text-[var(--brand)]">{statusLabel}</span>
-            <span className="text-[var(--modal-text-subtle)]" aria-hidden="true">·</span>
             <span className="inline-flex min-w-0 items-center gap-1.5 text-[var(--modal-text-muted)]">
               <CalendarDays className="h-3.5 w-3.5 shrink-0" />
               <time className="font-mono tabular-nums" dateTime={action.created_at}>
@@ -748,6 +735,13 @@ function DetailContent({
         </div>
       )}
 
+      {/* v21.0 action-revival: 行动点区块挂正文末,加同款分隔线过渡到"生成行动"。 */}
+      <section
+        data-testid="detail-action-zone"
+        className={cn((hasSummaryBlock || content) && 'border-t border-[var(--modal-divider)] pt-4 mt-2')}
+      >
+        <ActionZone itemId={item.id} />
+      </section>
     </>
   )
 }
@@ -966,16 +960,6 @@ function DetailSkeleton() {
 
 // ── Action Detail Content (for action-type modal) ──────────────────────────
 
-const ACTION_STATUS_LABELS: Record<ActionStatus, string> = {
-  pending: '待处理',
-  confirmed: '执行中',
-  executing: '执行中',
-  dispatched: '执行中',
-  done: '已完成',
-  failed: '失败',
-  dismissed: '已忽略',
-  ignored: '已忽略',
-}
 
 function hasCompleteActionDetailPayload(action: ActionItem | null): boolean {
   if (!action) return false
@@ -1056,11 +1040,106 @@ function ActionModalShell({
         goBack={goBack}
         handleClose={handleClose}
       />
+      <ActionStatusStepper action={action} onPatchAction={patchAction} />
       <div className="flex-1 overflow-y-auto px-6 pb-7 pt-0 sm:px-10 sm:pb-8">
-        <ActionDetailContent action={action} />
+        <ActionDetailContent action={action} onPatchAction={patchAction} />
       </div>
-      <ActionFooter action={action} onPatchAction={patchAction} />
     </>
+  )
+}
+
+// v2 §13.4: 行动详情顶部独立状态区。三段式 stepper 可点切换 + 忽略/恢复。
+const STATUS_STEPS: { label: string; status: 'pending' | 'confirmed' | 'done' }[] = [
+  { label: '待处理', status: 'pending' },
+  { label: '执行中', status: 'confirmed' },
+  { label: '已完成', status: 'done' },
+]
+
+function statusStepIndex(status: ActionStatus): number {
+  if (status === 'pending') return 0
+  if (status === 'confirmed' || status === 'executing' || status === 'dispatched') return 1
+  if (status === 'done') return 2
+  return -1
+}
+
+function ActionStatusStepper({
+  action,
+  onPatchAction,
+}: {
+  action: ActionItem
+  onPatchAction: (patch: Partial<ActionItem>) => void
+}) {
+  const updateActionInStore = useActionStore((s) => s.updateAction)
+  const [busy, setBusy] = useState(false)
+  const cur = statusStepIndex(action.status)
+  const isDismissed = action.status === 'dismissed' || action.status === 'ignored' || action.status === 'failed'
+
+  const apply = async (status: 'pending' | 'confirmed' | 'done' | 'dismissed', okMsg: string) => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await setActionStatus(action.id, status)
+      onPatchAction({ status })
+      updateActionInStore(action.id, { status })
+      toast.success(okMsg)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '操作失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div
+      data-testid="action-status-stepper"
+      className="flex flex-shrink-0 flex-wrap items-center gap-3 border-b border-[var(--modal-divider)] px-6 py-3 sm:px-10"
+    >
+      <div className="inline-flex items-center rounded-[9px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface)] p-1">
+        {STATUS_STEPS.map((st, i) => (
+          <span key={st.status} className="inline-flex items-center">
+            {i > 0 && <span className="px-0.5 text-[12px] text-[var(--modal-text-faint)]" aria-hidden="true">›</span>}
+            <button
+              type="button"
+              data-testid={`status-step-${st.status}`}
+              aria-pressed={i === cur}
+              disabled={busy}
+              onClick={() => apply(st.status, `已置为「${st.label}」`)}
+              className={cn(
+                'rounded-[6px] px-2.5 py-1 text-[12px] font-semibold transition-colors disabled:opacity-60',
+                i === cur
+                  ? 'bg-[var(--brand)] text-[var(--brand-foreground)]'
+                  : i < cur
+                    ? 'text-[var(--brand)] hover:bg-[var(--modal-hover-soft)]'
+                    : 'text-[var(--modal-text-muted)] hover:text-[var(--modal-text)]',
+              )}
+            >
+              {st.label}
+            </button>
+          </span>
+        ))}
+      </div>
+      {isDismissed ? (
+        <button
+          type="button"
+          data-testid="status-restore"
+          disabled={busy}
+          onClick={() => apply('pending', '已恢复待处理')}
+          className="inline-flex items-center gap-1.5 reading-caption text-[var(--modal-text-muted)] hover:text-[var(--modal-text)]"
+        >
+          <RotateCcw className="h-3.5 w-3.5" /> 恢复待处理
+        </button>
+      ) : (
+        <button
+          type="button"
+          data-testid="status-dismiss"
+          disabled={busy}
+          onClick={() => apply('dismissed', '已忽略')}
+          className="inline-flex items-center gap-1.5 reading-caption text-[var(--modal-text-faint)] hover:text-[var(--modal-text)]"
+        >
+          <Ban className="h-3.5 w-3.5" /> 忽略
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -1081,38 +1160,74 @@ function ActionModalLoading() {
   )
 }
 
+/** Parse a reason array: proper JSON, or best-effort salvage of legacy Python-repr
+ *  (`[{'label': '..', 'text': '..'}]` — BF-0706-#3 历史脏数据;后端已修正新写入)。*/
+function parseReasonArray(s: string): Array<{ label?: string; text?: string }> | null {
+  try {
+    const p = JSON.parse(s) as Array<{ label?: string; text?: string }>
+    if (Array.isArray(p) && p.length > 0 && p[0].text) return p
+  } catch { /* not JSON — try repr salvage below */ }
+  if (/^\[\s*\{\s*'/.test(s)) {
+    try {
+      const p = JSON.parse(s.replace(/'/g, '"')) as Array<{ label?: string; text?: string }>
+      if (Array.isArray(p) && p.length > 0 && p[0].text) return p
+    } catch { /* salvage failed — fall through to raw */ }
+  }
+  return null
+}
+
 /** Parse reasoning: JSON array of {label, text} or plain string */
 function ReasoningBlock({ text }: { text: string }) {
   const normalized = text.trim()
   if (normalized.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(normalized) as Array<{ label?: string; text?: string }>
-      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].text) {
-        return (
-          <div className="space-y-2">
-            {parsed.map((item, i) => (
-              <div key={i}>
-                {item.label && <span className="font-semibold text-[var(--modal-text)]">{item.label}：</span>}
-                {renderMarkdownInline(item.text || '')}
-              </div>
-            ))}
-          </div>
-        )
-      }
-    } catch { /* not JSON */ }
+    const parsed = parseReasonArray(normalized)
+    if (parsed) {
+      return (
+        <div className="space-y-2">
+          {parsed.map((item, i) => (
+            <div key={i}>
+              {item.label && <span className="font-semibold text-[var(--modal-text)]">{item.label}：</span>}
+              {renderMarkdownInline(item.text || '')}
+            </div>
+          ))}
+        </div>
+      )
+    }
   }
   return <p>{renderMarkdownInline(normalized)}</p>
 }
 
-function ActionDetailContent({ action }: { action: ActionItem }) {
+function ActionDetailContent({
+  action,
+  onPatchAction,
+}: {
+  action: ActionItem
+  onPatchAction: (patch: Partial<ActionItem>) => void
+}) {
   const actionPointItems = getActionPointItems(action)
   const sourceItems = getActionSourceItems(action)
   const decisionReason = action.ai_reasoning || action.reason || action.decision_brief || ''
+  // v21.0 (模块 D): 顺序 理由 → 行动点 → 执行 → 关联信息。
+  const showExecution = action.status === 'pending' || action.status === 'confirmed' || action.status === 'dispatched'
 
   return (
     <div className="pt-7">
+      {decisionReason.trim() && (
+        <section data-testid="action-modal-reason" className="mb-6">
+          <h3 className="reading-section mb-3 leading-none text-[var(--brand)]">
+            为什么做
+          </h3>
+          <div className="reading-body">
+            <ReasoningBlock text={decisionReason} />
+          </div>
+        </section>
+      )}
+
       {actionPointItems.length > 0 && (
-        <section data-testid="action-modal-points" className="mb-6">
+        <section
+          data-testid="action-modal-points"
+          className={cn('mb-6', decisionReason.trim() && 'border-t border-[var(--modal-divider)] pt-4')}
+        >
           <h3 className="reading-section mb-3 leading-none text-[var(--brand)]">
             行动点
           </h3>
@@ -1130,14 +1245,12 @@ function ActionDetailContent({ action }: { action: ActionItem }) {
         </section>
       )}
 
-      {decisionReason.trim() && (
-        <section data-testid="action-modal-reason" className="mb-6 border-t border-[var(--modal-divider)] pt-4">
+      {showExecution && (
+        <section data-testid="action-modal-execution" className="mb-6 border-t border-[var(--modal-divider)] pt-4">
           <h3 className="reading-section mb-3 leading-none text-[var(--brand)]">
-            决策理由
+            执行
           </h3>
-          <div className="reading-body">
-            <ReasoningBlock text={decisionReason} />
-          </div>
+          <ActionExecutionBlock action={action} onPatchAction={onPatchAction} />
         </section>
       )}
 
@@ -1148,7 +1261,11 @@ function ActionDetailContent({ action }: { action: ActionItem }) {
           </h3>
           <div className="space-y-2">
             {sourceItems.map((source) => (
-              <ActionSourceRow key={source.id} source={source} />
+              <ActionSourceRow
+                key={source.id}
+                source={source}
+                clusterId={action.source_type === 'cluster' && action.source_id != null ? Number(action.source_id) : null}
+              />
             ))}
           </div>
         </section>
@@ -1157,28 +1274,130 @@ function ActionDetailContent({ action }: { action: ActionItem }) {
   )
 }
 
-function ActionSourceRow({ source }: { source: ActionSourceItem }) {
+function ActionExecutionBlock({
+  action,
+  onPatchAction,
+}: {
+  action: ActionItem
+  onPatchAction: (patch: Partial<ActionItem>) => void
+}) {
+  const canDispatch = useAuthStore((s) => s.user?.has_discord_token ?? false)
+  const [copied, setCopied] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const prompt = action.prompt || ''
+
+  // v2 §13.3: 只复制 prompt(不再包命令)。
+  const doCopy = async () => {
+    try {
+      await copyTextToClipboard(prompt)
+      setCopied(true)
+      toast.success('已复制,粘贴到本地 Agent 新会话执行')
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  // v2 §13.4: 派发 Discord 算真实送出 → 自动置执行中;复制不改状态。
+  const doDispatch = async () => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await dispatchAction(action.id)
+      onPatchAction({ status: 'dispatched' })
+      toast.success('已派发到 Discord,进入执行中')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '派发失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const goSettings = () => {
+    useDetailStore.getState().closeModal()
+    window.location.hash = 'settings'
+  }
+
+  // 跟踪类无可执行命令,只作看板留存。
+  const actionType = (action.action_type ?? action.type) as string
+  if (actionType === 'track') {
+    return (
+      <div
+        data-testid="action-execution"
+        className="rounded-[8px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] px-3.5 py-3 reading-body text-[13.5px] leading-relaxed text-[var(--modal-text-muted)]"
+      >
+        这是一条<span className="font-semibold text-[var(--modal-text)]">跟踪项</span>,已留在行动看板。出现相关进展时,再把它转成可执行的行动。
+      </div>
+    )
+  }
+
+  return (
+    <div data-testid="action-execution" className="space-y-3">
+      <p className="reading-caption text-[var(--modal-text-muted)]">
+        复制下面的指令,粘贴到你的 Claude Code / Codex 新会话执行。
+      </p>
+      {/* prompt 代码块 + 右上角单复制按钮 */}
+      <div className="relative">
+        <pre
+          data-testid="exec-command"
+          className="max-h-[220px] overflow-auto scrollbar-hide rounded-[8px] bg-[var(--action-code-bg)] px-3.5 py-3 pr-16 font-mono text-[12px] leading-relaxed text-[var(--action-code-text)] whitespace-pre-wrap break-words"
+        >
+          {prompt}
+        </pre>
+        <button
+          type="button"
+          data-testid="exec-copy-prompt"
+          onClick={doCopy}
+          aria-label="复制指令"
+          className="absolute right-2 top-2 inline-flex items-center gap-1 rounded-[6px] border border-[rgba(255,255,255,0.16)] bg-[rgba(255,255,255,0.10)] px-2 py-1 text-[11px] font-medium text-[var(--action-code-text)] transition-colors hover:bg-[rgba(255,255,255,0.2)]"
+        >
+          {copied ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          {copied ? '已复制' : '复制'}
+        </button>
+      </div>
+      {/* Discord — 次级路径 */}
+      <div className="flex items-center gap-2 border-t border-[var(--modal-divider)] pt-3">
+        {canDispatch ? (
+          <button
+            type="button"
+            data-testid="exec-dispatch"
+            disabled={busy || action.status !== 'pending'}
+            onClick={doDispatch}
+            className="inline-flex items-center gap-1.5 rounded-[7px] border border-[var(--modal-border-soft)] px-3 py-1.5 text-[13px] font-medium text-[var(--modal-text-muted)] transition-colors hover:text-[var(--modal-text)] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <Send className="h-3.5 w-3.5" />
+            {action.status === 'dispatched' ? '已派发到 Discord' : '派发到 Discord'}
+          </button>
+        ) : (
+          <span data-testid="exec-discord-unconfigured" className="reading-caption text-[var(--modal-text-muted)]">
+            或派发到 Discord —
+            <button type="button" onClick={goSettings} className="ml-1 font-semibold text-[var(--brand)] hover:underline">
+              去设置
+            </button>
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ActionSourceRow({ source, clusterId }: { source: ActionSourceItem; clusterId?: number | null }) {
+  const openClusterModal = useClusterDetailStore((s) => s.openModal)
   const platform = source.platform || 'rss'
   const platformLabel = eventPlatformName(platform)
   const displayTitle = getActionSourceDisplayTitle(source)
   const label = normalizeActionSourceLabel(displayTitle)
+  // v2 §14 BF-0706-2(#3): 事件类行动的关联信息 → 打开事件弹窗;信息类 → 信息弹窗深链
+  const isCluster = clusterId != null && Number.isFinite(clusterId)
   const href = buildInfoItemHref(source.id)
   if (!displayTitle) return null
 
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      data-testid="action-modal-source-row"
-      className={cn(
-        'group block w-full rounded-[7px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] px-3 py-2.5 text-left transition-colors',
-        'hover:border-[var(--brand-border)] hover:bg-[var(--modal-hover-soft)]',
-        'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--modal-surface)]',
-      )}
-      aria-label={`打开关联信息: ${label}`}
-      title="打开关联信息"
-    >
+  const rowClass = cn(
+    'group block w-full rounded-[7px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] px-3 py-2.5 text-left transition-colors',
+    'hover:border-[var(--brand-border)] hover:bg-[var(--modal-hover-soft)]',
+    'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--modal-surface)]',
+  )
+
+  const inner = (
       <div className="flex min-w-0 items-center gap-2.5">
         <span
           className={cn(
@@ -1202,116 +1421,35 @@ function ActionSourceRow({ source }: { source: ActionSourceItem }) {
         </span>
         <ExternalLink className="h-3.5 w-3.5 shrink-0 text-[var(--modal-text-faint)] transition-colors group-hover:text-[var(--brand)]" />
       </div>
+  )
+
+  if (isCluster) {
+    return (
+      <button
+        type="button"
+        onClick={() => { void openClusterModal(clusterId as number) }}
+        data-testid="action-modal-source-row"
+        className={rowClass}
+        aria-label={`打开关联事件: ${label}`}
+        title="打开关联事件"
+      >
+        {inner}
+      </button>
+    )
+  }
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      data-testid="action-modal-source-row"
+      className={rowClass}
+      aria-label={`打开关联信息: ${label}`}
+      title="打开关联信息"
+    >
+      {inner}
     </a>
   )
-}
-
-function ActionFooter({
-  action,
-  onPatchAction,
-}: {
-  action: ActionItem
-  onPatchAction: (patch: Partial<ActionItem>) => void
-}) {
-  const canDispatch = useAuthStore((s) => s.user?.has_discord_token ?? false)
-  const [busy, setBusy] = useState<'left' | 'main' | null>(null)
-  const isRestorable = action.status === 'dismissed' || action.status === 'ignored' || action.status === 'failed'
-  const leftLabel = isRestorable ? '恢复' : '忽略'
-  const LeftIcon = isRestorable ? RotateCcw : Ban
-  const mainAction = getFooterMainAction(action, canDispatch)
-
-  const runFooterAction = async (kind: 'left' | 'main') => {
-    if (busy) return
-    setBusy(kind)
-    try {
-      if (kind === 'left') {
-        if (isRestorable) {
-          await updateAction(action.id, { status: 'pending' })
-          onPatchAction({ status: 'pending' })
-          toast.success('已恢复待处理')
-        } else {
-          await dismissAction(action.id)
-          onPatchAction({ status: 'dismissed' })
-          toast.success('已忽略')
-        }
-        return
-      }
-
-      if (mainAction.kind === 'dispatch') {
-        await dispatchAction(action.id)
-        onPatchAction({ status: 'dispatched' })
-        toast.success('已进入执行中')
-        return
-      }
-      if (mainAction.kind === 'done') {
-        await markActionDone(action.id)
-        onPatchAction({ status: 'done' })
-        toast.success('已完成')
-      }
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : '操作失败')
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  return (
-    <div
-      data-testid="action-modal-footer"
-      className="modal-safe-footer grid shrink-0 grid-cols-2 overflow-hidden border-t border-[var(--modal-border-soft)] bg-[var(--modal-surface)]"
-      style={paperSurfaceStyle}
-    >
-      <button
-        type="button"
-        onClick={() => runFooterAction('left')}
-        disabled={busy !== null}
-        className="flex h-14 w-full items-center justify-center gap-2 text-[15px] font-medium text-[var(--modal-text-muted)] transition-colors hover:bg-[var(--modal-hover)] hover:text-[var(--modal-text)] disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        <LeftIcon className="h-4 w-4" />
-        {busy === 'left' ? '处理中' : leftLabel}
-      </button>
-      <button
-        type="button"
-        onClick={() => runFooterAction('main')}
-        disabled={busy !== null || mainAction.disabled}
-        title={mainAction.title}
-        className={cn(
-          'flex h-14 w-full items-center justify-center gap-2 border-l border-[var(--modal-border-soft)] text-[15px] font-semibold transition-colors',
-          mainAction.disabled
-            ? 'cursor-not-allowed text-[var(--modal-text-faint)] opacity-65'
-            : 'text-[var(--brand)] hover:bg-[var(--modal-hover-soft)] hover:text-[var(--brand)]',
-        )}
-      >
-        <mainAction.icon className="h-4 w-4" />
-        {busy === 'main' ? '处理中' : mainAction.label}
-      </button>
-    </div>
-  )
-}
-
-function getFooterMainAction(action: ActionItem, canDispatch: boolean): {
-  label: string
-  kind: 'dispatch' | 'done' | 'none'
-  icon: typeof Send
-  disabled: boolean
-  title?: string
-} {
-  if (action.status === 'pending') {
-    return {
-      label: canDispatch ? '派发' : '配置 Token',
-      kind: canDispatch ? 'dispatch' : 'none',
-      icon: Send,
-      disabled: !canDispatch,
-      title: canDispatch ? undefined : '请先配置 Discord Bot Token',
-    }
-  }
-  if (action.status === 'confirmed' || action.status === 'executing' || action.status === 'dispatched') {
-    return { label: '完成', kind: 'done', icon: CheckCircle2, disabled: false }
-  }
-  if (action.status === 'done') {
-    return { label: '已完成', kind: 'none', icon: CheckCircle2, disabled: true }
-  }
-  return { label: '恢复后处理', kind: 'none', icon: RotateCcw, disabled: true }
 }
 
 function getActionPointItems(action: ActionItem): string[] {

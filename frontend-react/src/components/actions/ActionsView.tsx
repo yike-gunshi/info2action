@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { CalendarDays, ChevronDown, MoreHorizontal } from 'lucide-react'
 import { toast } from 'sonner'
-import { cn, actionTypeName } from '../../lib/utils'
+import { cn } from '../../lib/utils'
 import { useActionStore } from '../../store/actionStore'
 import { useDetailStore } from '../../store/detailStore'
 import { useAuthStore } from '../../store/authStore'
-import { fetchActionsBoard, markActionDone, dismissAction, dispatchAction, updateActionPriority, updateAction, type ActionsBoardResponse } from '../../lib/api'
-import type { ActionBoardDirection, ActionItem, ActionPriority, ActionStatus } from '../../lib/types'
+import { fetchActionsBoard, markActionDone, dismissAction, dispatchAction, updateAction, type ActionsBoardResponse } from '../../lib/api'
+import type { ActionBoardDirection, ActionItem, ActionStatus } from '../../lib/types'
 
 type LaneKey = 'pending' | 'in_progress' | 'done'
 type DateFilter = 'all' | 'today' | 'week'
@@ -24,45 +24,13 @@ const ACTION_LANES: Array<{ key: LaneKey; label: string; emptyLabel: string }> =
   { key: 'done', label: '已完成', emptyLabel: '暂无已完成行动' },
 ]
 
-const ACTION_STATUS_LABELS: Record<ActionStatus, string> = {
-  pending: '待处理',
-  confirmed: '执行中',
-  executing: '执行中',
-  dispatched: '执行中',
-  done: '已完成',
-  failed: '失败',
-  dismissed: '已忽略',
-  ignored: '已忽略',
-}
-
-const STATUS_COLORS: Record<ActionStatus, string> = {
-  pending: 'bg-[var(--brand-soft)] text-[var(--brand)]',
-  confirmed: 'bg-[var(--brand-soft)] text-[var(--brand)]',
-  executing: 'bg-[var(--brand-soft)] text-[var(--brand)]',
-  dispatched: 'bg-[var(--brand-soft)] text-[var(--brand)]',
-  done: 'bg-emerald-bg text-emerald',
-  failed: 'bg-red-50 text-destructive dark:bg-red-950',
-  dismissed: 'bg-warm-200 text-warm-500',
-  ignored: 'bg-warm-200 text-warm-500',
-}
-
 const DATE_LABELS: Record<DateFilter, string> = {
   all: '全部',
   today: '今天',
   week: '本周',
 }
 
-const PRIORITY_FILTERS: ActionPriority[] = ['P0', 'P1', 'P2']
 const CARDS_PER_PAGE = 20
-
-const FALLBACK_DIRECTION_LABELS: Record<string, string> = {
-  implementation: '实施',
-  implement: '实施',
-  investing: '投资',
-  investment: '投资',
-  research: '投资',
-  content: '内容',
-}
 
 export function ActionsView() {
   const actions = useActionStore((s) => s.actions)
@@ -73,7 +41,6 @@ export function ActionsView() {
   const isLoading = useActionStore((s) => s.isLoading)
   const focusedActionId = useActionStore((s) => s.focusedActionId)
   const [dateFilter, setDateFilter] = useState<DateFilter>('all')
-  const [priorityFilter, setPriorityFilter] = useState<ActionPriority | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [laneMeta, setLaneMeta] = useState<Record<LaneKey, LaneLoadMeta>>(emptyLaneMeta())
   const [loadingMoreLane, setLoadingMoreLane] = useState<LaneKey | null>(null)
@@ -83,9 +50,8 @@ export function ActionsView() {
 
   const boardQuery = useMemo(() => ({
     date_filter: dateFilter === 'all' ? undefined : dateFilter,
-    priority: priorityFilter ?? undefined,
     limit_per_direction: CARDS_PER_PAGE,
-  }), [dateFilter, priorityFilter])
+  }), [dateFilter])
   const boardQueryKey = useMemo(() => actionBoardQueryKey(boardQuery), [boardQuery])
 
   const applyBoardSnapshot = useCallback((snapshot: BoardSnapshot) => {
@@ -129,10 +95,9 @@ export function ActionsView() {
   const visibleActions = useMemo(() => {
     return actions.filter((action) => (
       actionLaneKey(action.status) != null &&
-      isInsideDateFilter(action, dateFilter) &&
-      matchesPriorityFilter(action, priorityFilter)
+      isInsideDateFilter(action, dateFilter)
     ))
-  }, [actions, dateFilter, priorityFilter])
+  }, [actions, dateFilter])
 
   const groupedByLane = useMemo(() => {
     const groups = laneGroups()
@@ -196,7 +161,6 @@ export function ActionsView() {
     const visible = visibleActions.some((a) => String(a.id) === String(focusedActionId))
     if (!visible) {
       setDateFilter('all')
-      setPriorityFilter(null)
       return
     }
     window.setTimeout(() => {
@@ -204,10 +168,6 @@ export function ActionsView() {
       el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }, 80)
   }, [focusedActionId, actions, visibleActions, isLoading])
-
-  const handlePriorityToggle = (priority: ActionPriority) => {
-    setPriorityFilter((current) => (current === priority ? null : priority))
-  }
 
   const handleActionMutation = useCallback(() => {
     boardCacheRef.current = {}
@@ -218,9 +178,7 @@ export function ActionsView() {
     <div data-testid="actions-view-shell" className="mx-auto w-full max-w-[1200px] px-4 pb-10">
       <ActionFilterSubbar
         dateFilter={dateFilter}
-        priorityFilter={priorityFilter}
         onDateChange={setDateFilter}
-        onPriorityToggle={handlePriorityToggle}
       />
 
       {loadError && (
@@ -266,26 +224,20 @@ function snapshotFromBoardResponse(resp: ActionsBoardResponse): BoardSnapshot {
 
 function actionBoardQueryKey(query: {
   date_filter?: DateFilter
-  priority?: ActionPriority
   limit_per_direction?: number
 }): string {
   return [
     `date:${query.date_filter ?? 'all'}`,
-    `priority:${query.priority ?? 'all'}`,
     `limit:${query.limit_per_direction ?? CARDS_PER_PAGE}`,
   ].join('|')
 }
 
 function ActionFilterSubbar({
   dateFilter,
-  priorityFilter,
   onDateChange,
-  onPriorityToggle,
 }: {
   dateFilter: DateFilter
-  priorityFilter: ActionPriority | null
   onDateChange: (filter: DateFilter) => void
-  onPriorityToggle: (priority: ActionPriority) => void
 }) {
   const tabClassName = (selected: boolean) => cn(
     'relative flex h-10 shrink-0 items-center border-b-2 px-0.5 font-event-title text-[16px] font-medium tracking-normal transition-colors',
@@ -314,21 +266,6 @@ function ActionFilterSubbar({
               data-testid={`actions-date-tab-${date}`}
             >
               {DATE_LABELS[date]}
-            </button>
-          ))}
-          <span className="select-none font-event-title text-[16px] font-medium text-muted-foreground/45" aria-hidden="true" data-testid="actions-l2-divider">
-            |
-          </span>
-          {PRIORITY_FILTERS.map((priority) => (
-            <button
-              key={priority}
-              type="button"
-              aria-pressed={priorityFilter === priority}
-              onClick={() => onPriorityToggle(priority)}
-              className={tabClassName(priorityFilter === priority)}
-              data-testid={`actions-priority-tab-${priority}`}
-            >
-              {priority}
             </button>
           ))}
         </div>
@@ -496,8 +433,6 @@ function ActionCard({ action, onActionMutation }: { action: ActionItem; onAction
   const [showMenu, setShowMenu] = useState(false)
   const isFocused = String(action.id) === String(focusedActionId || '')
   const actionPointItems = getActionPointItems(action)
-  const direction = normalizeDirection((action as ActionItem & { direction?: string }).direction)
-  const directionLabel = FALLBACK_DIRECTION_LABELS[direction] ?? (action as ActionItem & { direction_label?: string }).direction_label
   const sourceLabel = formatActionSource(action)
   const createdAtLabel = formatActionDate(action.created_at)
 
@@ -525,19 +460,6 @@ function ActionCard({ action, onActionMutation }: { action: ActionItem; onAction
       onActionMutation()
     } catch (err) {
       console.error('[actions] status change failed:', err)
-      toast.error(`操作失败: ${err instanceof Error ? err.message : '未知错误'}`)  // UX-8: 与全站 toast 一致
-    }
-    setShowMenu(false)
-  }
-
-  const handlePriorityChange = async (e: MouseEvent, priority: ActionPriority) => {
-    e.stopPropagation()
-    try {
-      await updateActionPriority(action.id, priority)
-      updateActionInStore(action.id, { priority })
-      onActionMutation()
-    } catch (err) {
-      console.error('[actions] priority change failed:', err)
       toast.error(`操作失败: ${err instanceof Error ? err.message : '未知错误'}`)  // UX-8: 与全站 toast 一致
     }
     setShowMenu(false)
@@ -584,52 +506,16 @@ function ActionCard({ action, onActionMutation }: { action: ActionItem; onAction
                 data-testid="action-point-dot"
                 className="mt-[0.55em] h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--brand)] opacity-70"
               />
-              <span className="line-clamp-1 min-w-0">{item}</span>
+              <span className="line-clamp-2 min-w-0">{item}</span>
             </li>
           ))}
         </ul>
       )}
 
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-[14px] text-[#5E574F]">
+      {/* BF-0706-6: 删类型/方向/优先级/状态徽章(状态与列头重复,优先级已下线);
+          卡片聚焦行动点内容。仅保留 来自N条 + 时间。 */}
+      <div data-testid="action-card-footer" className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1 text-[13px] text-[#6B6259]">
         {sourceLabel && <span>来自 {sourceLabel}</span>}
-        <span
-          data-testid="action-status-pill"
-          className={cn(
-            'ml-auto inline-flex h-7 items-center rounded-full px-2.5 text-[12px] font-medium',
-            STATUS_COLORS[action.status],
-          )}
-        >
-          {ACTION_STATUS_LABELS[action.status] || action.status}
-        </span>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        <span
-          data-testid="action-type-pill"
-          className="inline-flex h-7 items-center rounded-[4px] bg-[var(--brand-soft)] px-2.5 text-[13px] font-medium text-[var(--brand)]"
-        >
-          {actionTypeName(action.type)}
-        </span>
-        {directionLabel && (
-          <span className="inline-flex h-7 items-center rounded-[4px] border border-[#EFE7DE] bg-[#FBF7F1] px-2.5 text-[13px] text-[#4F4A43]">
-            {directionLabel}
-          </span>
-        )}
-        {action.priority && (
-          <span className={cn(
-            'inline-flex h-7 items-center rounded-[4px] px-2.5 text-[13px] font-medium',
-            action.priority === 'P0'
-              ? 'bg-red-50 text-destructive dark:bg-red-950'
-              : action.priority === 'P1'
-                ? 'bg-[var(--brand-soft)] text-[var(--brand)]'
-                : 'bg-[#F3EFE8] text-[#5E574F]',
-          )}>
-            {action.priority}
-          </span>
-        )}
-      </div>
-
-      <div data-testid="action-card-footer" className="flex items-center gap-3 pt-1 text-[13px] text-[#6B6259]">
         <span data-testid="action-card-created-at" className="inline-flex min-w-0 items-center gap-1.5 font-mono tabular-nums">
           <CalendarDays className="h-3.5 w-3.5 shrink-0" />
           {createdAtLabel}
@@ -644,12 +530,6 @@ function ActionCard({ action, onActionMutation }: { action: ActionItem; onAction
             <button onClick={(e) => canDispatch ? handleStatusChange(e, 'dispatched') : e.stopPropagation()} disabled={!canDispatch} className={cn('w-full px-3 py-1.5 text-left text-sm', canDispatch ? 'hover:bg-muted' : 'cursor-not-allowed opacity-40')}>派发</button>
             <button onClick={(e) => handleStatusChange(e, 'dismissed')} className="w-full px-3 py-1.5 text-left text-sm hover:bg-muted">忽略</button>
             <button onClick={(e) => handleStatusChange(e, 'pending')} className="w-full px-3 py-1.5 text-left text-sm hover:bg-muted">恢复待处理</button>
-            <div className="my-1 border-t border-border" />
-            {(['P0', 'P1', 'P2'] as ActionPriority[]).map((priority) => (
-              <button key={priority} onClick={(e) => handlePriorityChange(e, priority)} className="w-full px-3 py-1.5 text-left text-sm hover:bg-muted">
-                设为 {priority}
-              </button>
-            ))}
           </div>
         </>
       )}
@@ -677,20 +557,10 @@ function actionLaneKey(status: ActionStatus): LaneKey | null {
   return null
 }
 
-function normalizeDirection(direction: string | undefined): string {
-  if (!direction) return '_uncategorized'
-  if (direction === 'investment') return 'investing'
-  return direction
-}
-
 function sortActionsByCreatedDesc(a: ActionItem, b: ActionItem): number {
   return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
 }
 
-function matchesPriorityFilter(action: ActionItem, filter: ActionPriority | null): boolean {
-  if (!filter) return true
-  return action.priority === filter
-}
 
 function isInsideDateFilter(action: ActionItem, filter: DateFilter): boolean {
   if (filter === 'all') return true

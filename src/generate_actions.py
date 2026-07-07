@@ -57,8 +57,13 @@ MAX_CONCURRENCY, REQUEST_INTERVAL = _get_concurrency_settings()
 
 _SSL_CTX = ssl.create_default_context()
 _DEFAULT_MINIMAX_CHAT_BASE = "https://api.minimaxi.com/anthropic/v1"
-_DEFAULT_MINIMAX_CHAT_MODEL = "MiniMax-M2.7"
+_DEFAULT_MINIMAX_CHAT_MODEL = "MiniMax-M3"
 _AUTH_HTTP_STATUS = {401, 403}
+
+# M3 默认用英文思考;实测单靠 system prompt 约束无效,必须在 user 内容首尾各夹一道
+# 中文强指令才生效(recency + 首因双重锚定)。专有名词保留原文。
+CHINESE_ONLY_PREFIX = "【全程只用简体中文进行思考(thinking)与输出所有字段，禁止出现英文句子；MiniMax/GitHub 等专有名词可保留原文】\n\n"
+CHINESE_ONLY_SUFFIX = "\n\n【再次强调：你的 thinking 过程和最终输出的每个字段都必须是简体中文，不要用英文。】"
 
 
 class ProviderAuthenticationError(RuntimeError):
@@ -847,8 +852,55 @@ def parse_actions_response(text):
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
+        # BF-0706-5: 抢救被截断/畸形的数组 —— 逐个抽出完整的顶层 {..} action 对象,
+        # 丢弃末尾没闭合的那个(M2/M3 思考+输出超 max_tokens 被截断时高发)。
+        salvaged = _salvage_action_objects(text)
+        if salvaged:
+            print(f"[warn] parsed via salvage: {len(salvaged)} action(s) from malformed JSON")
+            return salvaged
         print(f"[warn] Could not parse actions response: {text[:200]}")
         return []
+
+
+def _salvage_action_objects(text):
+    """从畸形/截断的 JSON 文本里抽出完整的顶层 {..} 对象(在最外层数组内),逐个 json.loads。
+
+    追踪字符串态 + 花括号深度;末尾没闭合的对象自然被跳过。对未转义引号也尽量容错
+    (坏片段 json.loads 失败即跳过),不抛异常。"""
+    start = text.find('[')
+    if start < 0:
+        start = text.find('{') - 1  # 没有数组包裹时也尝试从第一个对象抽
+    objs = []
+    depth = 0
+    in_str = False
+    esc = False
+    obj_start = None
+    for i in range(start + 1, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif c == '}':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and obj_start is not None:
+                        try:
+                            objs.append(json.loads(text[obj_start:i + 1]))
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        obj_start = None
+    return objs
 
 
 def process_batch(batch_items, api_key, api_base, model, system_prompt):
@@ -934,8 +986,11 @@ def process_single_item_streaming(item, api_key, api_base, model, system_prompt,
     item_title = (item.get('title', '') or '')[:80]
     print(f"[single-item-stream] 开始分析 item_id={item_id} title={item_title}")
     content = build_item_content([item])
-    single_mode_prompt = system_prompt + "\n\n【重要】这是用户手动选择的单条信息，请务必给出行动点和评分，即使你认为价值不高。不得返回空数组。\n\n【语言要求】你的所有内部思考过程(thinking)必须使用中文。"
-    result = call_minimax_streaming(api_key, api_base, model, single_mode_prompt, content, on_thinking=on_thinking)
+    single_mode_prompt = system_prompt + "\n\n【重要】这是用户手动选择的单条信息，请务必给出行动点和评分，即使你认为价值不高。不得返回空数组。"
+    # v2: M3 默认英文思考,单靠 system 约束无效;必须在 user 内容首尾夹中文强指令(实测有效)
+    wrapped_content = CHINESE_ONLY_PREFIX + content + CHINESE_ONLY_SUFFIX
+    # BF-0706-5: M3 是推理模型,思考也吃 max_tokens;6144 时思考+深度输出会超额度 → JSON 被截断走兜底。放宽。
+    result = call_minimax_streaming(api_key, api_base, model, single_mode_prompt, wrapped_content, max_tokens=12000, on_thinking=on_thinking)
     print(f"[single-item-stream] MiniMax 响应 item_id={item_id}: {(result or '(None)')[:500]}")
     all_parsed = parse_actions_response(result)
 

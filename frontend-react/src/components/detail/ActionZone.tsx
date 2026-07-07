@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Plus, ArrowRight } from 'lucide-react'
-import { cn } from '../../lib/utils'
 import { fetchActionsByItem, generateActionFromItem } from '../../lib/api'
 import { navigateToActionCard } from '../../lib/actionNavigation'
 import { useDetailStore } from '../../store/detailStore'
 import { requireAuth } from '../shared/AuthGate'
 import { TypewriterLine } from '../shared/TypewriterLine'
+import { ActionGenHint } from '../shared/ActionGenHint'
 import type { SSEEvent } from '../../lib/api'
 import type { ActionItem } from '../../lib/types'
 
@@ -13,13 +13,6 @@ interface ActionZoneProps {
   itemId: string
   onActionCountChange?: (count: number) => void
 }
-
-const STAGE_LABELS = ['内容分析', '读取上下文', 'AI 评估', '整理结果']
-const ACTION_TYPES = [
-  { key: 'investigate', label: '调研验证' },
-  { key: 'implement', label: '动手做' },
-  { key: 'content', label: '创作内容' },
-]
 
 type GenState = 'idle' | 'form' | 'generating' | 'done' | 'error'
 
@@ -31,9 +24,7 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
 
   // Generation state
   const [genState, setGenState] = useState<GenState>('idle')
-  const [selectedType, setSelectedType] = useState('investigate')
   const [userHint, setUserHint] = useState('')
-  const [stages, setStages] = useState([0, 0, 0, 0]) // 0=pending 1=active 2=done
   const [thinkingLines, setThinkingLines] = useState<Array<{ text: string; ai?: boolean; stage?: number; divider?: boolean }>>([])
   const [visibleCount, setVisibleCount] = useState(0)
   const [errorMsg, setErrorMsg] = useState('')
@@ -111,14 +102,12 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
 
   const handleShowForm = () => {
     setGenState('form')
-    setSelectedType('investigate')
     setUserHint('')
   }
 
   const handleGenerate = () => {
     if (!requireAuth('生成行动')) return
     setGenState('generating')
-    setStages([1, 0, 0, 0])
     setThinkingLines([])
     setVisibleCount(0)
     setErrorMsg('')
@@ -127,7 +116,7 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
 
     const controller = generateActionFromItem(
       itemId,
-      { actionType: selectedType, userHint: userHint.trim() || undefined },
+      { userHint: userHint.trim() || undefined },
       // onEvent
       (evt: SSEEvent) => {
         if (evt.type === 'thinking' || evt.type === 'thinking-ai') {
@@ -138,22 +127,7 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
             lines.push({ text: evt.text || evt.data, ai: evt.type === 'thinking-ai', stage: stageIdx })
             return lines
           })
-        } else if (evt.type === 'stage') {
-          const idx = evt.stage ?? 0
-          const status = (evt as unknown as Record<string, unknown>).status as string
-          if (status === 'active' && idx !== lastStage) lastStage = idx
-          setStages((prev) => {
-            const next = [...prev]
-            if (status === 'done') {
-              next[idx] = 2
-              if (idx + 1 < next.length && next[idx + 1] === 0) next[idx + 1] = 1
-            } else if (status === 'active') {
-              next[idx] = 1
-            }
-            return next
-          })
         } else if (evt.type === 'result') {
-          setStages([2, 2, 2, 2])
           const hasAction = evt.action != null
           if (!hasAction) {
             // AI decided not to generate — show reason to user
@@ -184,7 +158,6 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
       },
       // onDone — flush
       () => {
-        setStages([2, 2, 2, 2])
         if (genStateRef.current !== 'error' && genStateRef.current !== 'idle') {
           setTimeout(() => {
             fetchActionsByItem(itemId)
@@ -237,57 +210,43 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
 
   return (
     <div className="mt-2 animate-zone-in">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-sm font-medium text-muted-foreground">行动点</span>
+      {/* Header — 品牌色小标题 + 醒目 CTA(v21.0 redesign) */}
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="reading-section leading-none text-[var(--brand)]">行动点</h3>
         {genState === 'idle' && (
           <button
             onClick={handleShowForm}
-            className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--brand-border)] px-3.5 py-2 text-[13px] font-semibold text-[var(--brand)] transition-colors hover:bg-[var(--brand-soft)]"
           >
-            <Plus className="w-3 h-3" />
-            {actions.length > 0 ? '新建' : '生成行动点'}
+            <Plus className="w-3.5 h-3.5" />
+            {actions.length > 0 ? '新建行动点' : '生成行动点'}
           </button>
         )}
       </div>
 
-      {/* Pre-generation form */}
+      {/* Pre-generation form — 纸面弹窗风格 */}
       {genState === 'form' && (
-        <div className="rounded-lg border border-border bg-card p-3 mb-3">
-          <p className="text-sm font-medium text-foreground mb-2">选择行动类型</p>
-          <div className="flex gap-2 mb-3">
-            {ACTION_TYPES.map((at) => (
-              <button
-                key={at.key}
-                onClick={() => setSelectedType(at.key)}
-                className={cn(
-                  'text-sm px-3 py-1.5 rounded-md border transition-colors',
-                  selectedType === at.key
-                    ? 'border-primary bg-accent text-primary font-semibold'
-                    : 'border-border text-muted-foreground hover:border-foreground/30',
-                )}
-              >
-                {at.label}
-              </button>
-            ))}
-          </div>
+        <div className="rounded-[10px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] p-3.5 mb-3">
+          <ActionGenHint />
+          <p className="font-event-title text-[14px] font-semibold text-[var(--modal-text)] mb-1">补充说明（可选）</p>
+          <p className="font-event-title text-[13px] text-[var(--modal-text-muted)] mb-2.5">AI 会自动判定行动类型;想指定方向就写一句,例如"帮我做个原型 / 我想写篇文章"。</p>
           <textarea
             value={userHint}
             onChange={(e) => setUserHint(e.target.value)}
-            placeholder="补充说明（可选）：告诉 AI 你关注的方向..."
-            className="w-full text-sm bg-muted border border-input rounded-md px-2.5 py-2 mb-3 resize-none focus:outline-none focus:ring-1 focus:ring-ring"
+            placeholder="告诉 AI 你关注的方向或想要的产出..."
+            className="w-full font-event-title text-[14px] bg-[var(--modal-surface)] border border-[var(--modal-border-soft)] rounded-[8px] px-3 py-2.5 mb-3 resize-none text-[var(--modal-text)] placeholder:text-[var(--modal-text-faint)] focus:outline-none focus:ring-1 focus:ring-[var(--brand-border)]"
             rows={2}
           />
           <div className="flex justify-end gap-2">
             <button
               onClick={() => setGenState('idle')}
-              className="text-sm text-muted-foreground hover:text-foreground px-3 py-1 rounded-md hover:bg-muted transition-colors"
+              className="text-[13px] text-[var(--modal-text-muted)] hover:text-[var(--modal-text)] px-3 py-1.5 rounded-[7px] hover:bg-[var(--modal-hover)] transition-colors"
             >
               取消
             </button>
             <button
               onClick={handleGenerate}
-              className="text-sm font-semibold text-primary-foreground bg-primary px-4 py-1.5 rounded-md hover:bg-primary/90 transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--brand-border)] px-4 py-2 text-[13px] font-semibold text-[var(--brand)] transition-colors hover:bg-[var(--brand-soft)]"
             >
               开始生成
             </button>
@@ -295,32 +254,31 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
         </div>
       )}
 
-      {/* Generating: thinking stream */}
+      {/* Generating: 暖色分析面板(v2 §13.2)—— 去阶段标签,人话标题 */}
       {genState === 'generating' && (
-        <div className="rounded-lg bg-[var(--terminal-bg)] p-3 mb-3">
-          <div className="flex items-center gap-2 mb-2">
-            <span className="text-xs font-mono text-[var(--terminal-text)] opacity-60">
-              {STAGE_LABELS[stages.findIndex((s) => s === 1)] || STAGE_LABELS[3]}
+        <div className="rounded-[10px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface)] p-3.5 mb-3">
+          <div className="flex items-center gap-2 mb-2.5">
+            <span className="inline-flex items-center gap-2 text-[13px] font-semibold text-[var(--brand)]">
+              正在分析这条信息
+              <span className="inline-flex gap-1" aria-hidden="true">
+                <span className="analyze-dot" /><span className="analyze-dot" /><span className="analyze-dot" />
+              </span>
             </span>
             <button
               onClick={handleCancel}
-              className="ml-auto text-xs text-warm-500 hover:text-foreground"
+              className="ml-auto reading-caption text-[var(--modal-text-muted)] hover:text-[var(--modal-text)]"
             >
               取消
             </button>
           </div>
-          {/* Thinking stream */}
           <div
             ref={streamRef}
-            className="max-h-[200px] overflow-y-auto scrollbar-hide space-y-0.5"
+            className="max-h-[200px] overflow-y-auto scrollbar-hide space-y-0.5 rounded-[8px] bg-[var(--action-code-bg)] px-3.5 py-3 font-mono text-[12px] leading-relaxed text-[var(--action-code-faint)]"
           >
             {thinkingLines.slice(0, visibleCount).map((line, i) => {
               const isLastLine = i === visibleCount - 1
               return (
-                <div
-                  key={i}
-                  className="text-xs font-mono leading-relaxed text-[var(--terminal-text)]"
-                >
+                <div key={i} className={line.ai ? 'text-[var(--action-code-text)]' : 'text-[var(--action-code-faint)]'}>
                   <TypewriterLine
                     text={line.text || ''}
                     speed={25}
@@ -348,19 +306,34 @@ export function ActionZone({ itemId, onActionCountChange }: ActionZoneProps) {
         </div>
       )}
 
-      {/* Action title links — click to navigate to Actions tab */}
+      {/* v2 §14.3(T7): 已生成行动点原位展示标题 + steps,点击进行动详情 */}
       {actions.length > 0 && (
-        <div className="space-y-1">
-          {actions.map((action) => (
-            <button
-              key={action.id}
-              onClick={() => navigateToAction(action.id)}
-              className="w-full flex items-center gap-2 text-left text-sm text-foreground hover:text-primary py-1.5 px-2 -mx-2 rounded-md hover:bg-muted transition-colors group"
-            >
-              <ArrowRight className="w-3.5 h-3.5 text-warm-400 group-hover:text-primary shrink-0" />
-              <span className="truncate">{action.title}</span>
-            </button>
-          ))}
+        <div className="space-y-1.5">
+          {actions.map((action) => {
+            const steps = Array.isArray(action.steps) ? action.steps.filter(Boolean) : []
+            return (
+              <button
+                key={action.id}
+                onClick={() => navigateToAction(action.id)}
+                className="w-full text-left rounded-[8px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] py-2.5 px-3 hover:border-[var(--brand-border)] hover:bg-[var(--modal-hover-soft)] transition-colors group"
+              >
+                <div className="flex items-center gap-2">
+                  <ArrowRight className="w-3.5 h-3.5 text-[var(--modal-text-faint)] group-hover:text-[var(--brand)] shrink-0" />
+                  <span className="min-w-0 flex-1 truncate font-event-title text-[14px] font-semibold text-[var(--modal-text)] group-hover:text-[var(--brand)]">{action.title}</span>
+                </div>
+                {steps.length > 0 && (
+                  <ul className="mt-1.5 ml-[22px] space-y-1">
+                    {steps.slice(0, 3).map((step, i) => (
+                      <li key={i} className="flex min-w-0 items-start gap-2 font-event-title text-[13px] leading-relaxed text-[var(--modal-text-muted)]">
+                        <span aria-hidden="true" className="mt-[0.6em] h-1 w-1 shrink-0 rounded-full bg-[var(--brand)] opacity-70" />
+                        <span className="min-w-0 line-clamp-1">{step}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </button>
+            )
+          })}
         </div>
       )}
     </div>

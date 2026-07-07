@@ -259,12 +259,14 @@ export async function authResetPassword(token: string, password: string): Promis
 export async function getUserSettings(): Promise<{
   discord_bot_token: string | null
   has_discord_token: boolean
+  discord_channel_id?: string
 }> {
   return apiFetch('/api/user/settings')
 }
 
 export async function updateUserSettings(data: {
   discord_bot_token?: string
+  discord_channel_id?: string
 }): Promise<{ ok: boolean }> {
   return apiFetch('/api/user/settings', {
     method: 'PUT',
@@ -524,6 +526,209 @@ export async function getEmbeddingUsage(params?: {
   return apiFetch(`/api/admin/embedding-usage?${qs}`)
 }
 
+export type AdminSourceStatus = 'active' | 'paused' | 'pending' | 'broken' | 'not_fetched' | 'deleted' | string
+
+export interface AdminSourceHealth {
+  last_fetched_at: string | null
+  inserted_7d: number | null
+  consecutive_failures: number | null
+}
+
+export interface AdminSource {
+  id: number
+  platform: string
+  source_key: string
+  display_name: string
+  status: AdminSourceStatus
+  config_json: unknown
+  origin: string | null
+  validated_at: string | null
+  created_at: string
+  updated_at: string
+  health?: AdminSourceHealth
+}
+
+export interface AdminSourceGroup {
+  platform: string
+  sources: AdminSource[]
+}
+
+export interface AdminSourcesResponse {
+  groups: AdminSourceGroup[]
+  total: number
+}
+
+export interface AdminSourcePreviewItem {
+  title?: string | null
+  url?: string | null
+  published_at?: string | null
+  summary?: string | null
+}
+
+export interface AdminSourceValidateResponse {
+  status: 'ok' | 'empty' | 'deferred'
+  platform: string
+  source_key: string
+  preview: AdminSourcePreviewItem[]
+  display_name?: string | null
+  reason?: string | null
+  warning?: string | null
+}
+
+export interface AdminSourceCreatePayload {
+  platform: string
+  source_key: string
+  display_name?: string | null
+  status?: 'active' | 'paused' | 'pending' | 'broken' | 'not_fetched'
+  config_json?: unknown
+  validated_at?: string | null
+}
+
+export type AdminSourceUpdatePayload = {
+  status?: 'active' | 'paused'
+  config_json?: unknown
+}
+
+export interface AdminSourceReconcileItem {
+  platform: string
+  source_key: string
+  display_name: string
+  id?: number
+}
+
+export interface AdminSourceReconcileResponse {
+  missing: AdminSourceReconcileItem[]
+  imported: AdminSourceReconcileItem[]
+  note?: string | null
+}
+
+export type AdminSourceAlgoParams = {
+  hackernews_count: number | null
+  github_trending_count: number | null
+  twitter_following_count: number | null
+  twitter_for_you_count: number | null
+  bilibili_hot_count: number | null
+  bilibili_rank_count: number | null
+  bilibili_videos_per_up: number | null
+}
+
+export async function getAdminSources(): Promise<AdminSourcesResponse> {
+  return apiFetch('/api/admin/sources')
+}
+
+export async function validateAdminSource(data: {
+  platform: string
+  source_key: string
+}): Promise<AdminSourceValidateResponse> {
+  return apiFetch('/api/admin/sources/validate', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function createAdminSource(data: AdminSourceCreatePayload): Promise<{ ok: boolean; source: AdminSource }> {
+  return apiFetch('/api/admin/sources', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateAdminSource(
+  id: number,
+  data: AdminSourceUpdatePayload,
+): Promise<{ ok: boolean; source: AdminSource }> {
+  return apiFetch(`/api/admin/sources/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteAdminSource(id: number): Promise<{ ok: boolean; source: AdminSource }> {
+  return apiFetch(`/api/admin/sources/${id}`, { method: 'DELETE' })
+}
+
+export async function reconcileLingowhaleSources(data?: {
+  import_keys?: string[]
+}): Promise<AdminSourceReconcileResponse> {
+  return apiFetch('/api/admin/sources/lingowhale/reconcile', {
+    method: 'POST',
+    body: JSON.stringify(data ?? {}),
+  })
+}
+
+export async function getAdminSourceAlgoParams(): Promise<{ params: AdminSourceAlgoParams }> {
+  return apiFetch('/api/admin/sources/algo-params')
+}
+
+export async function updateAdminSourceAlgoParams(params: AdminSourceAlgoParams): Promise<{
+  ok: boolean
+  params: AdminSourceAlgoParams
+}> {
+  return apiFetch('/api/admin/sources/algo-params', {
+    method: 'PATCH',
+    body: JSON.stringify({ params }),
+  })
+}
+
+// ── Admin 总览台 (v23.0 admin-console) ──
+// 契约真相源: .features/admin-console-v23/api-contract.md
+
+export type AdminHealthLevel = 'ok' | 'warn' | 'crit' | 'unknown'
+
+export type AdminHealthSignal = {
+  key: string
+  level: AdminHealthLevel
+  label: string
+  detail: string
+  link: 'runs' | null
+}
+
+export type AdminHealthIncident = {
+  severity: 'warn' | 'crit'
+  text: string
+  link: 'runs' | null
+}
+
+export type AdminTrendPoint = { date: string; value: number | null }
+
+export type AdminConsoleMetrics = {
+  total_users: number | null
+  new_users_today: number | null
+  new_users_7d: number | null
+  active_users_1d: number | null
+  active_users_7d: number | null
+  info_click_users_7d: number | null
+  info_click_items_7d: number | null
+  info_click_items_total: number | null
+  highlight_click_users_7d: number | null
+  highlight_click_events_7d: number | null
+  highlight_click_events_total: number | null
+}
+
+export type AdminInteractionsDetail = {
+  starred_users: number | null
+  starred_total: number | null
+  read_users_7d: number | null
+  read_items_7d: number | null
+  latest_signup: { username: string; created_at: string } | null
+}
+
+export type AdminConsoleSummary =
+  | { available: false; reason: 'remote_required' | 'remote_error'; error?: string }
+  | {
+      available: true
+      generated_at: string
+      c_metrics: AdminConsoleMetrics
+      interactions_detail: AdminInteractionsDetail
+      cost: { embedding_cost_yuan_24h: number | null; embedding_calls_24h: number | null }
+      health: { signals: AdminHealthSignal[]; incidents: AdminHealthIncident[] }
+      trends: { new_users_14d: AdminTrendPoint[]; fetch_success_rate_7d: AdminTrendPoint[] }
+    }
+
+export async function getAdminConsoleSummary(): Promise<AdminConsoleSummary> {
+  return apiFetch('/api/admin/console/summary')
+}
+
 // ── Feed ──
 
 export async function fetchFeed(params?: {
@@ -766,6 +971,38 @@ export async function dispatchAction(id: string): Promise<{ thread_id: string; t
   return apiFetch(`/api/actions/${id}/dispatch`, {
     method: 'POST',
   })
+}
+
+/** v21.0 (E2): 复制命令到本地执行后,标记为执行中(owner-scoped,不触发服务器代执行)。 */
+export async function markActionExecuting(id: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/actions/${id}/mark-executing`, {
+    method: 'POST',
+  })
+}
+
+/** v21.0 v2 (§13.4): owner-scoped 状态切换,供行动详情三段式 stepper 调用。 */
+export async function setActionStatus(
+  id: string,
+  status: 'pending' | 'confirmed' | 'done' | 'dismissed',
+): Promise<{ ok: boolean; status: string }> {
+  return apiFetch(`/api/actions/${id}/status`, {
+    method: 'POST',
+    body: JSON.stringify({ status }),
+  })
+}
+
+export interface ActionQuota {
+  limit: number
+  used: number
+  remaining: number
+  over_limit: boolean
+  unlimited?: boolean
+  reset_at?: string | null
+}
+
+/** v21.0 (B3): 当日生成配额快照。 */
+export async function fetchActionQuota(): Promise<ActionQuota> {
+  return apiFetch('/api/user/action-quota')
 }
 
 // ── Action Generation (SSE) ──

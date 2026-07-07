@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { SettingsPage } from '../SettingsPage'
 import { useAuthStore } from '../../store/authStore'
 import { getUserProfile, getUserSettings, updateUserProfile, updateUserSettings } from '../../lib/api'
@@ -83,5 +83,24 @@ describe('SettingsPage v19 utility shell', () => {
     expect(save.className).toContain('rounded-[4px]')
     expect(save.className).not.toContain('bg-primary')
     expect(save.className).not.toContain('rounded-[10px]')
+  })
+
+  it('行动画像: 未配置时可粘贴保存 manifest,走 updateUserProfile 并切到已配置态 (A2)', async () => {
+    render(<SettingsPage />)
+    const textarea = await screen.findByTestId('manifest-textarea')
+    fireEvent.change(textarea, { target: { value: '我在做 info2action' } })
+    fireEvent.click(screen.getByTestId('manifest-save'))
+    await waitFor(() => expect(mockUpdateUserProfile).toHaveBeenCalledWith({ manifest: '我在做 info2action' }))
+    expect(await screen.findByTestId('manifest-configured')).toHaveTextContent('我在做 info2action')
+  })
+
+  it('行动画像: 已配置时展示折叠预览 (A3)', async () => {
+    mockGetUserProfile.mockResolvedValue({
+      profile: { role: 'pm', interests: [], tools: [], manifest: '已有的画像内容' },
+      onboarding_completed: true,
+    })
+    render(<SettingsPage />)
+    expect(await screen.findByTestId('manifest-configured')).toHaveTextContent('已有的画像内容')
+    expect(screen.queryByTestId('manifest-textarea')).toBeNull()
   })
 })

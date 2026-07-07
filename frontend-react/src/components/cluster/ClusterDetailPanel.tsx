@@ -11,6 +11,7 @@ import { proxiedImageUrl } from '../../lib/media'
 import { PlatformBrandIcon } from '../shared/PlatformIcon'
 import { requireAuth } from '../shared/AuthGate'
 import { buildInfoItemHref } from '../../lib/itemDeepLink'
+import { ClusterActionZone } from './ClusterActionZone'
 
 type KeyPointItem = string | { title: string; points: string[] }
 type ModalVariant = 'no-media' | 'single-media' | 'multi-media'
@@ -721,6 +722,14 @@ export function ClusterDetailPanel() {
                   </div>
                 </section>
               )}
+
+              {/* v21.0 action-revival: 事件弹窗内生成行动点,挂来源列表之后。 */}
+              <section
+                data-testid="cluster-modal-action-zone"
+                className="mt-4 border-t border-[var(--modal-divider)] pt-4"
+              >
+                <ClusterActionZone clusterId={cluster.id} showExistingActions />
+              </section>
             </div>
 
             <div

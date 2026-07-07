@@ -37,6 +37,7 @@ from starlette.concurrency import run_in_threadpool
 
 import db
 import remote_db
+import action_quota
 from authz import can_access_all, current_user_id
 from category_taxonomy import ACTIVE_CATEGORY_IDS, canonicalize_category, expand_query_categories
 from deps import BASE
@@ -1050,6 +1051,15 @@ async def cluster_actions_list(request: Request, cluster_id: int):
     uid = current_user_id(request)
     if not uid:
         return {'actions': []}
+    # BF-0706-3: 生产走 remote(Supabase),行动在远端库;只读本地会返回空 → 事件弹窗
+    # 已生成行动点不显示。补 remote 分支(镜像本地查询)。
+    if remote_db.app_state_to_remote():
+        try:
+            actions = await run_in_threadpool(
+                remote_db.get_cluster_actions_remote, cluster_id, user_id=uid)
+        except remote_db.RemoteDBError as exc:
+            return _remote_error_response(exc)
+        return {'actions': actions}
     conn = db.get_conn()
     try:
         rows = conn.execute(
@@ -1093,7 +1103,12 @@ def _build_cluster_action_prompt(cluster_title: str, cluster_summary: str,
             title = (r['title'] or '').strip()[:120]
             snippet = (r['ai_summary'] or '').strip().replace('\n', ' ')[:200]
             plat = r['platform'] or '?'
-            src_lines.append(f'{idx}. [{plat}] {title}\n   摘要: {snippet}')
+            url = (r['url'] or '').strip() if 'url' in r.keys() else ''
+            line = f'{idx}. [{plat}] {title}'
+            if url:
+                line += f'\n   链接: {url}'
+            line += f'\n   摘要: {snippet}'
+            src_lines.append(line)
         parts.append('**主要来源**:\n' + '\n'.join(src_lines))
     if user_hint:
         parts.append(f'**用户预期方向**: {user_hint}')
@@ -1111,10 +1126,17 @@ def _build_cluster_action_prompt(cluster_title: str, cluster_summary: str,
     )
     parts.append(
         '## 输出格式\n'
-        '严格输出一个 JSON 对象（不要 markdown 代码块包裹），字段：\n'
+        '严格输出一个 JSON 对象（不要 markdown 代码块包裹），前后不得有额外文字。\n'
+        '**JSON 合法性铁律**：字符串值内部禁止裸 ASCII 双引号 `"`——需要引用词/短语时用中文引号「」，'
+        '确需 ASCII 双引号时转义为 \\"；换行/反斜杠也必须转义,保证 json.loads 一次解析成功。字段：\n'
         '- `title` (string): 行动点简短标题，<= 36 字；必须包含产出物或决策目标，不要只写“调研/深入了解/关注/分析某事件”\n'
-        '- `action_type` (string): "investigate" | "implement" | "content" 三选一\n'
-        '- `prompt` (string): 给执行 Agent 的详细 prompt（必须含目标、产出物形态、步骤、验收标准）\n'
+        '- `action_type` (string): "investigate"(调研) | "implement"(实践) | "content"(创作) | "track"(跟踪,值得关注但暂不落地) 四选一,由你根据内容判定\n'
+        '- `steps` (string[]): 给人看的行动点，3-6 条，每条一句话，用户 10 秒判断是否要做\n'
+        '- `prompt` (string): 交给本地 Agent 的**自包含**可执行指令，粘到全新会话即可跑，'
+        '不得依赖平台上下文。必须含：① 事件来源标题 + 上面列出的完整链接（指示先访问获取全文）；'
+        '② 一两句事件背景摘要；③ **联网深度调研**：明确指示 Agent 不要只看给定链接，'
+        '要用 web 搜索补充 2-4 个独立权威来源交叉验证事实，并主动找替代方案、反面观点/风险、最新进展；'
+        '④ **给出多种可能路径/选项**（各自取舍与适用场景），而非单一结论；⑤ 任务目标、产出物形态与验收标准\n'
         '- `priority` (string): "high" | "medium" | "low"\n'
         '- `reason` (string): 1-2 句说明为何值得做，必须点明多源事件带来的决策价值\n\n'
         '禁止输出没有明确产出物的泛行动。例如不要输出“Claude Narf 行为调研”，'
@@ -1137,6 +1159,7 @@ def _build_cluster_action_system_prompt() -> str:
         '- 如果事件适合写一篇深度文章/笔记，可选「内容型」(content)\n'
         '- 不要重复事件本身的信息，要给出「下一步要做什么」\n'
         '- 不要产出“了解一下/调研一下/关注一下”这类不可验收行动；每个行动都要有明确交付物\n'
+        '\n【语言要求】你的所有内部思考过程(thinking)以及最终输出的所有字段，必须使用简体中文。\n'
     )
 
 
@@ -1192,6 +1215,34 @@ def _parse_cluster_action_response(result_text: str | None, ga_module=None) -> d
     return None
 
 
+def _refresh_cluster_action_read_model(action_id: str, uid: str) -> None:
+    """Rebuild the action detail read model after a cluster action is persisted,
+    and invalidate the actions list payload cache so the行动 Tab shows it promptly.
+    Best-effort: never let a read-model hiccup fail the SSE stream."""
+    try:
+        if remote_db.app_state_to_remote():
+            remote_db.build_action_detail_read_model_remote(
+                action_id, request_user_id=uid, can_view_all=False,
+                owner_user_id=uid, persist=True,
+            )
+        else:
+            conn = db.get_conn()
+            try:
+                db.build_action_detail_read_model(
+                    conn, action_id, request_user_id=uid, can_view_all=False,
+                    owner_user_id=uid, persist=True,
+                )
+            finally:
+                conn.close()
+    except Exception as exc:
+        print(f"[warn] cluster action read model refresh failed for {action_id}: {exc}")
+    try:
+        import routes.actions as _actions_route
+        _actions_route._clear_actions_payload_cache()
+    except Exception:
+        pass
+
+
 def _emit_cluster_action_sse(uid: str, cluster_id: int, live_version: int,
                               cluster_title: str, cluster_summary: str,
                               cluster_key_points: list, user_hint: str,
@@ -1236,6 +1287,8 @@ def _emit_cluster_action_sse(uid: str, cluster_id: int, live_version: int,
         cluster_title, cluster_summary, cluster_key_points, user_hint,
         action_type_hint, member_rows,
     )
+    # M3 默认英文思考,首尾夹中文强指令强制中文 thinking/输出(实测有效)
+    user_content = ga.CHINESE_ONLY_PREFIX + user_content + ga.CHINESE_ONLY_SUFFIX
     yield sse('thinking', {'stage': 1, 'text': f'综合事件 + {len(member_rows)} 条来源'})
     yield sse('thinking', {'stage': 1, 'text': f'已组装 prompt（{len(user_content)} 字符）'})
     yield sse('stage', {'index': 1, 'status': 'done'})
@@ -1263,7 +1316,7 @@ def _emit_cluster_action_sse(uid: str, cluster_id: int, live_version: int,
             try:
                 txt = ga.call_minimax_streaming(
                     api_key, api_base, model, system_prompt, user_content,
-                    max_tokens=2048, on_thinking=on_thinking,
+                    max_tokens=8000, on_thinking=on_thinking,
                 )
                 result_holder['text'] = txt
             except ga.ProviderAuthenticationError as e:
@@ -1311,33 +1364,71 @@ def _emit_cluster_action_sse(uid: str, cluster_id: int, live_version: int,
     if parsed_action and parsed_action.get('title') and parsed_action.get('prompt'):
         action_title = str(parsed_action.get('title', ''))[:120].strip()
         action_type = action_type_hint or parsed_action.get('action_type', 'investigate')
-        if action_type not in ('investigate', 'implement', 'content'):
+        if action_type not in ('investigate', 'implement', 'content', 'track'):
             action_type = 'investigate'
         action_prompt = str(parsed_action.get('prompt', '')).strip()
         priority = parsed_action.get('priority', 'medium')
         if priority not in ('high', 'medium', 'low'):
             priority = 'medium'
-        reason = str(parsed_action.get('reason', 'generated from event cluster'))[:300]
+        # BF-0706-#3: 结构化 reason 存 JSON(不能 str() 成单引号 repr → 前端乱码);纯字符串截断 300
+        _raw_reason = parsed_action.get('reason', 'generated from event cluster')
+        if isinstance(_raw_reason, (list, dict)):
+            reason = json.dumps(_raw_reason, ensure_ascii=False)
+        else:
+            reason = str(_raw_reason)[:300]
+        # v21.0: 结构化行动点(人看),与自包含 prompt(机器执行)分离
+        raw_steps = parsed_action.get('steps')
+        if isinstance(raw_steps, str):
+            try:
+                raw_steps = json.loads(raw_steps)
+            except (json.JSONDecodeError, TypeError):
+                raw_steps = None
+        action_steps = (
+            [str(s).strip() for s in raw_steps if str(s or '').strip()]
+            if isinstance(raw_steps, list) else None
+        )
         yield sse('thinking', {'stage': 3, 'text': f'生成行动点: {action_title}'})
     else:
         yield sse('error', {'error': 'LLM 输出未能解析为可执行 action JSON'})
         return
 
-    conn2 = db.get_conn()
-    try:
-        conn2.execute(
-            """INSERT INTO actions
-                 (id, user_id, source_type, source_id, cluster_version,
-                  source_item_ids, title, action_type, prompt, reason,
-                  priority, status, is_stale)
-               VALUES (?, ?, 'cluster', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)""",
-            (action_id, uid, str(cluster_id), live_version,
-             json.dumps(source_item_ids, ensure_ascii=False),
-             action_title, action_type, action_prompt, reason, priority),
+    # v21.0 修复:生产 Supabase 模式必须写 remote,否则 cluster 行动点落错库、
+    # 不出现在行动 Tab。local/remote 双路径 + 持久化后刷新 detail read model。
+    if remote_db.app_state_to_remote():
+        action_id = remote_db.create_action_remote(
+            source_type='cluster',
+            title=action_title,
+            action_type=action_type,
+            prompt=action_prompt,
+            source_item_ids=source_item_ids,
+            reason=reason,
+            priority=priority,
+            status='pending',
+            user_id=uid,
+            source_id=str(cluster_id),
+            cluster_version=live_version,
+            steps=action_steps,
         )
-        conn2.commit()
-    finally:
-        conn2.close()
+    else:
+        conn2 = db.get_conn()
+        try:
+            conn2.execute(
+                """INSERT INTO actions
+                     (id, user_id, source_type, source_id, cluster_version,
+                      source_item_ids, title, action_type, prompt, steps, reason,
+                      priority, status, is_stale)
+                   VALUES (?, ?, 'cluster', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)""",
+                (action_id, uid, str(cluster_id), live_version,
+                 json.dumps(source_item_ids, ensure_ascii=False),
+                 action_title, action_type, action_prompt,
+                 json.dumps(action_steps, ensure_ascii=False) if action_steps else None,
+                 reason, priority),
+            )
+            conn2.commit()
+        finally:
+            conn2.close()
+
+    _refresh_cluster_action_read_model(action_id, uid)
 
     yield sse('stage', {'index': 3, 'status': 'done'})
 
@@ -1347,6 +1438,7 @@ def _emit_cluster_action_sse(uid: str, cluster_id: int, live_version: int,
         'title': action_title,
         'action_type': action_type,
         'prompt': action_prompt,
+        'steps': action_steps,
         'priority': priority,
         'reason': reason,
         'source_type': 'cluster',
@@ -1375,41 +1467,80 @@ async def cluster_generate_action(request: Request, cluster_id: int):
         body = {}
     user_hint = (body or {}).get('user_hint') or ''
     req_action_type = (body or {}).get('action_type') or ''
-    if req_action_type not in ('investigate', 'implement', 'content'):
+    if req_action_type not in ('investigate', 'implement', 'content', 'track'):
         req_action_type = ''
 
-    conn = db.get_conn()
-    row = conn.execute(
-        "SELECT id, ai_title, ai_summary, ai_key_points, live_version "
-        "FROM clusters WHERE id = ?",
-        (cluster_id,),
-    ).fetchone()
-    if not row:
-        conn.close()
-        return JSONResponse({'error': 'Cluster not found'}, status_code=404)
-    cluster_title = row['ai_title'] or '(untitled event)'
-    cluster_summary = row['ai_summary'] or ''
-    try:
-        cluster_key_points = json.loads(row['ai_key_points'] or '[]')
-        if not isinstance(cluster_key_points, list):
+    # BF: 生产走 remote(Supabase),cluster 不在本地 sqlite;必须 remote 取数,
+    # 否则 POST 生成一律 404(GET 走 remote 正常,POST 之前只读本地)。
+    if remote_db.events_read_from_remote():
+        try:
+            detail = await run_in_threadpool(
+                remote_db.cluster_detail, cluster_id=cluster_id, user_id=uid)
+            mrows = await run_in_threadpool(
+                remote_db.collect_cluster_member_rows_remote, None, cluster_id)
+        except remote_db.RemoteDBError as exc:
+            return _remote_error_response(exc)
+        if detail is None:
+            return JSONResponse({'error': 'Cluster not found'}, status_code=404)
+        cluster_title = detail.get('ai_title') or '(untitled event)'
+        cluster_summary = detail.get('ai_summary') or ''
+        kp = detail.get('ai_key_points')
+        cluster_key_points = kp if isinstance(kp, list) else []
+        live_version = int(detail.get('live_version') or 0)
+        mrows_sorted = sorted(
+            mrows,
+            key=lambda r: (
+                0 if r.get('is_primary_source') else 1,
+                r.get('rank_in_cluster') if r.get('rank_in_cluster') is not None else 9999,
+            ),
+        )[:10]
+        member_list = [
+            {'id': r.get('id'), 'title': r.get('title'), 'ai_summary': r.get('ai_summary'),
+             'url': r.get('url'), 'platform': r.get('platform')}
+            for r in mrows_sorted
+        ]
+        source_item_ids = [r['id'] for r in member_list]
+    else:
+        conn = db.get_conn()
+        row = conn.execute(
+            "SELECT id, ai_title, ai_summary, ai_key_points, live_version "
+            "FROM clusters WHERE id = ?",
+            (cluster_id,),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return JSONResponse({'error': 'Cluster not found'}, status_code=404)
+        cluster_title = row['ai_title'] or '(untitled event)'
+        cluster_summary = row['ai_summary'] or ''
+        try:
+            cluster_key_points = json.loads(row['ai_key_points'] or '[]')
+            if not isinstance(cluster_key_points, list):
+                cluster_key_points = []
+        except (json.JSONDecodeError, TypeError):
             cluster_key_points = []
-    except (json.JSONDecodeError, TypeError):
-        cluster_key_points = []
-    live_version = row['live_version'] or 0
+        live_version = row['live_version'] or 0
 
-    # Gather member snippets for action prompt context
-    member_rows = conn.execute(
-        """SELECT i.id, i.title, i.ai_summary, i.url, i.platform
-           FROM cluster_items ci JOIN items i ON i.id = ci.item_id
-           WHERE ci.cluster_id = ?
-           ORDER BY ci.is_primary_source DESC,
-                    COALESCE(ci.rank_in_cluster, 9999) ASC
-           LIMIT 10""",
-        (cluster_id,),
-    ).fetchall()
-    member_list = [dict(r) for r in member_rows]
-    source_item_ids = [r['id'] for r in member_list]
-    conn.close()
+        # Gather member snippets for action prompt context
+        member_rows = conn.execute(
+            """SELECT i.id, i.title, i.ai_summary, i.url, i.platform
+               FROM cluster_items ci JOIN items i ON i.id = ci.item_id
+               WHERE ci.cluster_id = ?
+               ORDER BY ci.is_primary_source DESC,
+                        COALESCE(ci.rank_in_cluster, 9999) ASC
+               LIMIT 10""",
+            (cluster_id,),
+        ).fetchall()
+        member_list = [dict(r) for r in member_rows]
+        source_item_ids = [r['id'] for r in member_list]
+        conn.close()
+
+    # v21.0 限额:非 admin 每日 5 次(item + cluster 合计),发起即计。
+    allowed, quota = action_quota.try_consume_for_request(request)
+    if not allowed:
+        return JSONResponse(
+            {'error': f"今日生成次数已用完({quota['used']}/{quota['limit']}),明天再来", 'quota': quota},
+            status_code=429,
+        )
 
     return StreamingResponse(
         _emit_cluster_action_sse(

@@ -6,7 +6,7 @@ import { useFeedStore } from '../../../store/feedStore'
 import { useActionStore } from '../../../store/actionStore'
 import { useAuthStore } from '../../../store/authStore'
 import type { ActionItem, FeedItem } from '../../../lib/types'
-import { dismissAction, dispatchAction, fetchAction, fetchFeedItem, markActionDone, setItemStatus, updateAction } from '../../../lib/api'
+import { dismissAction, dispatchAction, fetchAction, fetchFeedItem, markActionDone, setActionStatus, setItemStatus, updateAction } from '../../../lib/api'
 import { toast } from 'sonner'
 import { requireAuth } from '../../shared/AuthGate'
 
@@ -18,6 +18,7 @@ vi.mock('../../../lib/api', () => ({
   fetchActionsByItem: vi.fn().mockResolvedValue({ actions: [] }),
   fetchAction: vi.fn(),
   markActionDone: vi.fn().mockResolvedValue({ ok: true }),
+  setActionStatus: vi.fn().mockResolvedValue({ ok: true, status: 'confirmed' }),
   dismissAction: vi.fn().mockResolvedValue({ ok: true }),
   dispatchAction: vi.fn().mockResolvedValue({ ok: true, thread_id: 'thread-1', thread_url: 'https://discord.test/thread-1' }),
   updateAction: vi.fn().mockResolvedValue({ ok: true }),
@@ -56,6 +57,7 @@ const mockFetchFeedItem = fetchFeedItem as unknown as ReturnType<typeof vi.fn>
 const mockFetchAction = fetchAction as unknown as ReturnType<typeof vi.fn>
 const mockSetItemStatus = setItemStatus as unknown as ReturnType<typeof vi.fn>
 const mockMarkActionDone = markActionDone as unknown as ReturnType<typeof vi.fn>
+const mockSetActionStatus = setActionStatus as unknown as ReturnType<typeof vi.fn>
 const mockDismissAction = dismissAction as unknown as ReturnType<typeof vi.fn>
 const mockDispatchAction = dispatchAction as unknown as ReturnType<typeof vi.fn>
 const mockUpdateAction = updateAction as unknown as ReturnType<typeof vi.fn>
@@ -149,6 +151,7 @@ function openActionWith(action: ActionItem, options: { mockFetch?: boolean } = {
 describe('DetailPanel v19 modal variants', () => {
   beforeEach(() => {
     window.location.hash = ''
+    try { localStorage.clear() } catch { /* jsdom */ }
     clipboardWriteTextMock = vi.fn().mockResolvedValue(undefined)
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -234,7 +237,8 @@ describe('DetailPanel v19 modal variants', () => {
     expect(screen.getByTestId('detail-body-text')).toHaveClass('reading-body')
     expect(screen.getByTestId('detail-original-label')).toHaveTextContent('原文：')
     expect(screen.getByTestId('detail-original-label')).toHaveClass('!text-[var(--brand)]')
-    expect(screen.queryByTestId('mock-action-zone')).not.toBeInTheDocument()
+    // v21.0 action-revival: 行动点区块恢复挂载到信息弹窗正文末。
+    expect(screen.getByTestId('mock-action-zone')).toBeInTheDocument()
     expect(screen.getByTestId('detail-bottom-actions')).toHaveClass('modal-safe-footer', 'grid-cols-3')
     expect(screen.getByTestId('detail-bottom-actions')).toHaveTextContent('收藏')
     expect(screen.getByTestId('detail-bottom-actions')).toHaveTextContent('跳转原文')
@@ -326,7 +330,8 @@ describe('DetailPanel v19 modal variants', () => {
     const actionPanel = await screen.findByTestId('detail-panel')
     expect(actionPanel).toHaveAttribute('data-modal-theme', 'editorial')
     expect(actionPanel.className).toContain('bg-[var(--modal-surface)]')
-    expect(screen.getByTestId('action-modal-footer').className).toContain('bg-[var(--modal-surface)]')
+    // v2 §13.4: footer 移除,状态改由顶部状态区维护
+    expect(screen.getByTestId('action-status-stepper')).toBeInTheDocument()
   })
 
   it('E2: 无原文 URL 时底部两列均分收藏/分享,不留中间死区占位', async () => {
@@ -523,32 +528,37 @@ describe('DetailPanel v19 modal variants', () => {
     expect(screen.getByTestId('action-modal-title')).toHaveTextContent('集成 Claude Code + MiMo-V2.5-Pro 到 cc-switch 工作流')
 
     const meta = screen.getByTestId('action-modal-meta')
-    expect(meta).toHaveTextContent('动手做')
-    expect(meta).toHaveTextContent('P0')
-    expect(meta).toHaveTextContent('待处理')
+    // BF-0706-2(#5): 删除 类型/优先级/状态 标签(状态已移到顶部 stepper),meta 仅保留绝对时间
+    expect(meta).not.toHaveTextContent('实践')
+    expect(meta).not.toHaveTextContent('P0')
+    expect(meta).not.toHaveTextContent('待处理')
     expect(meta).toHaveTextContent('2026-05-30 01:20')
     expect(meta).not.toHaveTextContent('优先级：')
     expect(meta).not.toHaveTextContent('状态：')
     expect(meta).not.toHaveTextContent('来自 16:16')
   })
 
-  it('行动弹窗内容顺序为行动点、决策理由、关联信息,来源行新开 tab 跳转', async () => {
+  it('行动弹窗内容顺序为理由、行动点、执行、关联信息,来源行新开 tab 跳转', async () => {
     openActionWith(makeAction())
     render(<DetailPanel />)
 
     const points = await screen.findByTestId('action-modal-points')
     const sources = screen.getByTestId('action-modal-sources')
     const reason = screen.getByTestId('action-modal-reason')
+    const execution = screen.getByTestId('action-modal-execution')
     expect(points).toHaveTextContent('行动点')
     expect(points).toHaveTextContent('在 cc-switch 中新增 MiMo-V2.5-Pro 配置')
     expect(points.querySelector('ul')).toHaveClass('reading-bullet')
     expect(sources).toHaveTextContent('关联信息')
     expect(sources).toHaveTextContent('MiMo-V2.5-Pro 工具调用表现不错')
-    expect(reason).toHaveTextContent('决策理由')
+    // v21.0: 决策理由标题改为"为什么做",且提前到第一位。
+    expect(reason).toHaveTextContent('为什么做')
     expect(reason).toHaveTextContent('当前开发环境以 Claude Code + OpenClaw 为主')
     expect(reason.querySelector('div')).toHaveClass('reading-body')
-    expect(points.compareDocumentPosition(reason) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(reason.compareDocumentPosition(sources) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // 顺序: 理由 → 行动点 → 执行 → 关联信息
+    expect(reason.compareDocumentPosition(points) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(points.compareDocumentPosition(execution) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(execution.compareDocumentPosition(sources) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
 
     const sourceLink = screen.getAllByTestId('action-modal-source-row')[0]
     expect(sourceLink).toHaveAttribute('target', '_blank')
@@ -596,7 +606,7 @@ describe('DetailPanel v19 modal variants', () => {
     await screen.findByTestId('detail-panel')
     expect(screen.queryByTestId('action-modal-title')).toBeNull()
     expect(screen.queryByTestId('action-modal-points')).toBeNull()
-    expect(screen.queryByTestId('action-modal-footer')).toBeNull()
+    expect(screen.queryByTestId('action-status-stepper')).toBeNull()
     expect(screen.queryByTestId('action-modal-sources')).toBeNull()
     expect(screen.queryByText(/查看源内容/)).toBeNull()
     expect(screen.queryByText(/#src-1/)).toBeNull()
@@ -608,7 +618,7 @@ describe('DetailPanel v19 modal variants', () => {
     expect(screen.getByTestId('action-modal-points')).toHaveTextContent('在 cc-switch 中新增 MiMo-V2.5-Pro 配置')
     expect(screen.getByTestId('action-modal-reason')).toHaveTextContent('当前开发环境以 Claude Code + OpenClaw 为主')
     expect(await screen.findByTestId('action-modal-sources')).toHaveTextContent('MiMo-V2.5-Pro 工具调用表现不错')
-    expect(screen.getByTestId('action-modal-footer')).toHaveTextContent('派发')
+    expect(screen.getByTestId('action-status-stepper')).toHaveTextContent('执行中')
   })
 
   it('行动弹窗已有完整详情 payload 时不重复请求,避免二次覆盖跳变', async () => {
@@ -625,20 +635,54 @@ describe('DetailPanel v19 modal variants', () => {
     expect(mockFetchAction).not.toHaveBeenCalled()
   })
 
-  it('行动弹窗底部只保留忽略和主操作按钮,派发后同步 store', async () => {
+  it('顶部状态区可切换状态(执行中),派发在执行区且置 dispatched (v2 §13.4)', async () => {
     openActionWith(makeAction())
     render(<DetailPanel />)
 
-    const footer = await screen.findByTestId('action-modal-footer')
-    expect(footer).toHaveClass('modal-safe-footer', 'grid-cols-2', 'border-[var(--modal-border-soft)]', 'bg-[var(--modal-surface)]')
-    expect(footer).toHaveTextContent('忽略')
-    expect(footer).toHaveTextContent('派发')
-    expect(footer).not.toHaveTextContent('关联信息')
+    const stepper = await screen.findByTestId('action-status-stepper')
+    expect(stepper).toHaveTextContent('待处理')
+    expect(stepper).toHaveTextContent('执行中')
+    expect(stepper).toHaveTextContent('已完成')
+    expect(stepper).toHaveTextContent('忽略')
 
-    fireEvent.click(screen.getByText('派发'))
+    // 派发在执行区(pending 时可点,直接按钮无 tab)→ dispatched
+    fireEvent.click(screen.getByTestId('exec-dispatch'))
     await waitFor(() => expect(mockDispatchAction).toHaveBeenCalledWith('act-1'))
-    await waitFor(() => expect(useActionStore.getState().actions[0].status).toBe('dispatched'))
-    expect(toast.success).toHaveBeenCalledWith('已进入执行中')
+
+    // 状态区点"已完成" → setActionStatus(done)
+    fireEvent.click(screen.getByTestId('status-step-done'))
+    await waitFor(() => expect(mockSetActionStatus).toHaveBeenCalledWith('act-1', 'done'))
+    await waitFor(() => expect(useActionStore.getState().actions[0].status).toBe('done'))
+  })
+
+  it('跟踪类行动执行区显示跟踪提示,不出现代码块/复制 (track)', async () => {
+    openActionWith(makeAction({ action_type: 'track', type: 'track' }))
+    render(<DetailPanel />)
+    const exec = await screen.findByTestId('action-execution')
+    expect(exec).toHaveTextContent('跟踪项')
+    expect(screen.queryByTestId('exec-command')).toBeNull()
+    expect(screen.queryByTestId('exec-copy-prompt')).toBeNull()
+  })
+
+  it('执行区代码块显示 prompt,右上角一个复制按钮复制 prompt,不改状态 (v2 §13.3)', async () => {
+    openActionWith(makeAction({ prompt: '去做这件事的完整指令' }))
+    render(<DetailPanel />)
+    const code = await screen.findByTestId('exec-command')
+    expect(code.textContent).toContain('去做这件事的完整指令')
+    // 只有一个复制按钮(不再有 复制命令 / 仅复制 Prompt 两个)
+    fireEvent.click(screen.getByTestId('exec-copy-prompt'))
+    await waitFor(() => expect(clipboardWriteTextMock).toHaveBeenCalledWith('去做这件事的完整指令'))
+    // 复制不改状态
+    expect(mockSetActionStatus).not.toHaveBeenCalled()
+    expect(useActionStore.getState().actions[0].status).toBe('pending')
+  })
+
+  it('行动详情加载失败展示错误占位 (D5)', async () => {
+    mockFetchAction.mockResolvedValue(null)
+    openActionWith(makeAction(), { mockFetch: false })
+    useDetailStore.setState({ actionDetail: null })
+    render(<DetailPanel />)
+    expect(await screen.findByText('行动点未找到或加载失败')).toBeInTheDocument()
   })
 
   it('ArrowDown 在已加载列表内切到下一条,不关闭弹窗', async () => {
