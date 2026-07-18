@@ -59,6 +59,32 @@ def test_parse_watermark_failsafe_returns_none():
     assert lw._parse_watermark_to_ts("not-a-date") is None
 
 
+def test_local_watermark_connection_is_closed(monkeypatch):
+    import db
+    import remote_db
+
+    class FakeCursor:
+        def fetchone(self):
+            return {"mx": "2026-07-11T01:00:00Z"}
+
+    class FakeConn:
+        closed = False
+
+        def execute(self, sql):
+            assert "platform = 'lingowhale'" in sql
+            return FakeCursor()
+
+        def close(self):
+            self.closed = True
+
+    conn = FakeConn()
+    monkeypatch.setattr(remote_db, "fetch_write_to_remote", lambda: False)
+    monkeypatch.setattr(db, "get_conn", lambda: conn)
+
+    assert lw._lingowhale_watermark_ts() is not None
+    assert conn.closed is True
+
+
 def test_fetch_subscription_feed_forwards_since_ts(monkeypatch):
     captured = []
 
@@ -66,9 +92,13 @@ def test_fetch_subscription_feed_forwards_since_ts(monkeypatch):
         captured.append(since_ts)
         return ([], 1, "done")
 
+    monkeypatch.setenv("INFO2ACTION_LINGOWHALE_REGISTRY_ONLY", "0")
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {"registered": 1})
+    monkeypatch.setattr(lw, "_priority_channel_ids", lambda: [])
     monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_endpoint)
+    monkeypatch.setattr(lw, "_record_lingowhale_result", lambda source_id, *, ok, error=None: None)
     lw.fetch_subscription_feed(groups_info=None, since_ts=12345)
-    assert captured, "应至少调用一次 endpoint(legacy all)"
+    assert captured, "应至少调用一次注册表频道 endpoint"
     assert all(s == 12345 for s in captured), "since_ts 应透传到每个 endpoint 调用"
 
 

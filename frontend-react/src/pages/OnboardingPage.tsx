@@ -4,6 +4,7 @@ import { cn } from '../lib/utils'
 import { updateUserProfile } from '../lib/api'
 import { useAuthStore } from '../store/authStore'
 import { ROLES, INTERESTS, TOOLS } from '../lib/profileOptions'
+import { BrandWordmark } from '../components/shared/BrandWordmark'
 
 type Step = 0 | 1 | 2
 
@@ -11,6 +12,8 @@ interface Props {
   onComplete: () => void
 }
 
+// v24.0 §21.6: 三步画像页从全靛蓝 AI-SaaS 换皮为纸面语言（结构不动）——
+// 样板 = SettingsPage「编辑个人画像」弹窗(brand 进度条/brand-soft 选中态) + LoginPage 安静门。
 export function OnboardingPage({ onComplete }: Props) {
   const [step, setStep] = useState<Step>(0)
   const [role, setRole] = useState<string | null>(null)
@@ -55,17 +58,30 @@ export function OnboardingPage({ onComplete }: Props) {
     else handleFinish()
   }
 
+  const chipClass = (selected: boolean) =>
+    cn(
+      'rounded-[4px] border px-3 py-1.5 font-body-cjk text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]',
+      selected
+        ? 'border-[var(--brand-border)] bg-[var(--brand-soft)] text-[var(--brand)]'
+        : 'border-border text-muted-foreground hover:border-[var(--brand-border)] hover:text-foreground',
+    )
+
   return (
     <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
       <div className="w-full max-w-[520px]">
+        {/* Brand */}
+        <div className="mb-8 text-center">
+          <BrandWordmark className="text-[34px]" />
+        </div>
+
         {/* Progress */}
         <div className="flex items-center gap-2 mb-8">
           {[0, 1, 2].map((i) => (
             <div
               key={i}
               className={cn(
-                'h-1.5 flex-1 rounded-full transition-colors',
-                i <= step ? 'bg-primary' : 'bg-muted'
+                'h-1.5 flex-1 rounded-[4px] transition-colors',
+                i <= step ? 'bg-[var(--brand)]' : 'bg-muted'
               )}
             />
           ))}
@@ -74,22 +90,22 @@ export function OnboardingPage({ onComplete }: Props) {
         {/* Step 0: Role */}
         {step === 0 && (
           <div>
-            <h2 className="text-xl font-bold text-foreground mb-1">你的角色</h2>
-            <p className="text-sm text-muted-foreground mb-6">选择最贴近你的角色，帮助我们理解你的信息需求</p>
+            <h2 className="mb-1 font-event-title text-[22px] font-semibold leading-tight text-foreground">你的角色</h2>
+            <p className="mb-6 font-body-cjk text-sm text-muted-foreground">选择最贴近你的角色，帮助我们理解你的信息需求</p>
             <div className="grid grid-cols-2 gap-2">
               {ROLES.map((r) => (
                 <button
                   key={r.id}
                   onClick={() => setRole(r.id)}
                   className={cn(
-                    'p-3 rounded-lg border text-left transition-all',
+                    'rounded-[4px] border p-3 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]',
                     role === r.id
-                      ? 'border-primary bg-primary/5 ring-1 ring-primary'
-                      : 'border-border hover:border-primary/50'
+                      ? 'border-[var(--brand-border)] bg-[var(--brand-soft)]'
+                      : 'border-border hover:border-[var(--brand-border)]'
                   )}
                 >
-                  <div className="text-sm font-medium text-foreground">{r.label}</div>
-                  {r.desc && <div className="text-xs text-muted-foreground mt-0.5">{r.desc}</div>}
+                  <div className="font-body-cjk text-sm font-medium text-foreground">{r.label}</div>
+                  {r.desc && <div className="mt-0.5 font-body-cjk text-xs text-muted-foreground">{r.desc}</div>}
                 </button>
               ))}
             </div>
@@ -99,19 +115,14 @@ export function OnboardingPage({ onComplete }: Props) {
         {/* Step 1: Interests */}
         {step === 1 && (
           <div>
-            <h2 className="text-xl font-bold text-foreground mb-1">关注方向</h2>
-            <p className="text-sm text-muted-foreground mb-6">选择你感兴趣的方向（至少 1 个）</p>
+            <h2 className="mb-1 font-event-title text-[22px] font-semibold leading-tight text-foreground">关注方向</h2>
+            <p className="mb-6 font-body-cjk text-sm text-muted-foreground">选择你感兴趣的方向（至少 1 个）</p>
             <div className="flex flex-wrap gap-2">
               {INTERESTS.map((i) => (
                 <button
                   key={i.id}
                   onClick={() => toggleSet(interests, setInterests, i.id)}
-                  className={cn(
-                    'px-3 py-1.5 rounded-full text-sm font-medium border transition-all',
-                    interests.has(i.id)
-                      ? 'border-primary bg-primary/10 text-primary'
-                      : 'border-border text-muted-foreground hover:border-primary/50'
-                  )}
+                  className={chipClass(interests.has(i.id))}
                 >
                   {interests.has(i.id) && <Check className="w-3.5 h-3.5 inline mr-1 -mt-0.5" />}
                   {i.label}
@@ -124,19 +135,14 @@ export function OnboardingPage({ onComplete }: Props) {
         {/* Step 2: Tools */}
         {step === 2 && (
           <div>
-            <h2 className="text-xl font-bold text-foreground mb-1">常用工具</h2>
-            <p className="text-sm text-muted-foreground mb-6">选择你日常使用的 AI 工具（可跳过）</p>
+            <h2 className="mb-1 font-event-title text-[22px] font-semibold leading-tight text-foreground">常用工具</h2>
+            <p className="mb-6 font-body-cjk text-sm text-muted-foreground">选择你日常使用的 AI 工具（可跳过）</p>
             <div className="flex flex-wrap gap-2">
               {TOOLS.map((t) => (
                 <button
                   key={t.id}
                   onClick={() => toggleSet(tools, setTools, t.id)}
-                  className={cn(
-                    'px-3 py-1.5 rounded-full text-sm font-medium border transition-all',
-                    tools.has(t.id)
-                      ? 'border-primary bg-primary/10 text-primary'
-                      : 'border-border text-muted-foreground hover:border-primary/50'
-                  )}
+                  className={chipClass(tools.has(t.id))}
                 >
                   {tools.has(t.id) && <Check className="w-3.5 h-3.5 inline mr-1 -mt-0.5" />}
                   {t.label}
@@ -151,7 +157,7 @@ export function OnboardingPage({ onComplete }: Props) {
           {step > 0 ? (
             <button
               onClick={() => setStep((step - 1) as Step)}
-              className="flex items-center gap-1 px-4 py-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+              className="flex items-center gap-1 rounded-[4px] px-4 py-2 font-body-cjk text-sm font-medium text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]"
             >
               <ArrowLeft className="w-4 h-4" />
               上一步
@@ -164,9 +170,9 @@ export function OnboardingPage({ onComplete }: Props) {
             onClick={handleNext}
             disabled={!canNext || saving}
             className={cn(
-              'flex items-center gap-1 px-5 py-2 text-sm font-medium rounded-lg transition-colors',
+              'flex items-center gap-1 rounded-[4px] px-5 py-2 font-body-cjk text-sm font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]',
               canNext
-                ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                ? 'bg-[var(--brand)] text-[var(--brand-foreground)] hover:bg-[color-mix(in_srgb,var(--brand)_86%,#171512)]'
                 : 'bg-muted text-muted-foreground cursor-not-allowed'
             )}
           >
@@ -176,7 +182,7 @@ export function OnboardingPage({ onComplete }: Props) {
         </div>
 
         {/* Step indicator */}
-        <p className="text-center text-xs text-muted-foreground mt-4">
+        <p className="text-center font-mono text-xs text-muted-foreground mt-4">
           {step + 1} / 3
         </p>
       </div>

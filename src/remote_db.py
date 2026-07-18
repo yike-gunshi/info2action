@@ -8,6 +8,8 @@ status-write surface is still pointing at SQLite.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import re
 import shutil
@@ -27,6 +29,7 @@ import action_detail_read_model
 from category_taxonomy import ACTIVE_CATEGORY_IDS, canonicalize_category, expand_query_categories
 from env_utils import load_project_env
 from health_freshness import classify_platform_freshness
+import highlight_score_v26
 from time_utils import parse_datetime, sort_key, to_utc_iso
 
 BASE = Path(__file__).resolve().parents[1]
@@ -165,12 +168,21 @@ REMOTE_DB_POOL_MIN_ENV = "INFO2ACTION_REMOTE_DB_POOL_MIN"
 REMOTE_DB_POOL_MAX_ENV = "INFO2ACTION_REMOTE_DB_POOL_MAX"
 REMOTE_DB_POOL_TIMEOUT_ENV = "INFO2ACTION_REMOTE_DB_POOL_TIMEOUT_SEC"
 REMOTE_DB_CONNECT_TIMEOUT_ENV = "INFO2ACTION_REMOTE_DB_CONNECT_TIMEOUT_SEC"
+REMOTE_DB_POOL_MAX_IDLE_ENV = "INFO2ACTION_REMOTE_DB_POOL_MAX_IDLE_SEC"
+FEED_EVENTS_TIMEOUT_MS_ENV = "INFO2ACTION_FEED_EVENTS_TIMEOUT_MS"
+
+# Cloudflare drops the origin connection at ~100s (524). Any feed query allowed
+# to run longer than that can never reach the user, so cap well below it.
+_FEED_EVENTS_TIMEOUT_CEILING_MS = 90_000
+_FEED_EVENTS_TIMEOUT_DEFAULT_MS = 30_000
 REMOTE_DB_CONNECT_ATTEMPTS_ENV = "INFO2ACTION_REMOTE_DB_CONNECT_ATTEMPTS"
 REMOTE_DB_FORCE_WRITABLE_ENV = "INFO2ACTION_REMOTE_DB_FORCE_WRITABLE_ON_CONNECT"
 REMOTE_CACHE_TTL_ENV = "INFO2ACTION_REMOTE_CACHE_TTL_SEC"
+FEED_RESULT_CACHE_TTL_ENV = "INFO2ACTION_FEED_RESULT_CACHE_TTL_SEC"
 REMOTE_AUTH_CACHE_TTL_ENV = "INFO2ACTION_REMOTE_AUTH_CACHE_TTL_SEC"
 REMOTE_SNAPSHOT_TTL_ENV = "INFO2ACTION_REMOTE_SNAPSHOT_TTL_SEC"
 REMOTE_FEED_LIVE_TIMEOUT_MS_ENV = "INFO2ACTION_REMOTE_FEED_LIVE_TIMEOUT_MS"
+SUBCATEGORY_LIVE_TIMEOUT_MS_ENV = "INFO2ACTION_SUBCATEGORY_LIVE_TIMEOUT_MS"
 REMOTE_ACTIONS_BOARD_TIMEOUT_MS_ENV = "INFO2ACTION_REMOTE_ACTIONS_BOARD_TIMEOUT_MS"
 REMOTE_ACTIONS_BOARD_DETAIL_TIMEOUT_MS_ENV = "INFO2ACTION_REMOTE_ACTIONS_BOARD_DETAIL_TIMEOUT_MS"
 REMOTE_PENDING_SCAN_TIMEOUT_MS_ENV = "INFO2ACTION_REMOTE_PENDING_SCAN_TIMEOUT_MS"
@@ -182,11 +194,14 @@ CONTEXT_SEARCH_STATEMENT_TIMEOUT_MS_ENV = "INFO2ACTION_CONTEXT_SEARCH_STATEMENT_
 CONTEXT_SEARCH_IDLE_TX_TIMEOUT_MS_ENV = "INFO2ACTION_CONTEXT_SEARCH_IDLE_TX_TIMEOUT_MS"
 REMOTE_FEED_LIVE_DISABLED_ENV = "INFO2ACTION_REMOTE_FEED_LIVE_DISABLED"
 REMOTE_FEED_LIVE_CIRCUIT_SEC_ENV = "INFO2ACTION_REMOTE_FEED_LIVE_CIRCUIT_SEC"
-ALLOW_BLOCKING_MV_REFRESH_ENV = "INFO2ACTION_ALLOW_BLOCKING_MV_REFRESH"
-ALLOW_PLATFORM_MV_REFRESH_ENV = "INFO2ACTION_ALLOW_PLATFORM_MV_REFRESH"
-PREWARM_REFRESH_PLATFORMS_MV_ENV = "INFO2ACTION_PREWARM_REFRESH_PLATFORMS_MV"
 REMOTE_RUNNING_FETCH_MAX_AGE_MIN_ENV = "INFO2ACTION_REMOTE_RUNNING_FETCH_MAX_AGE_MINUTES"
 FETCH_RUN_HEARTBEAT_GRACE_SEC_ENV = "INFO2ACTION_FETCH_RUN_HEARTBEAT_GRACE_SEC"
+# 稳定性加固(2026-07-10 BF-0710-fetch-guards): 运行时(非重启)判活/回收孤儿用的更宽
+# 心跳容忍窗口。基础 grace(600s)用于重启恢复(进程边界=确定性,可激进);运行时守卫
+# 与运行时 stale 回收用这个更大的窗口,让一次瞬时 DB 承压(心跳走 2s checkout 的
+# connect(),承压时最先失败)不会把仍在跑的 run 误判成孤儿→放行第二条 pipeline→
+# 压力更大的正反馈。默认 1800s(30 个 60s 心跳周期)。
+FETCH_RUN_RUNTIME_STALE_GRACE_SEC_ENV = "INFO2ACTION_FETCH_RUN_RUNTIME_STALE_GRACE_SEC"
 INFO_READ_MODEL_ENV = "INFO2ACTION_INFO_READ_MODEL"
 INFO_READ_MODEL_REFRESH_ENV = "INFO2ACTION_INFO_READ_MODEL_REFRESH"
 # BF-0706-4: 跨进程单飞锁 —— 防止一次重建跑过 min_interval 时新请求并发再起一次重建
@@ -195,20 +210,40 @@ _INFO_READ_MODEL_BUILD_LOCK_KEY = 517070604
 INFO_READ_MODEL_REFRESH_TIMEOUT_MS_ENV = "INFO2ACTION_INFO_READ_MODEL_REFRESH_TIMEOUT_MS"
 INFO_READ_MODEL_INCREMENTAL_ENV = "INFO2ACTION_INFO_READ_MODEL_INCREMENTAL"
 INFO_READ_MODEL_PREWARM_SCOPES_ENV = "INFO2ACTION_INFO_READ_MODEL_PREWARM_SCOPES"
-INFO_READ_MODEL_LIVE_OVERLAY_ENV = "INFO2ACTION_INFO_READ_MODEL_LIVE_OVERLAY"
-INFO_READ_MODEL_LIVE_OVERLAY_LIMIT_ENV = "INFO2ACTION_INFO_READ_MODEL_LIVE_OVERLAY_LIMIT"
-INFO_READ_MODEL_LIVE_OVERLAY_PER_SCOPE_LIMIT_ENV = "INFO2ACTION_INFO_READ_MODEL_LIVE_OVERLAY_PER_SCOPE_LIMIT"
-INFO_READ_MODEL_LIVE_OVERLAY_TIMEOUT_MS_ENV = "INFO2ACTION_INFO_READ_MODEL_LIVE_OVERLAY_TIMEOUT_MS"
+INFO_READ_MODEL_PREWARM_PAGE_LIMIT_ENV = "INFO2ACTION_INFO_READ_MODEL_PREWARM_PAGE_LIMIT"
+INFO_READ_MODEL_PREWARM_PAGES_PER_SCOPE_ENV = "INFO2ACTION_INFO_READ_MODEL_PREWARM_PAGES_PER_SCOPE"
 INFO_READ_MODEL_IDLE_TX_TIMEOUT_MS_ENV = "INFO2ACTION_INFO_READ_MODEL_IDLE_TX_TIMEOUT_MS"
-INFO_READ_MODEL_LIVE_OVERLAY_RESULT_CACHE_TTL_ENV = "INFO2ACTION_INFO_READ_MODEL_LIVE_OVERLAY_RESULT_CACHE_TTL_SEC"
 INFO_READ_MODEL_STATE_KEY = "feed_platforms_v1"
 INFO_READ_MODEL_MIN_GITHUB_STARS = 50
 INFO_READ_MODEL_REFRESH_TIMEOUT_MS_DEFAULT = 180000
 INFO_READ_MODEL_IDLE_TX_TIMEOUT_MS_DEFAULT = 5000
+# BF-0710-1: delta 刷新按时间窗分片,每轮只吃 (水位, min_start+窗口] 的内容并独立提交,
+# 循环追赶;长积压不再变成一条撞 statement_timeout 的巨型 SQL。
+INFO_READ_MODEL_DELTA_WINDOW_HOURS_ENV = "INFO2ACTION_INFO_READ_MODEL_DELTA_WINDOW_HOURS"
+INFO_READ_MODEL_DELTA_WINDOW_HOURS_DEFAULT = 6
+# BF-0710-1: 刷新失败指数退避封顶 2h —— 失败无退避的每 10min 原样重试
+# 会把偶发拥塞滚成死循环(BF-0708 系列 P0 的库侧根因)。
+INFO_READ_MODEL_REFRESH_BACKOFF_CAP_SEC = 7200
+# 剩余墙钟预算低于此值时不再开启新一轮(避免注定超时的半轮)。
+_INFO_READ_MODEL_DELTA_ROUND_FLOOR_MS = 30000
+_INFO_READ_MODEL_DELTA_MAX_ROUNDS = 100
 INFO_READ_MODEL_RETAIN_COMPLETE_VERSIONS = 1
 INFO_READ_MODEL_PRUNE_TRANSIENT_AGE_HOURS = 6
 INFO_READ_MODEL_SORT_POLICY = "published_at_desc_v1"
+# perf-v27 P4: info 读模型收缩为「首屏预算」形态(目标架构定稿 §0-2/§5-5)。
+# 只物化 section_category 维度(信息默认页 = 每模块「全部」pill 首屏),
+# 热窗口 7 天、每 scope 封顶 TOP_N 行;其余维度(platform/source/category/
+# group)与超出部分全部走 live 现场查(既有回退路径,索引已备)。
+# 313k 行乘法式物化由此饿死:~14 scopes × 50 = ~700 行。
+INFO_READ_MODEL_WINDOW_DAYS = 7
+INFO_READ_MODEL_SCOPE_TOP_N = 50
+# 版本形态指纹:delta 路径发现 active 版本不是本形态时,升级为全量重建换版
+# (仿 sort_policy 自愈)。防止 delta 的窗口/封顶 prune 跑在旧 313k 行版本上
+# 做巨型 DELETE。升版本形态(改维度/窗口/帽)时必须改这个串。
+INFO_READ_MODEL_SCOPE_PROFILE = "section_category_top50_7d_v1"
 INFO_READ_MODEL_PREWARM_SCOPES_DEFAULT = 2
+INFO_READ_MODEL_PREWARM_PAGE_LIMIT_DEFAULT = 20
+INFO_READ_MODEL_PREWARM_PAGES_PER_SCOPE_DEFAULT = 1
 HIGHLIGHTS_READ_MODEL_ENV = "INFO2ACTION_HIGHLIGHTS_READ_MODEL"
 HIGHLIGHTS_READ_MODEL_REFRESH_ENV = "INFO2ACTION_HIGHLIGHTS_READ_MODEL_REFRESH"
 HIGHLIGHTS_READ_MODEL_REFRESH_TIMEOUT_MS_ENV = "INFO2ACTION_HIGHLIGHTS_READ_MODEL_REFRESH_TIMEOUT_MS"
@@ -219,6 +254,7 @@ HIGHLIGHTS_READ_MODEL_SELF_HEAL_ENV = "INFO2ACTION_HIGHLIGHTS_READ_MODEL_SELF_HE
 HIGHLIGHTS_REFRESH_SKIP_DURING_FETCH_ENV = "INFO2ACTION_HIGHLIGHTS_REFRESH_SKIP_DURING_FETCH"
 HIGHLIGHTS_VERDICT_FILTER_ENV = "INFO2ACTION_HIGHLIGHTS_VERDICT_FILTER_ENABLED"
 HIGHLIGHTS_VERDICT_FILTER_RECENT_DAYS_ENV = "INFO2ACTION_HIGHLIGHTS_VERDICT_FILTER_RECENT_DAYS"
+HIGHLIGHTS_DISPLAY_THRESHOLD_ENV = "INFO2ACTION_HIGHLIGHTS_DISPLAY_THRESHOLD"
 HIGHLIGHTS_READ_MODEL_REFRESH_TIMEOUT_MS_DEFAULT = 180000
 EVENTS_READ_MODEL_STATEMENT_TIMEOUT_MS_ENV = "INFO2ACTION_EVENTS_READ_MODEL_STATEMENT_TIMEOUT_MS"
 EVENTS_READ_MODEL_IDLE_TX_TIMEOUT_MS_ENV = "INFO2ACTION_EVENTS_READ_MODEL_IDLE_TX_TIMEOUT_MS"
@@ -235,10 +271,43 @@ CONTEXT_SEARCH_EVENTS_DEGRADED_TTL_SEC = 30
 CONTEXT_SEARCH_EVENTS_TOTAL_CAP = 1001
 REMOTE_FEED_SEARCH_TIMEOUT_MS_ENV = "INFO2ACTION_REMOTE_FEED_SEARCH_TIMEOUT_MS"
 REMOTE_FEED_SEARCH_TIMEOUT_MS_DEFAULT = 6000
+FEED_MORE_TIMEOUT_MS_ENV = "INFO2ACTION_FEED_MORE_TIMEOUT_MS"
+FEED_MORE_TIMEOUT_MS_DEFAULT = 6000
 HIGHLIGHTS_READ_MODEL_STATE_KEY = "highlights_events_v1"
 HIGHLIGHTS_READ_MODEL_VERSION = "highlights_v1"
 HIGHLIGHTS_READ_MODEL_MIN_GITHUB_STARS = 50
-HIGHLIGHTS_READ_MODEL_WINDOW_DAYS = 30
+# perf-v27 P4a: 精选热窗口 30→7 天(目标架构定稿 §0-1,用户拍板)。
+# 精选 Tab 滑到 7 天即到底;>7 天的老事件从精选消失(含仍在发酵的长尾
+# 事件——产品已认可)。翻旧精选走搜索。窗口收窄同时缩小物化/decisions
+# 同步/新鲜度探针的扫描范围。
+HIGHLIGHTS_READ_MODEL_WINDOW_DAYS = 7
+# v25.0 F-B 双因子精选分：LLM 质量（max/avg 加权 + 薄证据收缩）× ln(1+独立源数)。
+# 常量同时内插进 decisions SQL，Python 版是数值语义的参考实现（测试锚点）。
+HIGHLIGHT_SCORE_W_MAX = 0.6
+HIGHLIGHT_SCORE_W_AVG = 0.4
+HIGHLIGHT_SCORE_SHRINK_K = 1.0
+HIGHLIGHT_SCORE_PRIOR = 0.5
+HIGHLIGHT_SCORE_EVIDENCE_NORM_SOURCES = 8
+
+
+def compute_highlight_score(
+    *,
+    max_q: float | None,
+    avg_q: float | None,
+    scored_include_count: int,
+    unique_source_count: int,
+) -> float | None:
+    if not scored_include_count or max_q is None or avg_q is None:
+        return None
+    quality = HIGHLIGHT_SCORE_W_MAX * float(max_q) + HIGHLIGHT_SCORE_W_AVG * float(avg_q)
+    n = float(scored_include_count)
+    shrunk = (n * quality + HIGHLIGHT_SCORE_SHRINK_K * HIGHLIGHT_SCORE_PRIOR) / (
+        n + HIGHLIGHT_SCORE_SHRINK_K
+    )
+    evidence = math.log1p(max(int(unique_source_count or 0), 1))
+    norm = math.log1p(HIGHLIGHT_SCORE_EVIDENCE_NORM_SOURCES)
+    return round(100.0 * shrunk * evidence / norm, 2)
+ACTION_BOARD_RESULT_CACHE_TTL_ENV = "INFO2ACTION_ACTIONS_BOARD_CACHE_TTL_SEC"
 ACTION_BOARD_READ_MODEL_ENV = "INFO2ACTION_ACTION_BOARD_READ_MODEL"
 ACTION_BOARD_READ_MODEL_REFRESH_ENV = "INFO2ACTION_ACTION_BOARD_READ_MODEL_REFRESH"
 ACTION_BOARD_READ_MODEL_REFRESH_TIMEOUT_MS_ENV = "INFO2ACTION_ACTION_BOARD_READ_MODEL_REFRESH_TIMEOUT_MS"
@@ -267,12 +336,12 @@ REMOTE_CACHE_MAX_ENTRIES_ENV = "INFO2ACTION_REMOTE_CACHE_MAX_ENTRIES"
 REMOTE_CACHE_MAX_MB_ENV = "INFO2ACTION_REMOTE_CACHE_MAX_MB"
 _SNAPSHOT_WRITE_LOCK = threading.Lock()
 _SNAPSHOT_WRITES_IN_FLIGHT: set[str] = set()
-_MV_REFRESH_LOCK = threading.Lock()
-_MV_REFRESH_LAST_ATTEMPT_AT = 0.0
 _INFO_READ_MODEL_REFRESH_LOCK = threading.Lock()
 _INFO_READ_MODEL_REFRESH_LAST_ATTEMPT_AT = 0.0
+_INFO_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES = 0
 _HIGHLIGHTS_READ_MODEL_REFRESH_LOCK = threading.Lock()
 _HIGHLIGHTS_READ_MODEL_REFRESH_LAST_ATTEMPT_AT = 0.0
+_HIGHLIGHTS_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES = 0
 _HIGHLIGHTS_READ_MODEL_SELF_HEAL_LOCK = threading.Lock()
 _HIGHLIGHTS_READ_MODEL_SELF_HEAL_IN_FLIGHT = False
 _REMOTE_FEED_LIVE_CIRCUIT_LOCK = threading.Lock()
@@ -285,6 +354,16 @@ _REMOTE_STATUS_TIMEOUT_MS = 1500
 
 class RemoteDBError(RuntimeError):
     """Base class for expected remote DB adapter failures."""
+
+
+class RemoteDBTimeoutError(RemoteDBError):
+    """A query exceeded its statement_timeout.
+
+    Distinct from other RemoteDBError subclasses because callers may degrade
+    gracefully (serve stale data / empty state) instead of surfacing an error:
+    the database is reachable, this particular query was just too slow.
+    See BF-0708-3.
+    """
 
 
 class RemoteDBConfigError(RemoteDBError):
@@ -715,24 +794,106 @@ def load_source_index_remote(pg_conn: Any | None = None) -> dict[str, Any] | Non
         return None
 
 
-def list_active_sources_remote(platform: str, pg_conn: Any | None = None) -> list[dict[str, Any]]:
-    """Return active remote sources for one platform. Fail open to config fallback."""
+def list_active_sources_remote(
+    platform: str,
+    pg_conn: Any | None = None,
+    *,
+    fail_open: bool = True,
+) -> list[dict[str, Any]]:
+    """Return fetch-eligible remote sources, optionally propagating authority failures."""
     try:
         if pg_conn is None:
             with connect() as conn:
-                return list_active_sources_remote(platform, conn)
+                return list_active_sources_remote(platform, conn, fail_open=fail_open)
         import db
 
-        rows = pg_conn.execute(
-            f"""SELECT id, source_key, display_name, config_json
-                FROM {remote_schema()}.sources
-                WHERE platform=%s AND status='active'
-                ORDER BY id""",
-            (platform,),
-        ).fetchall()
+        if platform == "x_user":
+            rows = pg_conn.execute(
+                f"""SELECT id, source_key, display_name, config_json
+                    FROM {remote_schema()}.sources
+                    WHERE platform=%s AND status IN ('active', 'broken', 'not_fetched')
+                    ORDER BY id""",
+                (platform,),
+            ).fetchall()
+        else:
+            rows = pg_conn.execute(
+                f"""SELECT id, source_key, display_name, config_json
+                    FROM {remote_schema()}.sources
+                    WHERE platform=%s AND status IN ('active', 'broken')
+                    ORDER BY id""",
+                (platform,),
+            ).fetchall()
         return [db.normalize_active_source_row(row) for row in rows]
     except Exception:
-        return []
+        if fail_open:
+            return []
+        raise
+
+
+def latest_x_user_watermark_remote(
+    source_id: int | None,
+    pg_conn: Any | None = None,
+) -> str | None:
+    """Return the newest persisted tweet id for one remote X source."""
+    if source_id is None:
+        return None
+    if pg_conn is None:
+        with connect() as conn:
+            return latest_x_user_watermark_remote(source_id, pg_conn=conn)
+    row = pg_conn.execute(
+        f"""SELECT id
+              FROM {remote_schema()}.items
+             WHERE source_id = %s
+               AND platform = 'twitter'
+               AND published_at IS NOT NULL
+             ORDER BY published_at DESC NULLS LAST
+             LIMIT 1""",
+        (source_id,),
+    ).fetchone()
+    return str(row["id"]) if row is not None else None
+
+
+def upsert_source_registry_remote(
+    pg_conn: Any,
+    *,
+    platform: str,
+    source_key: str,
+    display_name: str,
+    status: str,
+    config_json: str | None,
+    origin: str,
+    now: str,
+) -> str:
+    """Upsert one remote registry source while preserving admin-owned fields."""
+    schema = remote_schema()
+    inserted = pg_conn.execute(
+        f"""INSERT INTO {schema}.sources
+              (platform, source_key, display_name, status, config_json, origin,
+               created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (platform, source_key) DO NOTHING
+            RETURNING id""",
+        (
+            platform,
+            source_key,
+            display_name,
+            status,
+            config_json,
+            origin,
+            now,
+            now,
+        ),
+    ).fetchone()
+    if inserted:
+        return "inserted"
+
+    pg_conn.execute(
+        f"""UPDATE {schema}.sources
+              SET display_name=%s, config_json=%s, updated_at=%s
+            WHERE platform=%s AND source_key=%s""",
+        (display_name, config_json, now, platform, source_key),
+    )
+    return "updated"
 
 
 def record_source_fetch_result_remote(
@@ -765,12 +926,12 @@ def record_source_fetch_result_remote(
         if row is None:
             return
         status = row["status"]
-        if status not in {"active", "broken"}:
+        if status not in {"active", "broken", "not_fetched"}:
             return
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if ok:
-            new_status = "active" if status == "broken" else status
+            new_status = "active"
             pg_conn.execute(
                 f"""UPDATE {schema}.sources
                       SET status = %s,
@@ -793,7 +954,7 @@ def record_source_fetch_result_remote(
         if threshold <= 0:
             threshold = 5
         failures = int(row["consecutive_failures"] or 0) + 1
-        new_status = "broken" if status == "active" and failures >= threshold else status
+        new_status = "broken" if failures >= threshold else status
         last_error = None if error is None else str(error)[:500]
         pg_conn.execute(
             f"""UPDATE {schema}.sources
@@ -831,18 +992,76 @@ def _env_int(env: dict[str, str], key: str, default: int, *, min_value: int = 0)
         return default
 
 
+def _info_read_model_prewarm_page_limit(env: dict[str, str] | None = None) -> int:
+    return min(
+        _env_int(
+            env or _runtime_env(),
+            INFO_READ_MODEL_PREWARM_PAGE_LIMIT_ENV,
+            INFO_READ_MODEL_PREWARM_PAGE_LIMIT_DEFAULT,
+            min_value=1,
+        ),
+        200,
+    )
+
+
+def _info_read_model_prewarm_pages_per_scope(env: dict[str, str] | None = None) -> int:
+    return min(
+        _env_int(
+            env or _runtime_env(),
+            INFO_READ_MODEL_PREWARM_PAGES_PER_SCOPE_ENV,
+            INFO_READ_MODEL_PREWARM_PAGES_PER_SCOPE_DEFAULT,
+            min_value=1,
+        ),
+        5,
+    )
+
+
+def _feed_first_paint_per_group(env: dict[str, str] | None = None) -> int:
+    # 与 routes/feed.py 的首屏每组条数同一 env/边界(默认 20,clamp 5..100)。
+    # prewarm 按此值预热 sections/platforms,才能和路由首屏请求命中同一缓存 key。
+    return min(
+        max(
+            _env_int(
+                env or _runtime_env(),
+                "INFO2ACTION_FEED_FIRST_PAINT_PER_GROUP",
+                20,
+                min_value=1,
+            ),
+            5,
+        ),
+        100,
+    )
+
+
 def _remote_cache_ttl(env: dict[str, str] | None = None) -> int:
     values = env or _runtime_env()
     return _env_int(values, REMOTE_CACHE_TTL_ENV, 180, min_value=0)
 
 
+def _feed_result_cache_ttl_sec(env: dict[str, str] | None = None) -> int:
+    values = env or _runtime_env()
+    return _env_int(values, FEED_RESULT_CACHE_TTL_ENV, 900, min_value=0)
+
+
+def _actions_board_result_cache_ttl_sec(env: dict[str, str] | None = None) -> int:
+    values = env or _runtime_env()
+    return _env_int(values, ACTION_BOARD_RESULT_CACHE_TTL_ENV, 300, min_value=0)
+
+
+def _cluster_bundle_cache_ttl_sec(env: dict[str, str] | None = None) -> int:
+    # 事件弹窗 bundle 进程缓存 TTL(可配置,默认 300s,原隐含 180s)。
+    # 事件详情/来源列表变化缓慢,适度延长减少重复打开与压力期冷读的 DB 开销。
+    return _env_int(
+        env or _runtime_env(),
+        "INFO2ACTION_CLUSTER_BUNDLE_CACHE_TTL_SEC",
+        300,
+        min_value=0,
+    )
+
+
 def _remote_snapshot_ttl(env: dict[str, str] | None = None) -> int:
     values = env or _runtime_env()
     return _env_int(values, REMOTE_SNAPSHOT_TTL_ENV, 1800, min_value=0)
-
-
-def _platform_mv_refresh_allowed(env: dict[str, str] | None = None) -> bool:
-    return _truthy((env or _runtime_env()).get(ALLOW_PLATFORM_MV_REFRESH_ENV))
 
 
 def _cache_max_entries() -> int:
@@ -1109,6 +1328,16 @@ def clear_feed_cache_keys(*, clear_remote_snapshots: bool = False) -> int:
     return removed
 
 
+def clear_actions_board_cache_keys() -> int:
+    removed = 0
+    with _CACHE_LOCK:
+        for key in list(_CACHE_TOKEN_INDEX.get("actions_board_result", ())):
+            if isinstance(key, tuple) and key and key[0] == "actions_board_result":
+                if _cache_remove_locked(key):
+                    removed += 1
+    return removed
+
+
 def _cache_key_mentions_item_id(key: tuple[Any, ...], item_id: str) -> bool:
     for elem in key:
         if str(elem) == item_id:
@@ -1326,70 +1555,30 @@ def prewarm_events_categories() -> dict[str, Any]:
     }
 
 
-def refresh_platforms_mv_if_stale(*, min_interval_sec: int = 600) -> dict[str, Any]:
-    """Refresh the platform MV at most once per process interval.
-
-    Refreshing this MV is one of the most expensive remote-db operations. The
-    platform/read prewarm path must not refresh it every cache cycle.
-    """
-    global _MV_REFRESH_LAST_ATTEMPT_AT
-    min_interval = max(0, int(min_interval_sec))
-    now = time.monotonic()
-    with _MV_REFRESH_LOCK:
-        age = now - _MV_REFRESH_LAST_ATTEMPT_AT if _MV_REFRESH_LAST_ATTEMPT_AT else None
-        if age is not None and age < min_interval:
-            return {
-                "ok": True,
-                "skipped": "recent_attempt",
-                "age_sec": round(age, 1),
-                "min_interval_sec": min_interval,
-            }
-        _MV_REFRESH_LAST_ATTEMPT_AT = now
-    return refresh_platforms_mv()
-
-
 def prewarm_platforms(
     *,
-    refresh_mv: bool | None = None,
-    refresh_min_interval_sec: int = 600,
     refresh_read_model: bool | None = None,
     refresh_read_model_min_interval_sec: int = 600,
     refresh_highlights_read_model: bool | None = None,
     refresh_highlights_read_model_min_interval_sec: int = 600,
 ) -> dict[str, Any]:
-    """BF-0515-mv-pgcron: warm up the in-process result cache for /api/feed/platforms.
+    """Warm up the in-process result cache for /api/feed/platforms.
 
     Sequence:
-      1. Optionally refresh the materialized view when explicitly requested.
-      2. Call query_feed_sections / query_feed_platforms with anonymous params
+      1. Call query_feed_sections / query_feed_platforms with anonymous params
          → populates result_cache for the 信息 tab default views.
-      3. Result cache TTL is _remote_cache_ttl() (default 180s) — long enough
-         that backend startup + next fetch_run cover the gap.
+      2. Result cache TTL is _feed_result_cache_ttl_sec() (default 900s) —
+         long enough for periodic prewarm to refresh it before expiry.
 
     Called from:
       - lifespan startup (background thread)
       - fetch.py finally block (background thread, after every fetch_run)
+
+    perf-v27 P0: platform MV(mv_items_top_per_platform)已删除——它自
+    BF-0515 起无任何读取方,每轮刷新却写 ~87GB 临时文件。
     """
     timings = {}
     t0 = time.time()
-    if refresh_mv is None:
-        refresh_mv = _truthy(_runtime_env().get(PREWARM_REFRESH_PLATFORMS_MV_ENV))
-    if refresh_mv and _platform_mv_refresh_allowed():
-        refresh_result = refresh_platforms_mv_if_stale(min_interval_sec=refresh_min_interval_sec)
-        timings['mv_refresh_ms'] = int((time.time() - t0) * 1000)
-        timings['mv_refresh_ok'] = refresh_result.get('ok', False)
-        if refresh_result.get("skipped"):
-            timings['mv_refresh_skipped_reason'] = refresh_result.get("skipped")
-    elif refresh_mv:
-        timings['mv_refresh_ms'] = 0
-        timings['mv_refresh_ok'] = False
-        timings['mv_refresh_skipped'] = True
-        timings['mv_refresh_skipped_reason'] = "platform_mv_refresh_not_allowed"
-    else:
-        timings['mv_refresh_ms'] = 0
-        timings['mv_refresh_ok'] = False
-        timings['mv_refresh_skipped'] = True
-
     t1 = time.time()
     if refresh_read_model is None:
         env = _runtime_env()
@@ -1443,8 +1632,9 @@ def prewarm_platforms(
 
     t1 = time.time()
     try:
+        # 对齐 Wave2 首屏每组条数,使 prewarm 预热的缓存条目正是路由首屏请求命中的那个。
         query_feed_sections(
-            per_category=50,
+            per_category=_feed_first_paint_per_group(),
             search=None,
             user_id=None,
             public_only=True,
@@ -1461,7 +1651,7 @@ def prewarm_platforms(
     t1 = time.time()
     try:
         query_feed_platforms(
-            per_platform=50,
+            per_platform=_feed_first_paint_per_group(),
             search=None,
             user_id=None,
             public_only=True,
@@ -1478,6 +1668,7 @@ def prewarm_platforms(
     if _info_read_model_enabled():
         try:
             env = _runtime_env()
+            # 对齐 Wave2 首屏 20 条 + A-3 已修 /more 按需,故页预热从 ~600 条降到 ~20/类,砍掉周期性 20-30s 预热与内存尖峰;prewarm 是纯后台优化,/more 仍可按需取,零功能影响。
             page_result = prewarm_info_read_model_pages(
                 max_scopes=_env_int(
                     env,
@@ -1485,6 +1676,8 @@ def prewarm_platforms(
                     INFO_READ_MODEL_PREWARM_SCOPES_DEFAULT,
                     min_value=1,
                 ),
+                page_limit=_info_read_model_prewarm_page_limit(env),
+                pages_per_scope=_info_read_model_prewarm_pages_per_scope(env),
             )
             timings['read_model_page_prewarm_ms'] = int((time.time() - t2) * 1000)
             timings['read_model_page_prewarm_ok'] = page_result.get('ok', False)
@@ -1503,65 +1696,77 @@ def prewarm_platforms(
     return timings
 
 
-def refresh_platforms_mv() -> dict[str, Any]:
-    """BF-0515-mv-pgcron: refresh mv_items_top_per_platform.
+def refresh_info_pill_counts() -> dict[str, Any]:
+    """perf-v27 P4: 每次抓取后重算各 pill 的全量计数快照(目标架构定稿 §0-6)。
 
-    Called from fetch.py finally block (after every fetch_run completes).
-    Tries CONCURRENTLY first (non-blocking, requires unique index — we have one).
-    By default it never falls back to plain REFRESH, because plain refresh takes
-    an AccessExclusive lock on the materialized view and can blank the feed while
-    readers wait. Set INFO2ACTION_ALLOW_BLOCKING_MV_REFRESH=1 only for manual
-    first-build/admin maintenance windows.
-    Returns timing + row count for logging.
+    读模型收缩到 7 天热窗口后,scopes.total_count 只反映 7 天量;而信息页
+    模块表头的「N 条」按产品决策要显示全保留期(90 天)总量。这里在
+    post-fetch 一次性 GROUP BY 出快照落表,读路径只查小表——绝不在请求时
+    对大表实时 count(count(*) 是本库的经典性能陷阱)。
+    当前只算 section_category(信息默认页表头);其余 pill 维度按需扩展。
     """
+    if not remote_authority_enabled():
+        return {"ok": True, "skipped": "not_remote"}
     schema = remote_schema()
+    section_category_expr = _section_category_expr("i")
+    where, params = _base_item_where(
+        public_only=True,
+        manual_owner_user_id=None,
+        min_github_stars=INFO_READ_MODEL_MIN_GITHUB_STARS,
+    )
+    where.append("i.visible = 1")
+    _add_ai_relevance_filter(where)
+    where_sql = _where_sql(where)
     t0 = time.time()
-    with connect() as conn:
-        old_autocommit = getattr(conn, "autocommit", None)
-        try:
-            try:
-                conn.autocommit = True
-            except Exception:
-                pass
-            try:
-                conn.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {schema}.mv_items_top_per_platform")
-                mode = "concurrent"
-            except Exception as exc:
-                _rollback_safely(conn)
-                if not _truthy(_runtime_env().get(ALLOW_BLOCKING_MV_REFRESH_ENV)):
-                    return {
-                        "ok": False,
-                        "mode": "concurrent",
-                        "blocking_skipped": True,
-                        "error": str(exc)[:200],
-                        "elapsed_ms": int((time.time() - t0) * 1000),
-                    }
-                try:
-                    conn.execute(f"REFRESH MATERIALIZED VIEW {schema}.mv_items_top_per_platform")
-                    mode = "blocking"
-                except Exception as exc:
-                    _rollback_safely(conn)
-                    return {"ok": False, "error": str(exc)[:200]}
-            row = conn.execute(f"SELECT count(*) AS n FROM {schema}.mv_items_top_per_platform").fetchone()
-        finally:
-            try:
-                if old_autocommit is not None:
-                    conn.autocommit = old_autocommit
-            except Exception:
-                pass
-    # invalidate the cached "platforms response" so next request re-aggregates
-    with _CACHE_LOCK:
-        for prefix in (
-            "feed_platforms_result",
-            "feed_sections_result",
-            "feed_sections_counts",
-            "platform_counts",
-            "platform_category_counts",
-        ):
-            for k in list(_CACHE_TOKEN_INDEX.get(prefix, ())):
-                if isinstance(k, tuple) and k and k[0] == prefix:
-                    _cache_remove_locked(k)
-    return {"ok": True, "mode": mode, "rows": int(row.get("n") or 0), "elapsed_ms": int((time.time() - t0) * 1000)}
+    try:
+        with connect() as conn:
+            _set_short_statement_timeout(conn, 30000)
+            conn.execute(
+                f"""CREATE TABLE IF NOT EXISTS {schema}.info_pill_counts (
+                       kind text NOT NULL,
+                       value text NOT NULL,
+                       n integer NOT NULL,
+                       computed_at timestamptz NOT NULL DEFAULT now(),
+                       PRIMARY KEY (kind, value)
+                     )"""
+            )
+            conn.execute(
+                f"""WITH counts AS (
+                       SELECT {section_category_expr} AS value, count(*)::integer AS n
+                         FROM {schema}.items i
+                         {where_sql}
+                        GROUP BY 1
+                     ),
+                     upserted AS (
+                       INSERT INTO {schema}.info_pill_counts (kind, value, n, computed_at)
+                       SELECT 'section_category', value, n, now() FROM counts
+                       ON CONFLICT (kind, value) DO UPDATE SET
+                         n = excluded.n,
+                         computed_at = excluded.computed_at
+                       RETURNING value
+                     )
+                     DELETE FROM {schema}.info_pill_counts pc
+                      WHERE pc.kind = 'section_category'
+                        AND pc.value NOT IN (SELECT value FROM upserted)""",
+                params,
+            )
+            _commit_safely(conn)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200], "elapsed_ms": int((time.time() - t0) * 1000)}
+    return {"ok": True, "elapsed_ms": int((time.time() - t0) * 1000)}
+
+
+def _info_pill_counts_overlay(conn: Any, schema: str, kind: str) -> dict[str, int]:
+    """读取计数快照;快照缺席/失败时返回空 dict(调用方回退到 scopes 计数)。"""
+    try:
+        rows = conn.execute(
+            f"SELECT value, n FROM {schema}.info_pill_counts WHERE kind = %(kind)s",
+            {"kind": kind},
+        ).fetchall()
+    except Exception:
+        _rollback_safely(conn)
+        return {}
+    return {str(r["value"]): int(r["n"]) for r in (dict(row) for row in rows) if r.get("value")}
 
 
 def _info_read_model_freshness(
@@ -1625,7 +1830,6 @@ def info_read_model_freshness_remote(
         "state_key": INFO_READ_MODEL_STATE_KEY,
         "data_backend": feed_read_backend(),
         "incremental_enabled": _info_read_model_incremental_enabled(),
-        "live_overlay_enabled": _info_live_overlay_enabled(),
     }
     if not enabled:
         return result
@@ -1688,64 +1892,15 @@ def _prune_info_read_model_versions(
 
 
 def _info_read_model_scope_rows_select(source_table: str) -> str:
+    # perf-v27 P4: 只保留 section_category 维度(信息默认页 = 每模块「全部」
+    # pill 首屏)。原 5 维度乘法式物化(all/source/group/category×2)全部下线,
+    # 对应视图改走 live 现场查——查询路由的既有 None→live 回退自动接管。
+    # (ENG-0710 砍 section_subcategory/group_source 的延续与收口。)
     return f"""WITH raw_scope_rows AS (
-                      SELECT i.platform, 'all'::text AS dimension, ''::text AS value,
-                             i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                        FROM {source_table} i
-                      UNION ALL
-                      SELECT i.platform, 'source'::text AS dimension, COALESCE(i.source, '') AS value,
-                             i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                        FROM {source_table} i
-                       WHERE COALESCE(i.source, '') != ''
-                      UNION ALL
-                      SELECT i.platform, 'group'::text AS dimension,
-                             CASE
-                               WHEN COALESCE(i.detail_json ->> 'group', '') IN ('', '未分组', '独立频道')
-                               THEN '未分组'
-                               ELSE i.detail_json ->> 'group'
-                             END AS value,
-                             i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                        FROM {source_table} i
-                       WHERE i.platform = 'lingowhale'
-                      UNION ALL
-                      SELECT i.platform, 'group_source'::text AS dimension,
-                             (CASE
-                                WHEN COALESCE(i.detail_json ->> 'group', '') IN ('', '未分组', '独立频道')
-                                THEN '未分组'
-                                ELSE i.detail_json ->> 'group'
-                              END) || %(compound_separator)s || COALESCE(i.source, '') AS value,
-                             i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                        FROM {source_table} i
-                       WHERE i.platform = 'lingowhale'
-                         AND COALESCE(i.source, '') != ''
-                      UNION ALL
-                      SELECT i.platform, 'category'::text AS dimension, cat.value AS value,
-                             i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                        FROM {source_table} i
-                        CROSS JOIN LATERAL jsonb_array_elements_text(i.ai_categories) AS cat(value)
-                       WHERE i.ai_categories IS NOT NULL
-                      UNION ALL
-                      SELECT i.platform, 'category'::text AS dimension,
-                             CASE
-                               WHEN i.ai_category IS NOT NULL AND i.ai_category != 'other'
-                               THEN i.ai_category
-                               ELSE %(uncategorized)s
-                             END AS value,
-                             i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                        FROM {source_table} i
-                       WHERE i.ai_categories IS NULL
-                      UNION ALL
                       SELECT '_all'::text AS platform, 'section_category'::text AS dimension,
                              i.section_category AS value,
                              i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
                         FROM {source_table} i
-                      UNION ALL
-                      SELECT '_all'::text AS platform, 'section_subcategory'::text AS dimension,
-                             i.section_category || %(compound_separator)s || subcat.value AS value,
-                             i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                        FROM {source_table} i
-                        CROSS JOIN LATERAL jsonb_array_elements_text(i.ai_subcategories) AS subcat(value)
-                       WHERE i.ai_subcategories IS NOT NULL
                    )
             SELECT 'platform=' || platform || '|dimension=' || dimension || '|value=' || value AS scope_key,
                    platform, dimension, value, item_id, sort_at, fetched_at, relevance_score,
@@ -1936,25 +2091,164 @@ def migrate_info_read_model_sort_policy() -> dict[str, Any]:
     }
 
 
+def _info_read_model_delta_window_hours(env: dict[str, str] | None = None) -> int:
+    return _env_int(
+        env if env is not None else _runtime_env(),
+        INFO_READ_MODEL_DELTA_WINDOW_HOURS_ENV,
+        INFO_READ_MODEL_DELTA_WINDOW_HOURS_DEFAULT,
+        min_value=1,
+    )
+
+
+def _delta_window_bounds(min_start: Any, now_ts: Any, window_hours: int) -> tuple[Any, bool]:
+    """一轮追赶窗口的上界:min(min_start+窗口, now)。触到 now 即视为追平。"""
+    window_end = min_start + timedelta(hours=int(window_hours))
+    if now_ts is not None and window_end >= now_ts:
+        return now_ts, True
+    return window_end, False
+
+
 def refresh_info_read_model_delta_in_place(
     *,
     sample_limit: int = 200,
     min_github_stars: int = INFO_READ_MODEL_MIN_GITHUB_STARS,
 ) -> dict[str, Any]:
-    """Apply new info items to the active read model without cloning all rows."""
+    """Apply new info items to the active read model without cloning all rows.
+
+    BF-0710-1: delta 按时间窗分轮追赶。每轮一个独立事务、独立提交,失败只丢当轮;
+    statement_timeout 随剩余墙钟预算收缩,预算耗尽带已提交进度收官(caught_up=False),
+    由下一次调度接力。长积压不再是一条全有或全无的巨型 SQL。
+    """
     if not _info_read_model_enabled():
         return {"ok": True, "skipped": "disabled"}
     schema = remote_schema()
     safe_sample_limit = max(50, min(int(sample_limit or 200), 1000))
     safe_min_github_stars = int(min_github_stars)
+    t0 = time.time()
+    timings_ms: dict[str, int] = {}
+    refresh_timeout_ms = _env_int(
+        _runtime_env(),
+        INFO_READ_MODEL_REFRESH_TIMEOUT_MS_ENV,
+        INFO_READ_MODEL_REFRESH_TIMEOUT_MS_DEFAULT,
+        min_value=60000,
+    )
+    window_hours = _info_read_model_delta_window_hours()
+
+    step_t0 = time.time()
+    with connect() as conn:
+        _set_short_statement_timeout(conn, refresh_timeout_ms)
+        active = _info_read_model_active_version(conn, schema)
+    if not active or not active.get("version_id") or not active.get("max_fetched_at"):
+        return refresh_info_read_model(
+            sample_limit=safe_sample_limit,
+            min_github_stars=safe_min_github_stars,
+        )
+    active_meta = _json_value(active.get("meta_json"))
+    if not isinstance(active_meta, dict) or active_meta.get("sort_policy") != INFO_READ_MODEL_SORT_POLICY:
+        return refresh_info_read_model(
+            sample_limit=safe_sample_limit,
+            min_github_stars=safe_min_github_stars,
+        )
+    # perf-v27 P4: 版本形态自愈——active 版本还是旧乘法式形态(全维度/无窗口/
+    # 无帽)时直接全量重建换版,绝不在 313k 行旧版本上跑 delta 的 prune。
+    if active_meta.get("scope_profile") != INFO_READ_MODEL_SCOPE_PROFILE:
+        return refresh_info_read_model(
+            sample_limit=safe_sample_limit,
+            min_github_stars=safe_min_github_stars,
+        )
+    active_version_id = str(active["version_id"])
+    current_watermark = active["max_fetched_at"]
+    timings_ms["read_active_version"] = int((time.time() - step_t0) * 1000)
+
+    deadline = t0 + refresh_timeout_ms / 1000.0
+    rounds = 0
+    total_delta = 0
+    caught_up = False
+    budget_exhausted = False
+    max_rounds_hit = False
+    while True:
+        remaining_ms = int((deadline - time.time()) * 1000)
+        if rounds and remaining_ms <= _INFO_READ_MODEL_DELTA_ROUND_FLOOR_MS:
+            budget_exhausted = True
+            break
+        round_result = _refresh_info_read_model_delta_round(
+            schema=schema,
+            active_version_id=active_version_id,
+            watermark=current_watermark,
+            min_github_stars=safe_min_github_stars,
+            window_hours=window_hours,
+            statement_timeout_ms=min(refresh_timeout_ms, max(remaining_ms, 60000)),
+        )
+        for step, ms in (round_result.get("timings_ms") or {}).items():
+            timings_ms[step] = timings_ms.get(step, 0) + ms
+        if round_result.get("status") == "no_delta":
+            caught_up = True
+            if not rounds:
+                return {
+                    "ok": True,
+                    "skipped": "no_delta",
+                    "active_version_id": active_version_id,
+                    "active_max_fetched_at": _timestamp_value(current_watermark),
+                    "elapsed_ms": int((time.time() - t0) * 1000),
+                    "timings_ms": timings_ms,
+                }
+            break
+        rounds += 1
+        total_delta += int(round_result.get("delta_items") or 0)
+        current_watermark = round_result.get("max_fetched_at") or current_watermark
+        if round_result.get("reached_now"):
+            caught_up = True
+            break
+        if rounds >= _INFO_READ_MODEL_DELTA_MAX_ROUNDS:
+            max_rounds_hit = True
+            break
+    if total_delta > 0:
+        clear_feed_cache_keys()
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": "delta_in_place",
+        "version_id": active_version_id,
+        "delta_items": total_delta,
+        "rounds": rounds,
+        "caught_up": caught_up,
+        "window_hours": window_hours,
+        "active_max_fetched_at": _timestamp_value(current_watermark),
+        "sample_limit": safe_sample_limit,
+        "elapsed_ms": int((time.time() - t0) * 1000),
+        "timings_ms": timings_ms,
+    }
+    # 有界收官不是失败,但要在结果里说清什么没做完(交给下一次调度接力)。
+    if budget_exhausted:
+        result["budget_exhausted"] = True
+    if max_rounds_hit:
+        result["max_rounds_hit"] = True
+    return result
+
+
+def _refresh_info_read_model_delta_round(
+    *,
+    schema: str,
+    active_version_id: str,
+    watermark: Any,
+    min_github_stars: int,
+    window_hours: int,
+    statement_timeout_ms: int,
+) -> dict[str, Any]:
+    """One bounded catch-up round over (watermark, min_start+window] in a single tx.
+
+    水位(update_active_version)只推进到本轮实际物化的 max(fetched_at),
+    绝不推到窗口上界;空窗口不动水位(宁可少推进不可越过,P0-1 checkpoint 语义)。
+    """
     where, params = _base_item_where(
         public_only=True,
         manual_owner_user_id=None,
-        min_github_stars=safe_min_github_stars,
+        min_github_stars=int(min_github_stars),
     )
     where.append("i.visible = 1")
     _add_ai_relevance_filter(where)
     where.append("i.fetched_at > %(active_max_fetched_at)s::timestamptz")
+    probe_where_sql = _where_sql(where)
+    where.append("i.fetched_at <= %(delta_window_end)s::timestamptz")
     where_sql = _where_sql(where)
     section_category_expr = _section_category_expr("i")
     delta_select_sql = f"""
@@ -1971,49 +2265,45 @@ def refresh_info_read_model_delta_in_place(
                          FROM {schema}.items i
                          {where_sql}
                      """
-    t0 = time.time()
     timings_ms: dict[str, int] = {}
     current_step = "init"
-    refresh_timeout_ms = _env_int(
-        _runtime_env(),
-        INFO_READ_MODEL_REFRESH_TIMEOUT_MS_ENV,
-        INFO_READ_MODEL_REFRESH_TIMEOUT_MS_DEFAULT,
-        min_value=60000,
-    )
 
     def _record_step(step: str, started_at: float) -> None:
-        timings_ms[step] = int((time.time() - started_at) * 1000)
-
-    current_step = "read_active_version"
-    step_t0 = time.time()
-    with connect() as conn:
-        _set_short_statement_timeout(conn, refresh_timeout_ms)
-        active = _info_read_model_active_version(conn, schema)
-    if not active or not active.get("version_id") or not active.get("max_fetched_at"):
-        return refresh_info_read_model(
-            sample_limit=safe_sample_limit,
-            min_github_stars=safe_min_github_stars,
-        )
-    active_meta = _json_value(active.get("meta_json"))
-    if not isinstance(active_meta, dict) or active_meta.get("sort_policy") != INFO_READ_MODEL_SORT_POLICY:
-        return refresh_info_read_model(
-            sample_limit=safe_sample_limit,
-            min_github_stars=safe_min_github_stars,
-        )
-    active_version_id = str(active["version_id"])
-    active_max_fetched_at = active["max_fetched_at"]
-    _record_step(current_step, step_t0)
+        timings_ms[step] = timings_ms.get(step, 0) + int((time.time() - started_at) * 1000)
 
     with connect() as conn:
         try:
-            _set_short_statement_timeout(conn, refresh_timeout_ms)
+            _set_short_statement_timeout(conn, statement_timeout_ms)
+            current_step = "probe_delta_window"
+            step_t0 = time.time()
+            probe = conn.execute(
+                f"""SELECT i.fetched_at AS min_start, now() AS now_ts
+                      FROM {schema}.items i
+                      {probe_where_sql}
+                     ORDER BY i.fetched_at ASC
+                     LIMIT 1""",
+                {**params, "active_max_fetched_at": watermark},
+            ).fetchone()
+            min_start = (probe or {}).get("min_start")
+            now_ts = (probe or {}).get("now_ts")
+            if min_start is None:
+                conn.commit()
+                _record_step(current_step, step_t0)
+                return {"status": "no_delta", "timings_ms": timings_ms}
+            delta_window_end, reached_now = _delta_window_bounds(min_start, now_ts, window_hours)
+            _record_step(current_step, step_t0)
+
             current_step = "materialize_delta"
             step_t0 = time.time()
             conn.execute("DROP TABLE IF EXISTS pg_temp.info_read_model_delta")
             conn.execute(
                 f"""CREATE TEMP TABLE info_read_model_delta ON COMMIT DROP AS
                     {delta_select_sql}""",
-                {**params, "active_max_fetched_at": active_max_fetched_at},
+                {
+                    **params,
+                    "active_max_fetched_at": watermark,
+                    "delta_window_end": delta_window_end,
+                },
             )
             conn.execute("ANALYZE pg_temp.info_read_model_delta")
             delta_row = conn.execute(
@@ -2021,15 +2311,10 @@ def refresh_info_read_model_delta_in_place(
             ).fetchone()
             delta_count = int((delta_row or {}).get("n") or 0)
             if delta_count <= 0:
+                # 竞态兜底:探针可见但物化为空 —— 当无增量处理,水位不动。
                 conn.commit()
-                return {
-                    "ok": True,
-                    "skipped": "no_delta",
-                    "active_version_id": active_version_id,
-                    "active_max_fetched_at": _timestamp_value(active_max_fetched_at),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                    "timings_ms": timings_ms,
-                }
+                _record_step(current_step, step_t0)
+                return {"status": "no_delta", "timings_ms": timings_ms}
             delta_max_fetched_at = (delta_row or {}).get("max_fetched_at")
             _record_step(current_step, step_t0)
 
@@ -2057,11 +2342,9 @@ def refresh_info_read_model_delta_in_place(
                               'metrics_json', i.metrics_json,
                               'lang', i.lang,
                               'description', i.description,
-                              'ai_summary', i.ai_summary,
+                              'ai_summary', left(i.ai_summary, 280),
                               'ai_category', i.ai_category,
-                              'ai_keywords', i.ai_keywords,
                               'ai_categories', i.ai_categories,
-                              'ai_subcategories', i.ai_subcategories,
                               'content_type', i.content_type,
                               'visible', i.visible,
                               'relevance_score', i.relevance_score,
@@ -2300,6 +2583,52 @@ def refresh_info_read_model_delta_in_place(
             )
             _record_step(current_step, step_t0)
 
+            # perf-v27 P4: 收口热窗口与封顶——delta 只增不减,不修剪的话
+            # in-place 版本会随时间越出 7 天窗口/每 scope TOP_N 帽。
+            # 在封顶后的小表(~700 行)上这三条 DELETE 均为瞬时。
+            current_step = "prune_window_and_cap"
+            step_t0 = time.time()
+            conn.execute(
+                f"""DELETE FROM {schema}.info_scope_items
+                     WHERE version_id = %(active_version_id)s::uuid
+                       AND fetched_at < now() - (%(info_window_days)s::int * interval '1 day')""",
+                {
+                    "active_version_id": active_version_id,
+                    "info_window_days": INFO_READ_MODEL_WINDOW_DAYS,
+                },
+            )
+            conn.execute(
+                f"""DELETE FROM {schema}.info_scope_items si
+                     USING (
+                       SELECT scope_key, item_id,
+                              row_number() OVER (
+                                PARTITION BY scope_key
+                                ORDER BY {_info_scope_item_order_sql("inner_si")}
+                              ) AS rn
+                         FROM {schema}.info_scope_items inner_si
+                        WHERE inner_si.version_id = %(active_version_id)s::uuid
+                     ) overflow
+                     WHERE si.version_id = %(active_version_id)s::uuid
+                       AND si.scope_key = overflow.scope_key
+                       AND si.item_id = overflow.item_id
+                       AND overflow.rn > %(scope_top_n)s""",
+                {
+                    "active_version_id": active_version_id,
+                    "scope_top_n": INFO_READ_MODEL_SCOPE_TOP_N,
+                },
+            )
+            conn.execute(
+                f"""DELETE FROM {schema}.info_card_items ci
+                     WHERE ci.version_id = %(active_version_id)s::uuid
+                       AND NOT EXISTS (
+                         SELECT 1 FROM {schema}.info_scope_items si
+                          WHERE si.version_id = ci.version_id
+                            AND si.item_id = ci.item_id
+                       )""",
+                {"active_version_id": active_version_id},
+            )
+            _record_step(current_step, step_t0)
+
             current_step = "update_active_version"
             step_t0 = time.time()
             conn.execute(
@@ -2345,55 +2674,79 @@ def refresh_info_read_model_delta_in_place(
         except Exception as exc:
             _rollback_safely(conn)
             raise RemoteDBError(f"info read model in-place delta refresh failed at {current_step}: {exc}") from exc
-    clear_feed_cache_keys()
     return {
-        "ok": True,
-        "mode": "delta_in_place",
-        "version_id": active_version_id,
+        "status": "applied",
         "delta_items": delta_count,
-        "active_max_fetched_at": _timestamp_value(delta_max_fetched_at),
-        "sample_limit": safe_sample_limit,
-        "elapsed_ms": int((time.time() - t0) * 1000),
+        "max_fetched_at": delta_max_fetched_at,
+        "reached_now": reached_now,
         "timings_ms": timings_ms,
     }
 
 
+def _info_read_model_refresh_effective_interval(min_interval_sec: int, consecutive_failures: int) -> int:
+    """BF-0710-1 失败指数退避:min_interval × 2^连续失败次数,封顶 2h。
+
+    无退避的固定间隔重试是把偶发拥塞滚成死循环的发动机(BF-0708 系列 P0):
+    刷新失败→回滚→10min 后面对同样(略多)的 delta 原样重来,期间把库 IO 吃满。
+    BF-0710-7 起同时服务 info / highlights / platforms-MV 三处 *_if_stale 守卫。
+    """
+    if consecutive_failures <= 0:
+        return min_interval_sec
+    cap = max(int(min_interval_sec), INFO_READ_MODEL_REFRESH_BACKOFF_CAP_SEC)
+    return int(min(min_interval_sec * (2 ** min(consecutive_failures, 16)), cap))
+
+
 def refresh_info_read_model_if_stale(*, min_interval_sec: int = 600) -> dict[str, Any]:
-    global _INFO_READ_MODEL_REFRESH_LAST_ATTEMPT_AT
+    global _INFO_READ_MODEL_REFRESH_LAST_ATTEMPT_AT, _INFO_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES
     if not _info_read_model_enabled():
         return {"ok": True, "skipped": "disabled"}
     min_interval = max(0, int(min_interval_sec))
     now = time.monotonic()
     with _INFO_READ_MODEL_REFRESH_LOCK:
+        failures = _INFO_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES
+        effective_interval = _info_read_model_refresh_effective_interval(min_interval, failures)
         age = now - _INFO_READ_MODEL_REFRESH_LAST_ATTEMPT_AT if _INFO_READ_MODEL_REFRESH_LAST_ATTEMPT_AT else None
-        if age is not None and age < min_interval:
-            return {
+        if age is not None and age < effective_interval:
+            skipped: dict[str, Any] = {
                 "ok": True,
                 "skipped": "recent_attempt",
                 "age_sec": round(age, 1),
                 "min_interval_sec": min_interval,
             }
+            if failures:
+                skipped["consecutive_failures"] = failures
+                skipped["effective_interval_sec"] = effective_interval
+            return skipped
         _INFO_READ_MODEL_REFRESH_LAST_ATTEMPT_AT = now
-    schema = remote_schema()
-    with connect() as conn:
-        _set_short_statement_timeout(conn, 15000)
-        freshness = _info_read_model_freshness(conn, schema=schema)
-    if not freshness.get("stale"):
-        return {
-            "ok": True,
-            "skipped": "data_fresh",
-            **freshness,
-        }
-    if freshness.get("sort_policy_stale"):
-        migration_result = migrate_info_read_model_sort_policy()
-        if freshness.get("data_stale") and _info_read_model_incremental_enabled():
-            incremental_result = refresh_info_read_model_delta_in_place()
-            incremental_result["sort_policy_migration"] = migration_result
-            return incremental_result
-        return migration_result
-    if _info_read_model_incremental_enabled():
-        return refresh_info_read_model_delta_in_place()
-    return refresh_info_read_model()
+    try:
+        schema = remote_schema()
+        with connect() as conn:
+            _set_short_statement_timeout(conn, 15000)
+            freshness = _info_read_model_freshness(conn, schema=schema)
+        if not freshness.get("stale"):
+            result: dict[str, Any] = {
+                "ok": True,
+                "skipped": "data_fresh",
+                **freshness,
+            }
+        elif freshness.get("sort_policy_stale"):
+            migration_result = migrate_info_read_model_sort_policy()
+            if freshness.get("data_stale") and _info_read_model_incremental_enabled():
+                result = refresh_info_read_model_delta_in_place()
+                result["sort_policy_migration"] = migration_result
+            else:
+                result = migration_result
+        elif _info_read_model_incremental_enabled():
+            result = refresh_info_read_model_delta_in_place()
+        else:
+            result = refresh_info_read_model()
+    except Exception:
+        with _INFO_READ_MODEL_REFRESH_LOCK:
+            _INFO_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES += 1
+        raise
+    with _INFO_READ_MODEL_REFRESH_LOCK:
+        _INFO_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES = 0
+    return result
 
 
 def refresh_info_read_model_incremental(
@@ -2466,6 +2819,13 @@ def refresh_info_read_model_incremental(
         )
     active_meta = _json_value(active.get("meta_json"))
     if not isinstance(active_meta, dict) or active_meta.get("sort_policy") != INFO_READ_MODEL_SORT_POLICY:
+        return refresh_info_read_model(
+            sample_limit=safe_sample_limit,
+            min_github_stars=safe_min_github_stars,
+        )
+    # perf-v27 P4: 版本形态自愈——active 版本还是旧乘法式形态(全维度/无窗口/
+    # 无帽)时直接全量重建换版,绝不在 313k 行旧版本上跑 delta 的 prune。
+    if active_meta.get("scope_profile") != INFO_READ_MODEL_SCOPE_PROFILE:
         return refresh_info_read_model(
             sample_limit=safe_sample_limit,
             min_github_stars=safe_min_github_stars,
@@ -2582,11 +2942,9 @@ def refresh_info_read_model_incremental(
                               'metrics_json', i.metrics_json,
                               'lang', i.lang,
                               'description', i.description,
-                              'ai_summary', i.ai_summary,
+                              'ai_summary', left(i.ai_summary, 280),
                               'ai_category', i.ai_category,
-                              'ai_keywords', i.ai_keywords,
                               'ai_categories', i.ai_categories,
-                              'ai_subcategories', i.ai_subcategories,
                               'content_type', i.content_type,
                               'visible', i.visible,
                               'relevance_score', i.relevance_score,
@@ -2864,6 +3222,10 @@ def refresh_info_read_model(*, sample_limit: int = 200, min_github_stars: int = 
         min_github_stars=safe_min_github_stars,
     )
     where.append("i.visible = 1")
+    # perf-v27 P4: 热窗口 7 天——读模型只物化近 7 天内容(冷数据走 live/搜索)。
+    # eligible 集从全量 visible(~70k)缩到一周量级,是本次物化瘦身的分母杠杆。
+    where.append("i.fetched_at > now() - (%(info_window_days)s::int * interval '1 day')")
+    params["info_window_days"] = INFO_READ_MODEL_WINDOW_DAYS
     _add_ai_relevance_filter(where)
     where_sql = _where_sql(where)
     section_category_expr = _section_category_expr("i")
@@ -2919,6 +3281,7 @@ def refresh_info_read_model(*, sample_limit: int = 200, min_github_stars: int = 
                     "meta_json": json.dumps({
                         "min_github_stars": safe_min_github_stars,
                         "sort_policy": INFO_READ_MODEL_SORT_POLICY,
+                        "scope_profile": INFO_READ_MODEL_SCOPE_PROFILE,
                     }),
                 },
             )
@@ -2959,11 +3322,9 @@ def refresh_info_read_model(*, sample_limit: int = 200, min_github_stars: int = 
                               'metrics_json', i.metrics_json,
                               'lang', i.lang,
                               'description', i.description,
-                              'ai_summary', i.ai_summary,
+                              'ai_summary', left(i.ai_summary, 280),
                               'ai_category', i.ai_category,
-                              'ai_keywords', i.ai_keywords,
                               'ai_categories', i.ai_categories,
-                              'ai_subcategories', i.ai_subcategories,
                               'content_type', i.content_type,
                               'visible', i.visible,
                               'relevance_score', i.relevance_score,
@@ -2988,71 +3349,11 @@ def refresh_info_read_model(*, sample_limit: int = 200, min_github_stars: int = 
             current_step = "materialize_scope_rows"
             step_t0 = time.time()
             conn.execute("DROP TABLE IF EXISTS pg_temp.info_read_model_scope_rows")
+            # perf-v27 P4: 内联 UNION 副本改走共享 helper——ENG-0710 时内联副本
+            # 差点漏砍的教训;单一事实源后砍维度只改 helper 一处。
             conn.execute(
                 f"""CREATE TEMP TABLE info_read_model_scope_rows ON COMMIT DROP AS
-                    WITH raw_scope_rows AS (
-                              SELECT i.platform, 'all'::text AS dimension, ''::text AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                              UNION ALL
-                              SELECT i.platform, 'source'::text AS dimension, COALESCE(i.source, '') AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                               WHERE COALESCE(i.source, '') != ''
-                              UNION ALL
-                              SELECT i.platform, 'group'::text AS dimension,
-                                     CASE
-                                       WHEN COALESCE(i.detail_json ->> 'group', '') IN ('', '未分组', '独立频道')
-                                       THEN '未分组'
-                                       ELSE i.detail_json ->> 'group'
-                                     END AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                               WHERE i.platform = 'lingowhale'
-                              UNION ALL
-                              SELECT i.platform, 'group_source'::text AS dimension,
-                                     (CASE
-                                        WHEN COALESCE(i.detail_json ->> 'group', '') IN ('', '未分组', '独立频道')
-                                        THEN '未分组'
-                                        ELSE i.detail_json ->> 'group'
-                                      END) || %(compound_separator)s || COALESCE(i.source, '') AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                               WHERE i.platform = 'lingowhale'
-                                 AND COALESCE(i.source, '') != ''
-                              UNION ALL
-                              SELECT i.platform, 'category'::text AS dimension, cat.value AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                                CROSS JOIN LATERAL jsonb_array_elements_text(i.ai_categories) AS cat(value)
-                               WHERE i.ai_categories IS NOT NULL
-                              UNION ALL
-                              SELECT i.platform, 'category'::text AS dimension,
-                                     CASE
-                                       WHEN i.ai_category IS NOT NULL AND i.ai_category != 'other'
-                                       THEN i.ai_category
-                                       ELSE %(uncategorized)s
-                                     END AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                               WHERE i.ai_categories IS NULL
-                              UNION ALL
-                              SELECT '_all'::text AS platform, 'section_category'::text AS dimension,
-                                     i.section_category AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                              UNION ALL
-                              SELECT '_all'::text AS platform, 'section_subcategory'::text AS dimension,
-                                     i.section_category || %(compound_separator)s || subcat.value AS value,
-                                     i.id::text AS item_id, i.sort_at, i.fetched_at, i.relevance_score
-                                FROM pg_temp.info_read_model_eligible i
-                                CROSS JOIN LATERAL jsonb_array_elements_text(i.ai_subcategories) AS subcat(value)
-                               WHERE i.ai_subcategories IS NOT NULL
-                            )
-                    SELECT 'platform=' || platform || '|dimension=' || dimension || '|value=' || value AS scope_key,
-                           platform, dimension, value, item_id, sort_at, fetched_at, relevance_score,
-                           sort_at AS rank_at
-                      FROM raw_scope_rows""",
+                    {_info_read_model_scope_rows_select("pg_temp.info_read_model_eligible")}""",
                 {
                     "uncategorized": UNCATEGORIZED_SENTINEL,
                     "compound_separator": INFO_SCOPE_COMPOUND_SEPARATOR,
@@ -3099,8 +3400,9 @@ def refresh_info_read_model(*, sample_limit: int = 200, min_github_stars: int = 
                      )
                      SELECT %(version_id)s::uuid, scope_key, rn::integer, item_id,
                             sort_at, fetched_at, relevance_score
-                       FROM ranked""",
-                {"version_id": version_id},
+                       FROM ranked
+                      WHERE rn <= %(scope_top_n)s""",
+                {"version_id": version_id, "scope_top_n": INFO_READ_MODEL_SCOPE_TOP_N},
             )
             _record_step(current_step, step_t0)
             current_step = "complete_version"
@@ -3208,6 +3510,83 @@ def _highlights_verdict_filter_recent_days(env: dict[str, str] | None = None) ->
     return _env_int(env or _runtime_env(), HIGHLIGHTS_VERDICT_FILTER_RECENT_DAYS_ENV, 0, min_value=0)
 
 
+def _highlights_display_threshold(env: dict[str, str] | None = None) -> float | None:
+    values = _runtime_env() if env is None else env
+    raw = (values.get(HIGHLIGHTS_DISPLAY_THRESHOLD_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        threshold = float(raw)
+    except (TypeError, ValueError):
+        threshold = math.nan
+    if not math.isfinite(threshold):
+        logging.getLogger(__name__).warning(
+            "%s=%r is invalid; highlights display gate disabled",
+            HIGHLIGHTS_DISPLAY_THRESHOLD_ENV,
+            raw,
+        )
+        return None
+    return threshold
+
+
+def _highlights_display_cluster_condition(
+    schema: str,
+    cluster_alias: str,
+    *,
+    threshold: float | None,
+) -> str:
+    """Return the single production/admin predicate for cluster display."""
+    manual_hide = f"""EXISTS (
+        SELECT 1
+          FROM {schema}.highlight_cluster_decisions hcd
+         WHERE hcd.cluster_id = {cluster_alias}.id
+           AND hcd.manual_display = 'force_hide'
+      )"""
+    if threshold is None:
+        return f"(NOT {manual_hide})"
+    threshold_sql = repr(float(threshold))
+    return f"""(
+      NOT {manual_hide}
+      AND {cluster_alias}.why_read IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+          FROM {schema}.highlight_cluster_decisions hcd
+         WHERE hcd.cluster_id = {cluster_alias}.id
+           AND (
+             hcd.manual_display = 'force_show'
+             OR (hcd.score_inputs->>'max_flag_score10')::float >= {threshold_sql}
+           )
+      )
+    )"""
+
+
+def _highlights_display_cluster_filter(
+    schema: str,
+    cluster_alias: str,
+    *,
+    threshold: float | None,
+) -> str:
+    condition = _highlights_display_cluster_condition(
+        schema,
+        cluster_alias,
+        threshold=threshold,
+    )
+    return f"\n      AND {condition}\n    "
+
+
+def _highlights_summary_cluster_filter(schema: str, cluster_alias: str) -> str:
+    """Return the production summary-gate predicate shared with admin audit views."""
+    return f"""
+      EXISTS (
+        SELECT 1
+          FROM {schema}.highlight_cluster_decisions d
+         WHERE d.cluster_id = {cluster_alias}.id
+           AND d.decision = 'included'
+           AND d.cluster_verdict IN ('featured', 'positive_borderline')
+      )
+    """.strip()
+
+
 def _highlights_verdict_cluster_filter(
     schema: str,
     cluster_alias: str,
@@ -3216,13 +3595,12 @@ def _highlights_verdict_cluster_filter(
     if not _highlights_verdict_filter_enabled(env):
         return ""
     recent_days = _highlights_verdict_filter_recent_days(env)
-    include_filter = f"""EXISTS (
-        SELECT 1
-          FROM {schema}.cluster_items hci
-          JOIN {schema}.items hi ON hi.id = hci.item_id
-         WHERE hci.cluster_id = {cluster_alias}.id
-           AND hi.highlight_include_in_highlights IS TRUE
-      )"""
+    # perf-v27 P1: 改读簇级预计算表 highlight_cluster_decisions(PK join)。
+    # 旧形态对窗口内每簇现场做 cluster_items JOIN items 的 EXISTS,在生产实测
+    # 把物化拖到 24-93s(BF-0711-1 饱和事故根因);新形态生产实测 0.02s。
+    # decisions 行由 _sync_highlight_cluster_decisions 在每次刷新内先行增量维护
+    # (全量/delta 两路径均已保证 sync 先于 scope 物化),窗口覆盖率生产核验 0 缺失。
+    include_filter = _highlights_summary_cluster_filter(schema, cluster_alias)
     if recent_days > 0:
         cluster_sort_expr = (
             f"COALESCE({cluster_alias}.last_doc_at, {cluster_alias}.first_doc_at, "
@@ -3456,6 +3834,7 @@ def _sync_highlight_cluster_decisions(
                       i.highlight_uncertainty,
                       i.highlight_include_in_highlights,
                       i.highlight_reason,
+                      i.highlight_scores,
                       i.highlight_prompt_version,
                       i.highlight_model,
                       i.highlight_last_error,
@@ -3506,6 +3885,40 @@ def _sync_highlight_cluster_decisions(
                       ) AS rn
                  FROM members
              ),
+             quality AS (
+               -- v25.0 F-B 质量因子：include 成员三核心维度分归一（importance+substance+novelty）/9
+               SELECT cluster_id,
+                      count(*) AS scored_include_count,
+                      max(item_q) AS max_q,
+                      avg(item_q) AS avg_q,
+                      max((highlight_scores->'v26'->>'score10')::numeric) AS max_flag_score10
+                 FROM (
+                   SELECT cluster_id,
+                          highlight_scores,
+                          COALESCE(
+                            (highlight_scores->'v26'->>'score10')::numeric / 10.0,
+                            (
+                              (highlight_scores->>'importance')::numeric
+                            + (highlight_scores->>'substance')::numeric
+                            + (highlight_scores->>'novelty')::numeric
+                            ) / 9.0
+                          ) AS item_q
+                     FROM members
+                    WHERE highlight_include_in_highlights IS TRUE
+                      AND (
+                            (
+                              highlight_scores ? 'importance'
+                              AND highlight_scores ? 'substance'
+                              AND highlight_scores ? 'novelty'
+                            )
+                            OR (
+                              highlight_scores ? 'v26'
+                              AND highlight_scores->'v26'->>'score10' IS NOT NULL
+                            )
+                          )
+                 ) scored
+                GROUP BY cluster_id
+             ),
              decisions AS (
                SELECT vc.cluster_id,
                       CASE
@@ -3525,6 +3938,37 @@ def _sync_highlight_cluster_decisions(
                       COALESCE(c.verdict_counts_json, '{{}}'::jsonb) AS verdict_counts_json,
                       bm.highlight_prompt_version AS prompt_version,
                       bm.highlight_model AS model,
+                      CASE
+                        WHEN COALESCE(c.has_include, false) AND COALESCE(q.scored_include_count, 0) > 0 THEN
+                          round((
+                            (
+                              (q.scored_include_count * ({HIGHLIGHT_SCORE_W_MAX} * q.max_q + {HIGHLIGHT_SCORE_W_AVG} * q.avg_q)
+                               + {HIGHLIGHT_SCORE_SHRINK_K} * {HIGHLIGHT_SCORE_PRIOR})
+                              / (q.scored_include_count + {HIGHLIGHT_SCORE_SHRINK_K})
+                            )
+                            * ln(1 + GREATEST(COALESCE(vc.unique_source_count, 1), 1))
+                            / ln(1 + {HIGHLIGHT_SCORE_EVIDENCE_NORM_SOURCES})
+                            * 100
+                          )::numeric, 2)
+                        ELSE NULL
+                      END AS highlight_score,
+                      NULLIF(
+                        (
+                          CASE
+                            WHEN COALESCE(c.has_include, false) AND COALESCE(q.scored_include_count, 0) > 0 THEN
+                              jsonb_build_object(
+                                'max_q', round(q.max_q::numeric, 4),
+                                'avg_q', round(q.avg_q::numeric, 4),
+                                'scored_include_count', q.scored_include_count,
+                                'unique_source_count', COALESCE(vc.unique_source_count, 0)
+                              )
+                            ELSE '{{}}'::jsonb
+                          END
+                        ) || jsonb_strip_nulls(jsonb_build_object(
+                          'max_flag_score10', q.max_flag_score10
+                        )),
+                        '{{}}'::jsonb
+                      ) AS score_inputs,
                       jsonb_strip_nulls(jsonb_build_object(
                         'cluster_id', vc.cluster_id,
                         'ai_title', vc.ai_title,
@@ -3538,15 +3982,18 @@ def _sync_highlight_cluster_decisions(
                       )) AS snapshot_json
                  FROM visible_clusters vc
                  LEFT JOIN counts c ON c.cluster_id = vc.cluster_id
+                 LEFT JOIN quality q ON q.cluster_id = vc.cluster_id
                  LEFT JOIN best_member bm ON bm.cluster_id = vc.cluster_id AND bm.rn = 1
              )
              INSERT INTO {schema}.highlight_cluster_decisions AS target (
                cluster_id, decision, cluster_verdict, deciding_item_id,
                reason, verdict_counts_json, prompt_version, model,
+               highlight_score, score_inputs,
                decided_at, updated_at, snapshot_json
              )
              SELECT cluster_id, decision, cluster_verdict, deciding_item_id,
                     reason, verdict_counts_json, prompt_version, model,
+                    highlight_score, score_inputs,
                     now(), now(), snapshot_json
                FROM decisions
              ON CONFLICT (cluster_id) DO UPDATE SET
@@ -3557,6 +4004,8 @@ def _sync_highlight_cluster_decisions(
                verdict_counts_json = excluded.verdict_counts_json,
                prompt_version = excluded.prompt_version,
                model = excluded.model,
+               highlight_score = excluded.highlight_score,
+               score_inputs = excluded.score_inputs,
                decided_at = excluded.decided_at,
                updated_at = excluded.updated_at,
                snapshot_json = excluded.snapshot_json
@@ -3567,6 +4016,8 @@ def _sync_highlight_cluster_decisions(
                 OR target.verdict_counts_json IS DISTINCT FROM excluded.verdict_counts_json
                 OR target.prompt_version IS DISTINCT FROM excluded.prompt_version
                 OR target.model IS DISTINCT FROM excluded.model
+                OR target.highlight_score IS DISTINCT FROM excluded.highlight_score
+                OR target.score_inputs IS DISTINCT FROM excluded.score_inputs
                 OR target.snapshot_json IS DISTINCT FROM excluded.snapshot_json""",
         params,
     )
@@ -3586,6 +4037,11 @@ def refresh_highlights_read_model_delta_in_place(
     public_filter = _public_cluster_filter(schema, "c")
     github_filter = _github_display_filter(schema, safe_min_github_stars, "c")
     verdict_filter = _highlights_verdict_cluster_filter(schema, "c")
+    display_filter = _highlights_display_cluster_filter(
+        schema,
+        "c",
+        threshold=_highlights_display_threshold(),
+    )
     category_expr = _highlights_category_sql("i")
     category_priority = _highlights_category_priority_sql("category")
     active_categories = [category_id for category_id in ACTIVE_CATEGORY_IDS if category_id != "other"]
@@ -3692,6 +4148,7 @@ def refresh_highlights_read_model_delta_in_place(
                           {public_filter}
                           {github_filter}
                           {verdict_filter}
+                          {display_filter}
                      ),
                      source_members AS (
                        SELECT ci.cluster_id,
@@ -4128,7 +4585,7 @@ def refresh_highlights_read_model_delta_in_place(
 
 
 def refresh_highlights_read_model_if_stale(*, min_interval_sec: int = 600) -> dict[str, Any]:
-    global _HIGHLIGHTS_READ_MODEL_REFRESH_LAST_ATTEMPT_AT
+    global _HIGHLIGHTS_READ_MODEL_REFRESH_LAST_ATTEMPT_AT, _HIGHLIGHTS_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES
     if not _highlights_read_model_enabled():
         return {"ok": True, "skipped": "disabled"}
     # P-C insurance: never refresh the highlights read model while a fetch run is
@@ -4149,22 +4606,37 @@ def refresh_highlights_read_model_if_stale(*, min_interval_sec: int = 600) -> di
     min_interval = max(0, int(min_interval_sec))
     now = time.monotonic()
     with _HIGHLIGHTS_READ_MODEL_REFRESH_LOCK:
+        failures = _HIGHLIGHTS_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES
+        effective_interval = _info_read_model_refresh_effective_interval(min_interval, failures)
         age = (
             now - _HIGHLIGHTS_READ_MODEL_REFRESH_LAST_ATTEMPT_AT
             if _HIGHLIGHTS_READ_MODEL_REFRESH_LAST_ATTEMPT_AT
             else None
         )
-        if age is not None and age < min_interval:
-            return {
+        if age is not None and age < effective_interval:
+            skipped: dict[str, Any] = {
                 "ok": True,
                 "skipped": "recent_attempt",
                 "age_sec": round(age, 1),
                 "min_interval_sec": min_interval,
             }
+            if failures:
+                skipped["consecutive_failures"] = failures
+                skipped["effective_interval_sec"] = effective_interval
+            return skipped
         _HIGHLIGHTS_READ_MODEL_REFRESH_LAST_ATTEMPT_AT = now
-    if _highlights_read_model_incremental_enabled():
-        return refresh_highlights_read_model_delta_in_place()
-    return refresh_highlights_read_model()
+    try:
+        if _highlights_read_model_incremental_enabled():
+            result = refresh_highlights_read_model_delta_in_place()
+        else:
+            result = refresh_highlights_read_model()
+    except Exception:
+        with _HIGHLIGHTS_READ_MODEL_REFRESH_LOCK:
+            _HIGHLIGHTS_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES += 1
+        raise
+    with _HIGHLIGHTS_READ_MODEL_REFRESH_LOCK:
+        _HIGHLIGHTS_READ_MODEL_REFRESH_CONSECUTIVE_FAILURES = 0
+    return result
 
 
 def _highlights_sort_tuple(row: dict[str, Any] | None) -> tuple[float, int]:
@@ -4188,6 +4660,11 @@ def highlights_read_model_freshness(
     schema = remote_schema()
     public_filter = _public_cluster_filter(schema, "c")
     github_filter = _github_display_filter(schema, int(min_github_stars), "c")
+    display_filter = _highlights_display_cluster_filter(
+        schema,
+        "c",
+        threshold=_highlights_display_threshold(),
+    )
     with connect() as conn:
         _set_short_statement_timeout(conn, 2500)
         try:
@@ -4231,6 +4708,7 @@ def highlights_read_model_freshness(
                    AND c.last_updated_at > now() - (%(window_days)s::int * interval '1 day')
                    {public_filter}
                    {github_filter}
+                   {display_filter}
                  ORDER BY sort_at DESC NULLS LAST,
                           c.id DESC
                  LIMIT 1""",
@@ -4282,6 +4760,11 @@ def refresh_highlights_read_model(
     public_filter = _public_cluster_filter(schema, "c")
     github_filter = _github_display_filter(schema, safe_min_github_stars, "c")
     verdict_filter = _highlights_verdict_cluster_filter(schema, "c")
+    display_filter = _highlights_display_cluster_filter(
+        schema,
+        "c",
+        threshold=_highlights_display_threshold(),
+    )
     category_expr = _highlights_category_sql("i")
     category_priority = _highlights_category_priority_sql("category")
     active_categories = [category_id for category_id in ACTIVE_CATEGORY_IDS if category_id != "other"]
@@ -4319,6 +4802,7 @@ def refresh_highlights_read_model(
                           {public_filter}
                           {github_filter}
                           {verdict_filter}
+                          {display_filter}
                      ),
                      source_members AS (
                        SELECT ci.cluster_id,
@@ -4480,6 +4964,15 @@ def refresh_highlights_read_model(
                      )""",
                 params,
             )
+            # perf-v27 P1: decisions 同步必须先于 scope 物化——verdict_filter 现在
+            # 读 highlight_cluster_decisions,若 sync 在后,本轮新打分的簇会被旧
+            # 决策行漏掉一个刷新周期。(delta 路径原本就是 sync 在前,此处对齐。)
+            _sync_highlight_cluster_decisions(
+                conn,
+                schema,
+                window_days=safe_window_days,
+                min_github_stars=safe_min_github_stars,
+            )
             conn.execute(
                 f"""{scope_cte}
                      INSERT INTO {schema}.highlights_scopes (
@@ -4543,12 +5036,6 @@ def refresh_highlights_read_model(
                        updated_at = excluded.updated_at""",
                 params,
             )
-            _sync_highlight_cluster_decisions(
-                conn,
-                schema,
-                window_days=safe_window_days,
-                min_github_stars=safe_min_github_stars,
-            )
             scope_item_row = conn.execute(
                 f"""SELECT count(*) AS n
                       FROM {schema}.highlights_scope_items
@@ -4596,6 +5083,22 @@ def refresh_highlights_read_model(
         "min_github_stars": safe_min_github_stars,
         "elapsed_ms": int((time.time() - t0) * 1000),
     }
+
+
+def _feed_events_timeout_ms(env: dict[str, str] | None = None) -> int:
+    """statement_timeout for the /api/feed/events read path (BF-0708-3).
+
+    Default 30s: above the observed 21.4s cold query, far below Cloudflare's
+    ~100s cutoff. Clamped to the ceiling so a misconfigured env cannot bring
+    back the 524 white-screen.
+    """
+    value = _env_int(
+        env if env is not None else _runtime_env(),
+        FEED_EVENTS_TIMEOUT_MS_ENV,
+        _FEED_EVENTS_TIMEOUT_DEFAULT_MS,
+        min_value=1000,
+    )
+    return min(value, _FEED_EVENTS_TIMEOUT_CEILING_MS)
 
 
 def _set_short_statement_timeout(conn: Any, timeout_ms: int = _REMOTE_STATUS_TIMEOUT_MS) -> None:
@@ -4665,6 +5168,15 @@ def _remote_feed_search_timeout_ms() -> int:
     )
 
 
+def _feed_more_timeout_ms(env: dict[str, str] | None = None) -> int:
+    return _env_int(
+        env or _runtime_env(),
+        FEED_MORE_TIMEOUT_MS_ENV,
+        FEED_MORE_TIMEOUT_MS_DEFAULT,
+        min_value=1000,
+    )
+
+
 def _remote_actions_board_timeout_ms() -> int:
     return _env_int(_runtime_env(), REMOTE_ACTIONS_BOARD_TIMEOUT_MS_ENV, 4500, min_value=500)
 
@@ -4689,12 +5201,21 @@ def set_cluster_write_statement_timeout(conn: Any) -> None:
     _set_short_statement_timeout(conn, _remote_cluster_write_timeout_ms())
 
 
+def _remote_feed_live_runtime_circuit_open() -> bool:
+    """仅运行时熔断窗(live 刚失败后的保护期),不含 env 级 LIVE_DISABLED。
+
+    ENG-0710 降维瘦身:section_subcategory 视图不再物化、只能走 live,
+    env 级关闭对它不适用,但熔断窗必须尊重——live 失败后别继续锤库。
+    """
+    with _REMOTE_FEED_LIVE_CIRCUIT_LOCK:
+        return time.monotonic() < _REMOTE_FEED_LIVE_CIRCUIT_OPEN_UNTIL
+
+
 def _remote_feed_live_circuit_open() -> bool:
     env = _runtime_env()
     if _truthy(env.get(REMOTE_FEED_LIVE_DISABLED_ENV)):
         return True
-    with _REMOTE_FEED_LIVE_CIRCUIT_LOCK:
-        return time.monotonic() < _REMOTE_FEED_LIVE_CIRCUIT_OPEN_UNTIL
+    return _remote_feed_live_runtime_circuit_open()
 
 
 def _mark_remote_feed_live_circuit_open() -> None:
@@ -4705,26 +5226,6 @@ def _mark_remote_feed_live_circuit_open() -> None:
             _REMOTE_FEED_LIVE_CIRCUIT_OPEN_UNTIL,
             time.monotonic() + hold_sec,
         )
-
-
-def _platforms_mv_available(conn: Any, schema: str) -> bool:
-    """BF-0515-mv-pgcron: detect whether mv_items_top_per_platform exists.
-    Cached 5 min so we don't query pg_catalog on every request."""
-    cache_key = ("platforms_mv_available", schema)
-    cached = _cache_get_with_ttl(cache_key, 300)
-    if cached is not None:
-        return bool(cached)
-    try:
-        row = conn.execute(
-            "select to_regclass(%s) as name",
-            (f"{schema}.mv_items_top_per_platform",),
-        ).fetchone()
-        available = bool(row and row.get("name"))
-    except Exception:
-        _rollback_safely(conn)
-        available = False
-    _cache_set_with_ttl(cache_key, available, 300)
-    return available
 
 
 def _mark_stale_payload(payload: Any, *, source: str) -> Any:
@@ -4828,9 +5329,11 @@ def _events_snapshot_key(
     enabled: bool,
     categories: list[str] | None,
     timezone_offset_minutes: int = _DEFAULT_TIMELINE_TIMEZONE_OFFSET_MINUTES,
+    display_threshold: float | None = None,
 ) -> str:
     cats = ",".join(sorted(categories or []))
     tz_offset = _timezone_offset_minutes(timezone_offset_minutes)
+    display = "off" if display_threshold is None else repr(float(display_threshold))
     return (
         "events:v4:"
         f"limit={int(limit)}:"
@@ -4838,6 +5341,7 @@ def _events_snapshot_key(
         f"stars={int(min_github_stars)}:"
         f"enabled={int(bool(enabled))}:"
         f"tz={tz_offset}:"
+        f"display={display}:"
         f"cats={cats}"
     )
 
@@ -4850,15 +5354,18 @@ def _feed_events_local_cache_name(
     enabled: bool,
     categories: list[str] | None,
     timezone_offset_minutes: int = _DEFAULT_TIMELINE_TIMEZONE_OFFSET_MINUTES,
+    display_threshold: float | None = None,
 ) -> str:
     cats = ",".join(sorted(categories or []))
     tz_offset = _timezone_offset_minutes(timezone_offset_minutes)
+    display = "off" if display_threshold is None else repr(float(display_threshold))
     return (
         f"feed_events_limit={int(limit)}_"
         f"public={int(bool(public_only))}_"
         f"stars={int(min_github_stars)}_"
         f"enabled={int(bool(enabled))}_"
         f"tz={tz_offset}_"
+        f"display={display}_"
         f"cats={cats}"
     )
 
@@ -4915,12 +5422,24 @@ def _get_pool(psycopg_module: Any, dict_row: Any) -> Any | None:
         max_size = _env_int(env, REMOTE_DB_POOL_MAX_ENV, 8, min_value=max(1, min_size))
         timeout = _env_int(env, REMOTE_DB_POOL_TIMEOUT_ENV, 2, min_value=1)
         connect_timeout = _env_int(env, REMOTE_DB_CONNECT_TIMEOUT_ENV, 2, min_value=1)
+        max_idle = _env_int(env, REMOTE_DB_POOL_MAX_IDLE_ENV, 120, min_value=10)
         _POOL = ConnectionPool(
             conninfo=dsn,
             min_size=min_size,
             max_size=max_size,
             timeout=float(timeout),
             open=True,
+            # check runs a liveness probe before handing a connection to the caller.
+            # The Supabase transaction pooler (port 6543) silently recycles idle
+            # server-side connections; without this probe the pool hands out a dead
+            # connection and the first query fails with EDBHANDLEREXITED. Only the
+            # 30-minute /api/auth/refresh path stayed idle long enough to hit it,
+            # which is why it alone returned 500. See BF-0708-1.
+            check=ConnectionPool.check_connection,
+            # Retire connections above min_size before the pooler's idle window
+            # closes them. min_size connections stay resident, so `check` above
+            # remains the load-bearing guard, not this.
+            max_idle=float(max_idle),
             # prepare_threshold=None disables psycopg's prepared-statement cache,
             # required by Supabase transaction-mode pooler (port 6543) which does
             # not preserve session state between checkouts. See BF-0515-1.
@@ -5116,6 +5635,20 @@ def fetch_run_heartbeat_grace_seconds() -> int:
         FETCH_RUN_HEARTBEAT_GRACE_SEC_ENV,
         600,
         min_value=60,
+    )
+
+
+def fetch_run_runtime_stale_grace_seconds() -> int:
+    """运行时判活/孤儿回收的心跳容忍窗口(见 env 常量注释)。
+
+    下限钉在基础 grace 之上,保证运行时窗口不会比重启恢复窗口更激进。
+    """
+    base = fetch_run_heartbeat_grace_seconds()
+    return _env_int(
+        _runtime_env(),
+        FETCH_RUN_RUNTIME_STALE_GRACE_SEC_ENV,
+        max(1800, base),
+        min_value=base,
     )
 
 
@@ -6512,6 +7045,775 @@ def admin_console_summary_remote(*, now: datetime | None = None) -> dict[str, An
     }
 
 
+_ADMIN_HIGHLIGHTS_FUNNEL_VIEWS = {"panorama", "anomaly"}
+_ADMIN_HIGHLIGHTS_FUNNEL_DISPLAYS = {"all", "shown", "hidden"}
+_ADMIN_HIGHLIGHTS_FUNNEL_STAGES = {
+    "",
+    "pending",
+    "displayed",
+    "blocked_scoring",
+    "blocked_summary",
+    "blocked_display",
+}
+_ADMIN_HIGHLIGHTS_FUNNEL_TIMEOUT_MS = 15_000
+
+
+def _admin_highlights_funnel_days(days: int) -> int:
+    safe_days = int(days)
+    if safe_days not in {1, 3, 7}:
+        raise ValueError("days must be 1, 3, or 7")
+    return safe_days
+
+
+def _admin_highlights_funnel_query(q: str | None) -> tuple[str, str]:
+    query = str(q or "").strip()[:200]
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return query, f"%{escaped}%"
+
+
+def _admin_highlights_funnel_tag(tag: str | None) -> str:
+    safe_tag = canonicalize_category(str(tag or "").strip()) or ""
+    if safe_tag and safe_tag not in {*ACTIVE_CATEGORY_IDS, "other"}:
+        raise ValueError("unsupported funnel tag")
+    return safe_tag
+
+
+def _admin_highlights_tag_filter(alias: str) -> str:
+    return f"(%(tag)s = '' OR {alias}.dominant_category = %(tag)s)"
+
+
+def _admin_highlights_funnel_ctes(
+    schema: str,
+    *,
+    display_threshold: float | None,
+) -> str:
+    verdict_filter = _highlights_verdict_cluster_filter(schema, "c")
+    display_filter = _highlights_display_cluster_filter(
+        schema,
+        "c",
+        threshold=display_threshold,
+    )
+    public_filter = _public_cluster_filter(schema, "c")
+    github_filter = _github_display_filter(
+        schema,
+        HIGHLIGHTS_READ_MODEL_MIN_GITHUB_STARS,
+        "c",
+    )
+    category_sql = """/* aliases mirror src/category_taxonomy.py */
+                      CASE lower(BTRIM(split_part(COALESCE(i.ai_category, ''), '[', 1)))
+                        WHEN 'ai_tools' THEN 'efficiency_tools'
+                        WHEN 'tools' THEN 'efficiency_tools'
+                        WHEN 'insights' THEN 'tech'
+                        ELSE lower(BTRIM(split_part(COALESCE(i.ai_category, ''), '[', 1)))
+                      END"""
+    actionable_error_filter = """i.highlight_last_error IS NOT NULL
+                              AND (
+                                i.highlight_error_count >= 3
+                                OR i.highlight_retry_after IS NULL
+                                OR i.highlight_retry_after <= now()
+                              )"""
+    tag_filter = _admin_highlights_tag_filter("s")
+    if display_threshold is None:
+        blocked_display_reason = """CASE
+                     WHEN d.manual_display = 'force_hide' THEN 'manual_hide'
+                     ELSE COALESCE(NULLIF(d.reason, ''), 'below_threshold')
+                   END"""
+    else:
+        threshold_sql = repr(float(display_threshold))
+        blocked_display_reason = f"""CASE
+                     WHEN d.manual_display = 'force_hide' THEN 'manual_hide'
+                     WHEN c.why_read IS NULL
+                      AND (
+                        d.manual_display = 'force_show'
+                        OR NULLIF(d.score_inputs->>'max_flag_score10', '')::numeric >= {threshold_sql}
+                      ) THEN 'awaiting_why_read'
+                     WHEN NULLIF(d.score_inputs->>'max_flag_score10', '')::numeric IS NULL
+                       OR NULLIF(d.score_inputs->>'max_flag_score10', '')::numeric < {threshold_sql}
+                       THEN 'below_threshold'
+                     WHEN c.why_read IS NULL THEN 'awaiting_why_read'
+                     ELSE COALESCE(NULLIF(d.reason, ''), 'below_threshold')
+                   END"""
+    return f"""WITH window_items AS (
+                   SELECT i.id,
+                          i.fetched_at,
+                          i.title,
+                          i.url,
+                          i.platform,
+                          i.source,
+                          i.author_name,
+                          i.ai_category,
+                          i.cluster_id,
+                          i.highlight_scores,
+                          i.highlight_uncertainty,
+                          i.highlight_reason,
+                          i.highlight_verdict,
+                          i.highlight_last_error,
+                          i.highlight_error_count,
+                          i.highlight_retry_after,
+                          i.highlight_scored_at,
+                          c.ai_title AS cluster_title
+                     FROM {schema}.items i
+                     LEFT JOIN {schema}.clusters c ON c.id = i.cluster_id
+                    WHERE i.fetched_at >= now() - (%(days)s::int * interval '1 day')
+                 ),
+                 matching_cluster_ids AS (
+                   SELECT DISTINCT i.cluster_id
+                     FROM window_items i
+                    WHERE i.cluster_id IS NOT NULL
+                      AND (
+                        %(query)s = ''
+                        OR i.title ILIKE %(search_pattern)s ESCAPE '\\'
+                        OR i.cluster_title ILIKE %(search_pattern)s ESCAPE '\\'
+                      )
+                 ),
+                 selected_window_items AS (
+                   SELECT i.*
+                     FROM window_items i
+                    WHERE %(query)s = ''
+                       OR EXISTS (
+                         SELECT 1
+                           FROM matching_cluster_ids matched
+                          WHERE matched.cluster_id = i.cluster_id
+                       )
+                 ),
+                 terminal_items AS (
+                   SELECT *
+                     FROM selected_window_items i
+                    WHERE i.highlight_verdict IS NOT NULL
+                 ),
+                 scored_items AS (
+                   SELECT *
+                     FROM terminal_items i
+                    WHERE i.highlight_verdict <> 'drop'
+                 ),
+                 clustered_cluster_ids AS (
+                   SELECT DISTINCT cluster_id
+                     FROM scored_items
+                    WHERE cluster_id IS NOT NULL
+                 ),
+                 clustered_clusters AS (
+                   SELECT ids.cluster_id,
+                          MAX(i.fetched_at) AS latest_at
+                     FROM clustered_cluster_ids ids
+                     JOIN selected_window_items i ON i.cluster_id = ids.cluster_id
+                    GROUP BY ids.cluster_id
+                 ),
+                 all_window_cluster_ids AS (
+                   SELECT i.cluster_id,
+                          MAX(i.fetched_at) AS latest_at,
+                          COUNT(*)::int AS member_count,
+                          COUNT(*) FILTER (WHERE i.highlight_verdict IS NOT NULL)::int
+                            AS terminal_count,
+                          COUNT(*) FILTER (WHERE i.highlight_verdict = 'drop')::int
+                            AS drop_count,
+                          COUNT(*) FILTER (
+                            WHERE {actionable_error_filter}
+                          )::int AS error_member_count,
+                          BOOL_OR(i.highlight_verdict = 'drop') AS has_drop_member
+                     FROM selected_window_items i
+                    WHERE i.cluster_id IS NOT NULL
+                    GROUP BY i.cluster_id
+                 ),
+                 summarized_clusters AS (
+                   SELECT cc.cluster_id,
+                          cc.latest_at
+                     FROM clustered_clusters cc
+                     JOIN {schema}.clusters c ON c.id = cc.cluster_id
+                    WHERE c.is_visible_in_feed = true
+                      AND c.published_at IS NOT NULL
+                      AND COALESCE(c.archived, false) = false
+                      AND c.merged_into IS NULL
+                      AND NULLIF(BTRIM(c.ai_title), '') IS NOT NULL
+                      AND NULLIF(BTRIM(c.ai_summary), '') IS NOT NULL
+                      {verdict_filter}
+                      {public_filter}
+                      {github_filter}
+                 ),
+                 displayed_clusters AS (
+                   SELECT sc.cluster_id,
+                          sc.latest_at
+                     FROM summarized_clusters sc
+                     JOIN {schema}.clusters c ON c.id = sc.cluster_id
+                    WHERE true
+                      {display_filter}
+                 ),
+                 category_votes AS (
+                   SELECT i.cluster_id,
+                          {category_sql} AS category_id,
+                          COUNT(*)::int AS votes
+                     FROM selected_window_items i
+                    WHERE i.cluster_id IS NOT NULL
+                    GROUP BY i.cluster_id, {category_sql}
+                 ),
+                 dominant_categories AS (
+                   SELECT DISTINCT ON (cv.cluster_id)
+                          cv.cluster_id,
+                          cv.category_id
+                     FROM category_votes cv
+                    WHERE cv.category_id NOT IN ('', 'other')
+                    ORDER BY cv.cluster_id, cv.votes DESC, cv.category_id ASC
+                 ),
+                 panorama_clusters AS (
+                   SELECT aw.cluster_id,
+                          aw.latest_at,
+                          COALESCE(dc.category_id, 'other') AS dominant_category,
+                          aw.has_drop_member,
+                          CASE
+                            WHEN aw.terminal_count = 0 THEN 'pending'
+                            WHEN shown.cluster_id IS NOT NULL THEN 'displayed'
+                            WHEN summarized.cluster_id IS NOT NULL THEN 'blocked_display'
+                            WHEN clustered.cluster_id IS NOT NULL THEN 'blocked_summary'
+                            WHEN aw.terminal_count = aw.drop_count
+                             AND aw.terminal_count > 0 THEN 'blocked_scoring'
+                            ELSE 'blocked_summary'
+                          END AS stage,
+                          CASE
+                            WHEN aw.terminal_count = 0 THEN 'pending_scoring'
+                            WHEN shown.cluster_id IS NOT NULL THEN NULL::text
+                            WHEN summarized.cluster_id IS NOT NULL THEN {blocked_display_reason}
+                            WHEN clustered.cluster_id IS NOT NULL
+                              THEN COALESCE(NULLIF(d.reason, ''), 'summary_gate_filtered')
+                            WHEN aw.terminal_count = aw.drop_count
+                             AND aw.terminal_count > 0 THEN 'all_members_dropped'
+                            ELSE COALESCE(NULLIF(d.reason, ''), 'summary_gate_filtered')
+                          END AS blocked_reason,
+                          (shown.cluster_id IS NOT NULL) AS displayed
+                     FROM all_window_cluster_ids aw
+                     JOIN {schema}.clusters c ON c.id = aw.cluster_id
+                     LEFT JOIN clustered_clusters clustered
+                       ON clustered.cluster_id = aw.cluster_id
+                     LEFT JOIN summarized_clusters summarized
+                       ON summarized.cluster_id = aw.cluster_id
+                     LEFT JOIN displayed_clusters shown
+                       ON shown.cluster_id = aw.cluster_id
+                     LEFT JOIN {schema}.highlight_cluster_decisions d
+                       ON d.cluster_id = aw.cluster_id
+                     LEFT JOIN dominant_categories dc
+                       ON dc.cluster_id = aw.cluster_id
+                    WHERE NOT (
+                      aw.terminal_count = 0
+                      AND aw.error_member_count > 0
+                    )
+                 ),
+                 anomaly_items AS (
+                   SELECT i.id,
+                          i.fetched_at,
+                          i.title,
+                          i.url,
+                          i.cluster_id,
+                          i.highlight_scores,
+                          i.highlight_uncertainty,
+                          i.highlight_reason,
+                          i.highlight_verdict,
+                          i.highlight_last_error,
+                          i.highlight_error_count,
+                          i.highlight_retry_after,
+                          i.highlight_scored_at,
+                          i.cluster_title,
+                          CASE
+                            WHEN i.highlight_last_error IS NOT NULL THEN 'scoring'
+                            ELSE 'clustering'
+                          END AS stuck_at,
+                          CASE
+                            WHEN i.highlight_last_error IS NOT NULL
+                              THEN LEFT(i.highlight_last_error, 500)
+                            ELSE 'scored item was not clustered within 30 minutes'
+                          END AS error_summary
+                     FROM window_items i
+                    WHERE (
+                      %(query)s = ''
+                      OR i.title ILIKE %(search_pattern)s ESCAPE '\\'
+                      OR i.cluster_title ILIKE %(search_pattern)s ESCAPE '\\'
+                    )
+                      AND (
+                        (
+                          {actionable_error_filter}
+                        )
+                        OR (
+                          i.highlight_verdict <> 'drop'
+                          AND i.cluster_id IS NULL
+                          AND i.highlight_scored_at <= now() - interval '30 minutes'
+                        )
+                      )
+                 ),
+                 funnel_cluster_ids AS (
+                   SELECT s.cluster_id
+                     FROM panorama_clusters s
+                    WHERE {tag_filter}
+                 ),
+                 funnel_terminal_items AS (
+                   SELECT i.*
+                     FROM terminal_items i
+                    WHERE %(tag)s = ''
+                       OR EXISTS (
+                         SELECT 1
+                           FROM funnel_cluster_ids tagged
+                          WHERE tagged.cluster_id = i.cluster_id
+                       )
+                 ),
+                 funnel_scored_items AS (
+                   SELECT i.*
+                     FROM scored_items i
+                    WHERE %(tag)s = ''
+                       OR EXISTS (
+                         SELECT 1
+                           FROM funnel_cluster_ids tagged
+                          WHERE tagged.cluster_id = i.cluster_id
+                       )
+                 ),
+                 funnel_clustered_clusters AS (
+                   SELECT c.*
+                     FROM clustered_clusters c
+                    WHERE %(tag)s = ''
+                       OR EXISTS (
+                         SELECT 1
+                           FROM funnel_cluster_ids tagged
+                          WHERE tagged.cluster_id = c.cluster_id
+                       )
+                 ),
+                 funnel_summarized_clusters AS (
+                   SELECT c.*
+                     FROM summarized_clusters c
+                    WHERE %(tag)s = ''
+                       OR EXISTS (
+                         SELECT 1
+                           FROM funnel_cluster_ids tagged
+                          WHERE tagged.cluster_id = c.cluster_id
+                       )
+                 ),
+                 funnel_displayed_clusters AS (
+                   SELECT c.*
+                     FROM displayed_clusters c
+                    WHERE %(tag)s = ''
+                       OR EXISTS (
+                         SELECT 1
+                           FROM funnel_cluster_ids tagged
+                          WHERE tagged.cluster_id = c.cluster_id
+                       )
+                 )"""
+
+
+def _admin_highlights_funnel_params(
+    *,
+    days: int,
+    q: str | None,
+    tag: str | None = "",
+) -> dict[str, Any]:
+    query, search_pattern = _admin_highlights_funnel_query(q)
+    return {
+        "days": _admin_highlights_funnel_days(days),
+        "query": query,
+        "search_pattern": search_pattern,
+        "tag": _admin_highlights_funnel_tag(tag),
+        "verdict_recent_days": _highlights_verdict_filter_recent_days(),
+    }
+
+
+def query_admin_highlights_funnel_remote(
+    *,
+    days: int = 1,
+    q: str = "",
+    tag: str = "",
+) -> dict[str, Any]:
+    """Return the five audit stations and three exact adjacent-set differences."""
+    schema = remote_schema()
+    display_threshold = _highlights_display_threshold()
+    params = _admin_highlights_funnel_params(days=days, q=q, tag=tag)
+    ctes = _admin_highlights_funnel_ctes(
+        schema,
+        display_threshold=display_threshold,
+    )
+    with connect() as conn:
+        _set_short_statement_timeout(conn, _ADMIN_HIGHLIGHTS_FUNNEL_TIMEOUT_MS)
+        row = conn.execute(
+            f"""{ctes}
+                SELECT (SELECT COUNT(*) FROM funnel_terminal_items) AS ingested_count,
+                       (SELECT COUNT(*) FROM funnel_scored_items) AS scored_count,
+                       (SELECT COUNT(*) FROM funnel_clustered_clusters) AS clustered_count,
+                       (SELECT COUNT(*) FROM funnel_summarized_clusters) AS summarized_count,
+                       (SELECT COUNT(*) FROM funnel_displayed_clusters) AS displayed_count,
+                       (SELECT COUNT(*) FROM anomaly_items) AS anomalies_count""",
+            params,
+        ).fetchone()
+    values = dict(row or {})
+    counts = {
+        "ingested": int(values.get("ingested_count") or 0),
+        "scored": int(values.get("scored_count") or 0),
+        "clustered": int(values.get("clustered_count") or 0),
+        "summarized": int(values.get("summarized_count") or 0),
+        "displayed": int(values.get("displayed_count") or 0),
+    }
+    if (
+        counts["ingested"] < counts["scored"]
+        or counts["clustered"] < counts["summarized"]
+        or counts["summarized"] < counts["displayed"]
+    ):
+        raise RemoteDBError("highlights funnel station invariant violated")
+    return {
+        "stations": [
+            {"key": key, "count": counts[key]}
+            for key in ("ingested", "scored", "clustered", "summarized", "displayed")
+        ],
+        "diffs": [
+            {"key": "scoring", "count": counts["ingested"] - counts["scored"]},
+            {"key": "summary", "count": counts["clustered"] - counts["summarized"]},
+            {"key": "display", "count": counts["summarized"] - counts["displayed"]},
+        ],
+        "anomalies_count": int(values.get("anomalies_count") or 0),
+        "gate_disabled": display_threshold is None,
+    }
+
+
+def _highlight_funnel_dims(scores: Any) -> dict[str, Any]:
+    payload = _json_value(scores)
+    nested = payload.get("v26") if isinstance(payload, dict) else None
+    v26 = nested if isinstance(nested, dict) else {}
+    return {
+        key: v26.get(key)
+        for key in ("authority", "substance", "novelty", "timeliness", "audience_fit")
+    }
+
+
+def _highlight_funnel_score(scores: Any) -> float | None:
+    payload = _json_value(scores)
+    nested = payload.get("v26") if isinstance(payload, dict) else None
+    v26 = nested if isinstance(nested, dict) else {}
+    raw_score = v26.get("score10")
+    try:
+        return float(raw_score) if raw_score is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _admin_highlights_veto(value: Any) -> str | None:
+    if value in (None, "", "none"):
+        return None
+    return str(value)
+
+
+def _admin_highlights_item_rows(
+    *,
+    conn: Any,
+    schema: str,
+    ctes: str,
+    params: dict[str, Any],
+) -> tuple[int, list[dict[str, Any]]]:
+    total_row = conn.execute(
+        f"""{ctes}
+            SELECT COUNT(*) AS total
+              FROM anomaly_items s""",
+        params,
+    ).fetchone()
+    rows = conn.execute(
+        f"""{ctes}
+            SELECT s.id,
+                   s.fetched_at AS ingested_at,
+                   s.title,
+                   s.url,
+                   s.cluster_id,
+                   s.cluster_title,
+                   s.highlight_scores,
+                   s.highlight_uncertainty AS uncertainty,
+                   COALESCE(NULLIF(s.highlight_reason, ''), s.error_summary) AS reason,
+                   s.stuck_at,
+                   s.error_summary,
+                   fb.action AS feedback_kind,
+                   fb.reason AS feedback_note
+              FROM anomaly_items s
+              LEFT JOIN LATERAL (
+                SELECT item_fb.action,
+                       item_fb.reason
+                  FROM {schema}.item_feedback item_fb
+                 WHERE item_fb.item_id = s.id
+                   AND item_fb.action IN ('should_feature', 'should_drop')
+                 ORDER BY item_fb.created_at DESC, item_fb.id DESC
+                 LIMIT 1
+              ) fb ON true
+             ORDER BY s.fetched_at DESC, s.id DESC
+             LIMIT %(limit)s OFFSET %(offset)s""",
+        params,
+    ).fetchall()
+    return int((total_row or {}).get("total") or 0), [dict(row) for row in rows]
+
+
+def _admin_highlights_panorama_filter() -> str:
+    tag_filter = _admin_highlights_tag_filter("s")
+    return f"""WHERE (
+                     %(display)s = 'all'
+                     OR (%(display)s = 'shown' AND s.displayed IS TRUE)
+                     OR (%(display)s = 'hidden' AND s.displayed IS FALSE)
+                   )
+               AND {tag_filter}
+               AND (
+                     %(stage)s = ''
+                     OR (%(stage)s = 'blocked_scoring' AND s.has_drop_member)
+                     OR s.stage = %(stage)s
+                   )"""
+
+
+def _admin_highlights_cluster_rows(
+    *,
+    conn: Any,
+    schema: str,
+    ctes: str,
+    params: dict[str, Any],
+) -> tuple[int, list[dict[str, Any]]]:
+    source_filter = _admin_highlights_panorama_filter()
+    total_row = conn.execute(
+        f"""{ctes}
+            SELECT COUNT(*) AS total
+              FROM panorama_clusters s
+              {source_filter}""",
+        params,
+    ).fetchone()
+    rows = conn.execute(
+        f"""{ctes}
+            SELECT c.id,
+                   s.latest_at,
+                   c.ai_title AS title,
+                   s.dominant_category,
+                   NULLIF(d.score_inputs->>'max_flag_score10', '')::numeric
+                     AS max_flag_score10,
+                   d.score_inputs,
+                   representative.id AS deciding_item_id,
+                   representative.title AS deciding_item_title,
+                   representative.highlight_scores AS deciding_item_scores,
+                   representative.highlight_reason AS deciding_item_reason,
+                   s.stage,
+                   s.blocked_reason,
+                   s.displayed,
+                   d.manual_display,
+                   cs.feedback_kind,
+                   cs.feedback_note,
+                   COALESCE(members.items, '[]'::jsonb) AS members
+              FROM panorama_clusters s
+              JOIN {schema}.clusters c ON c.id = s.cluster_id
+              LEFT JOIN {schema}.highlight_cluster_decisions d ON d.cluster_id = c.id
+              LEFT JOIN LATERAL (
+                SELECT i_deciding.id,
+                       i_deciding.title,
+                       i_deciding.highlight_scores,
+                       i_deciding.highlight_reason
+                  FROM {schema}.items i_deciding
+                 WHERE i_deciding.cluster_id = c.id
+                   AND i_deciding.fetched_at >= now() - (%(days)s::int * interval '1 day')
+                 ORDER BY (i_deciding.id = d.deciding_item_id) DESC,
+                          (i_deciding.highlight_scores->'v26'->>'score10')::numeric DESC NULLS LAST,
+                          i_deciding.id DESC
+                 LIMIT 1
+              ) representative ON true
+              LEFT JOIN LATERAL (
+                SELECT jsonb_agg(
+                         jsonb_build_object(
+                           'id', i_member.id,
+                           'title', i_member.title,
+                           'url', i_member.url,
+                           'platform', i_member.platform,
+                           'source', i_member.source,
+                           'author_name', i_member.author_name,
+                           'fetched_at', i_member.fetched_at,
+                           'verdict', i_member.highlight_verdict,
+                           'score10', (i_member.highlight_scores->'v26'->>'score10')::numeric,
+                           'highlight_scores', i_member.highlight_scores,
+                           'veto', COALESCE(
+                             i_member.highlight_scores->'v26'->>'veto',
+                             i_member.highlight_scores->>'veto'
+                           ),
+                           'uncertainty', i_member.highlight_uncertainty,
+                           'highlight_reason', i_member.highlight_reason,
+                           'feedback_kind', item_fb.action,
+                           'feedback_note', item_fb.reason
+                         )
+                         ORDER BY (i_member.highlight_scores->'v26'->>'score10')::numeric DESC NULLS LAST,
+                                  i_member.id DESC
+                       ) AS items
+                  FROM {schema}.items i_member
+                  LEFT JOIN LATERAL (
+                    SELECT fb.action,
+                           fb.reason
+                      FROM {schema}.item_feedback fb
+                     WHERE fb.item_id = i_member.id
+                       AND fb.action IN ('should_feature', 'should_drop')
+                     ORDER BY fb.created_at DESC, fb.id DESC
+                     LIMIT 1
+                  ) item_fb ON true
+                 WHERE i_member.cluster_id = s.cluster_id
+                   AND i_member.fetched_at >= now() - (%(days)s::int * interval '1 day')
+              ) members ON true
+              LEFT JOIN {schema}.cluster_status cs
+                ON cs.cluster_id = c.id
+               AND cs.user_id = %(user_id)s
+              {source_filter}
+             ORDER BY s.latest_at DESC, c.id DESC
+             LIMIT %(limit)s OFFSET %(offset)s""",
+        params,
+    ).fetchall()
+    return int((total_row or {}).get("total") or 0), [dict(row) for row in rows]
+
+
+def _admin_highlights_item_payload(row: dict[str, Any], *, anomaly: bool) -> dict[str, Any]:
+    scores = row.get("highlight_scores")
+    payload = _json_value(scores)
+    nested = payload.get("v26") if isinstance(payload, dict) else None
+    v26 = nested if isinstance(nested, dict) else {}
+    raw_veto = v26.get("veto") or (
+        payload.get("veto") if isinstance(payload, dict) else None
+    )
+    item = {
+        "id": str(row.get("id") or ""),
+        "ingested_at": to_utc_iso(row.get("ingested_at")),
+        "title": row.get("title"),
+        "url": row.get("url"),
+        "cluster_id": int(row["cluster_id"]) if row.get("cluster_id") is not None else None,
+        "cluster_title": row.get("cluster_title"),
+        "score10": _highlight_funnel_score(scores),
+        "dims": _highlight_funnel_dims(scores),
+        "veto": _admin_highlights_veto(raw_veto),
+        "uncertainty": row.get("uncertainty"),
+        "reason": row.get("reason"),
+        "feedback": {
+            "kind": row.get("feedback_kind"),
+            "note": row.get("feedback_note"),
+        },
+    }
+    if anomaly:
+        item["stuck_at"] = row.get("stuck_at")
+        item["error_summary"] = row.get("error_summary")
+    return item
+
+
+def _admin_highlights_cluster_payload(row: dict[str, Any]) -> dict[str, Any]:
+    members: list[dict[str, Any]] = []
+    for raw_member in _json_array(row.get("members")):
+        member = raw_member if isinstance(raw_member, dict) else {}
+        raw_score = member.get("score10")
+        try:
+            score10 = float(raw_score) if raw_score is not None else None
+        except (TypeError, ValueError):
+            score10 = None
+        members.append({
+            "id": str(member.get("id") or ""),
+            "title": member.get("title"),
+            "url": member.get("url"),
+            "platform": member.get("platform"),
+            "source": member.get("source"),
+            "author_name": member.get("author_name"),
+            "fetched_at": to_utc_iso(member.get("fetched_at")),
+            "verdict": member.get("verdict"),
+            "score10": score10,
+            "dims": _highlight_funnel_dims(member.get("highlight_scores")),
+            "veto": _admin_highlights_veto(member.get("veto")),
+            "uncertainty": member.get("uncertainty"),
+            "reason": member.get("highlight_reason"),
+            "feedback": {
+                "kind": member.get("feedback_kind"),
+                "note": member.get("feedback_note"),
+            },
+        })
+    raw_score = row.get("max_flag_score10")
+    stage = str(row.get("stage") or "blocked_summary")
+    if stage not in _ADMIN_HIGHLIGHTS_FUNNEL_STAGES - {""}:
+        stage = "blocked_summary"
+    return {
+        "id": int(row["id"]),
+        "latest_at": to_utc_iso(row.get("latest_at")),
+        "title": row.get("title"),
+        "dominant_category": row.get("dominant_category") or "other",
+        "max_flag_score10": float(raw_score) if raw_score is not None else None,
+        "score_inputs": _json_value(row.get("score_inputs")),
+        "deciding_item": {
+            "id": str(row.get("deciding_item_id") or ""),
+            "title": row.get("deciding_item_title"),
+            "dims": _highlight_funnel_dims(row.get("deciding_item_scores")),
+            "reason": row.get("deciding_item_reason"),
+        },
+        "stage": stage,
+        "blocked_reason": row.get("blocked_reason"),
+        "displayed": bool(row.get("displayed")),
+        "manual_display": row.get("manual_display"),
+        "feedback": {
+            "kind": row.get("feedback_kind"),
+            "note": row.get("feedback_note"),
+        },
+        "members": members,
+    }
+
+
+def query_admin_highlights_funnel_rows_remote(
+    *,
+    view: str = "panorama",
+    days: int = 1,
+    q: str = "",
+    tag: str = "",
+    display: str = "all",
+    stage: str = "",
+    page: int = 1,
+    limit: int = 50,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the paginated cluster panorama or anomaly fallback view."""
+    safe_view = str(view or "").strip()
+    if safe_view not in _ADMIN_HIGHLIGHTS_FUNNEL_VIEWS:
+        raise ValueError("unsupported funnel view")
+    safe_display = str(display or "all").strip()
+    if safe_display not in _ADMIN_HIGHLIGHTS_FUNNEL_DISPLAYS:
+        raise ValueError("display must be all, shown, or hidden")
+    safe_stage = str(stage or "").strip()
+    if safe_stage not in _ADMIN_HIGHLIGHTS_FUNNEL_STAGES:
+        raise ValueError("unsupported funnel stage")
+    safe_tag = _admin_highlights_funnel_tag(tag)
+    safe_page = max(1, int(page or 1))
+    safe_limit = max(1, min(int(limit or 50), 100))
+    schema = remote_schema()
+    display_threshold = _highlights_display_threshold()
+    params = _admin_highlights_funnel_params(days=days, q=q, tag=safe_tag)
+    params.update({
+        "user_id": str(user_id) if user_id is not None else None,
+        "tag": safe_tag,
+        "display": safe_display,
+        "stage": safe_stage,
+        "limit": safe_limit,
+        "offset": (safe_page - 1) * safe_limit,
+    })
+    ctes = _admin_highlights_funnel_ctes(
+        schema,
+        display_threshold=display_threshold,
+    )
+    item_view = safe_view == "anomaly"
+    with connect() as conn:
+        _set_short_statement_timeout(conn, _ADMIN_HIGHLIGHTS_FUNNEL_TIMEOUT_MS)
+        if item_view:
+            total, rows = _admin_highlights_item_rows(
+                conn=conn,
+                schema=schema,
+                ctes=ctes,
+                params=params,
+            )
+        else:
+            total, rows = _admin_highlights_cluster_rows(
+                conn=conn,
+                schema=schema,
+                ctes=ctes,
+                params=params,
+            )
+    items = (
+        [
+            _admin_highlights_item_payload(row, anomaly=safe_view == "anomaly")
+            for row in rows
+        ]
+        if item_view
+        else [_admin_highlights_cluster_payload(row) for row in rows]
+    )
+    return {
+        "granularity": "item" if item_view else "cluster",
+        "items": items,
+        "total": total,
+        "page": safe_page,
+        "gate_disabled": display_threshold is None,
+        "display_threshold": display_threshold,
+    }
+
+
 def admin_overview_remote(
     *,
     fetch_run_limit: int = 20,
@@ -6632,18 +7934,34 @@ def get_last_fetch_remote() -> dict[str, Any] | None:
 def has_recent_running_fetch_remote(max_age_minutes: int | None = None) -> bool:
     """Return whether Supabase has a recent in-flight fetch run.
 
-    Old failed finish paths can leave zombie rows with status=running, so this
-    guard only treats rows with a fresh heartbeat as active. Scheduler callers
-    should fail closed when this query cannot be answered.
+    Liveness is decided by heartbeat freshness alone: a row is "running" iff its
+    status is ``running`` and its heartbeat (falling back to ``started_at`` for
+    runs that never wrote one) is within the runtime-stale grace window. Zombie
+    rows from old failed finish paths have a stale heartbeat and are excluded.
+
+    稳定性加固(2026-07-10 BF-0710-fetch-guards): 移除了旧的 ``started_at >= now()
+    - 180min`` 硬龄窗口——它与心跳判活冗余,且比"各阶段超时之和(~3.2h)"还短,
+    导致一次合法长 run 跑过 3h 后被守卫误判成"无 run 在跑"→放行第二条 pipeline→
+    双 pipeline 打爆 Supabase Micro。心跳新鲜即视为在跑,与孤儿回收的"心跳陈旧"
+    互为反面,不再耦合 run 时长。若运维确需一个上限窗口,显式传 ``max_age_minutes``
+    或设 ``INFO2ACTION_REMOTE_RUNNING_FETCH_MAX_AGE_MINUTES``(默认不启用)。
+
+    Scheduler callers should fail closed when this query cannot be answered.
     """
     age_minutes = max_age_minutes
     if age_minutes is None:
-        age_minutes = _env_int(
-            _runtime_env(),
-            REMOTE_RUNNING_FETCH_MAX_AGE_MIN_ENV,
-            180,
-            min_value=1,
-        )
+        raw = (_runtime_env().get(REMOTE_RUNNING_FETCH_MAX_AGE_MIN_ENV) or "").strip()
+        if raw:
+            try:
+                age_minutes = max(1, int(raw))
+            except (ValueError, TypeError):
+                age_minutes = None
+    age_clause = ""
+    params: list[Any] = []
+    if age_minutes is not None:
+        age_clause = "AND started_at >= now() - (%s::int * interval '1 minute')"
+        params.append(int(age_minutes))
+    params.append(fetch_run_runtime_stale_grace_seconds())
     with connect() as conn:
         _set_short_statement_timeout(conn)
         row = conn.execute(
@@ -6651,12 +7969,12 @@ def has_recent_running_fetch_remote(max_age_minutes: int | None = None) -> bool:
                     SELECT 1
                       FROM {remote_schema()}.fetch_runs
                      WHERE status = 'running'
-                       AND started_at >= now() - (%s::int * interval '1 minute')
+                       {age_clause}
                        AND COALESCE(NULLIF(stats_json->>'_heartbeat_at', '')::timestamptz, started_at)
                            >= now() - (%s::int * interval '1 second')
                      LIMIT 1
                  ) AS has_running""",
-            (int(age_minutes), fetch_run_heartbeat_grace_seconds()),
+            tuple(params),
         ).fetchone()
     if isinstance(row, dict):
         return bool(row.get("has_running"))
@@ -7298,6 +8616,78 @@ def write_highlight_verdict_remote(pg_conn: Any | None, item_id: str, result: di
             pending,
             result.get("highlight_last_error"),
             retry_after_value,
+            item_id,
+        ),
+    )
+    _commit_if_supported(pg_conn)
+
+
+def write_highlight_score_v26_remote(
+    pg_conn: Any | None,
+    item_id: str,
+    result: dict[str, Any],
+    *,
+    threshold: float,
+) -> None:
+    """Merge a v26 item score into nested highlight_scores metadata."""
+    if pg_conn is None:
+        with connect() as conn:
+            write_highlight_score_v26_remote(
+                conn,
+                item_id,
+                result,
+                threshold=threshold,
+            )
+            return
+
+    dims = result.get("dims") or {}
+    v26_score = {
+        "authority": dims.get("authority"),
+        "substance": dims.get("substance"),
+        "novelty": dims.get("novelty"),
+        "timeliness": dims.get("timeliness"),
+        "audience_fit": dims.get("audience_fit"),
+        "marketing": result.get("marketing"),
+        "score10": result.get("score10"),
+        "content_type": result.get("content_type"),
+        "reject": result.get("reject"),
+        "veto": result.get("veto"),
+    }
+    for key in ("runs", "pass2_error"):
+        if key in result:
+            v26_score[key] = result.get(key)
+    if result.get("reject") or result.get("veto") != "none":
+        verdict = "drop"
+    elif result.get("score10") is not None and result["score10"] >= threshold:
+        verdict = "featured"
+    else:
+        verdict = "borderline"
+
+    pg_conn.execute(
+        f"""UPDATE {remote_schema()}.items
+               SET highlight_scores = COALESCE(highlight_scores, '{{}}'::jsonb)
+                                      || jsonb_build_object('v26', %s::jsonb),
+                   highlight_include_in_highlights = %s,
+                   highlight_verdict = %s,
+                   highlight_value_path = %s,
+                   highlight_uncertainty = %s,
+                   highlight_reason = %s,
+                   highlight_confidence = %s,
+                   highlight_prompt_version = %s,
+                   highlight_scored_at = now(),
+                   highlight_error_count = 0,
+                   highlight_last_error = NULL,
+                   highlight_retry_after = NULL
+             WHERE id = %s""",
+        (
+            _maybe_jsonb(v26_score),
+            bool(result.get("is_flag_bearer")),
+            verdict,
+            result.get("value_path"),
+            result.get("uncertainty"),
+            result.get("reason"),
+            result.get("confidence"),
+            highlight_score_v26.PROMPT_VERSION,
             item_id,
         ),
     )
@@ -8157,6 +9547,7 @@ def write_cluster_summary_draft_remote(
     title: str,
     summary: str,
     key_points: Any,
+    why_read: str | None,
     is_visible: bool,
     warnings: list[str],
     run_id: int | None,
@@ -8169,6 +9560,7 @@ def write_cluster_summary_draft_remote(
                 title=title,
                 summary=summary,
                 key_points=key_points,
+                why_read=why_read,
                 is_visible=is_visible,
                 warnings=warnings,
                 run_id=run_id,
@@ -8179,6 +9571,7 @@ def write_cluster_summary_draft_remote(
                SET ai_title_draft = %s,
                    ai_summary_draft = %s,
                    ai_key_points_draft = %s,
+                   why_read = %s,
                    pending_is_visible_in_feed = %s,
                    pending_summary_warnings_json = %s,
                    last_touched_run_id = COALESCE(%s, last_touched_run_id)
@@ -8187,6 +9580,7 @@ def write_cluster_summary_draft_remote(
             title,
             summary,
             json.dumps(key_points, ensure_ascii=False),
+            why_read,
             1 if is_visible else 0,
             _maybe_jsonb(warnings),
             run_id,
@@ -8637,6 +10031,10 @@ def invalidate_action_board_read_model_remote(pg_conn: Any | None = None) -> Non
             (f"{ACTION_BOARD_READ_MODEL_STATE_PREFIX}:%",),
         )
         _commit_if_supported(pg_conn)
+        try:
+            clear_actions_board_cache_keys()
+        except Exception:
+            pass
     except Exception:
         _rollback_safely(pg_conn)
 
@@ -9365,6 +10763,26 @@ def get_actions_board_payload_remote(
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit_per_direction or 20), 50))
     start = max(0, int(offset or 0))
+    schema = remote_schema()
+    cache_ttl = _actions_board_result_cache_ttl_sec()
+    cache_key = (
+        "actions_board_result",
+        schema,
+        status,
+        priority,
+        action_type,
+        direction,
+        source_filter,
+        date_filter,
+        user_id or "",
+        bool(can_view_all),
+        limit,
+        start,
+        bool(include_detail_payloads),
+    )
+    cached = _cache_get_copy_with_ttl(cache_key, cache_ttl)
+    if cached is not None:
+        return cached
     read_model_payload = _query_actions_board_read_model_remote(
         status=status,
         priority=priority,
@@ -9379,8 +10797,8 @@ def get_actions_board_payload_remote(
         include_detail_payloads=include_detail_payloads,
     )
     if read_model_payload is not None:
+        _cache_set_copy_with_ttl(cache_key, read_model_payload, cache_ttl)
         return read_model_payload
-    schema = remote_schema()
     where, params = _action_where(
         status=status,
         priority=priority,
@@ -10996,6 +12414,82 @@ def add_feedback_remote(item_id: str, fb_type: str, topic: str | None = None, te
         conn.commit()
 
 
+def toggle_item_admin_feedback_remote(
+    *,
+    item_id: str,
+    action: str,
+    platform: str | None = None,
+    title: str | None = None,
+    author: str | None = None,
+    url: str | None = None,
+    reason: str | None = None,
+    topic: str | None = None,
+) -> bool:
+    """Toggle one admin item label in both remote copies in one transaction."""
+    if action not in {"should_feature", "should_drop"}:
+        raise ValueError("unsupported admin item feedback action")
+    schema = remote_schema()
+    with connect() as conn:
+        existing = conn.execute(
+            f"""SELECT 1 AS exists
+                  FROM {schema}.feedback
+                 WHERE item_id = %s
+                   AND type = %s
+                 LIMIT 1""",
+            (item_id, action),
+        ).fetchone()
+        active = existing is None
+        conn.execute(
+            f"""DELETE FROM {schema}.feedback
+                 WHERE item_id = %s
+                   AND type IN ('should_feature', 'should_drop')""",
+            (item_id,),
+        )
+        conn.execute(
+            f"""DELETE FROM {schema}.item_feedback
+                 WHERE item_id = %s
+                   AND action IN ('should_feature', 'should_drop')""",
+            (item_id,),
+        )
+        if active:
+            conn.execute(
+                f"""INSERT INTO {schema}.feedback (item_id, type, topic, text)
+                    VALUES (%s, %s, %s, %s)""",
+                (item_id, action, topic, reason),
+            )
+            conn.execute(
+                f"""INSERT INTO {schema}.item_feedback
+                      (item_id, platform, item_title, item_author, item_url,
+                       action, reason, topic_at_time)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (item_id, platform, title, author, url, action, reason, topic),
+            )
+        conn.commit()
+    return active
+
+
+def toggle_item_should_feature_remote(
+    *,
+    item_id: str,
+    platform: str | None = None,
+    title: str | None = None,
+    author: str | None = None,
+    url: str | None = None,
+    reason: str | None = None,
+    topic: str | None = None,
+) -> bool:
+    return toggle_item_admin_feedback_remote(
+        item_id=item_id,
+        action="should_feature",
+        platform=platform,
+        title=title,
+        author=author,
+        url=url,
+        reason=reason,
+        topic=topic,
+    )
+
+
 def record_item_feedback_remote(
     *,
     item_id: str,
@@ -11543,6 +13037,23 @@ def upsert_asset_metadata_remote(
         conn.commit()
 
 
+def _wrap_remote_db_exception(exc: Exception) -> RemoteDBError:
+    """Classify a raw driver exception into the right RemoteDBError subclass.
+
+    A statement_timeout cancellation means the database is healthy but this
+    query was too slow — callers can degrade to stale/empty data. Everything
+    else is a genuine failure and must stay loud. See BF-0708-3.
+    """
+    try:
+        import psycopg
+    except ImportError:
+        return RemoteDBError(f"Remote DB connection/query failed: {exc}")
+
+    if isinstance(exc, psycopg.errors.QueryCanceled):
+        return RemoteDBTimeoutError(f"Remote DB query timed out: {exc}")
+    return RemoteDBError(f"Remote DB connection/query failed: {exc}")
+
+
 @contextmanager
 def connect() -> Iterator[Any]:
     """Yield a psycopg connection with dict rows, imported lazily."""
@@ -11578,7 +13089,7 @@ def connect() -> Iterator[Any]:
         except RemoteDBError:
             raise
         except Exception as exc:
-            raise RemoteDBError(f"Remote DB connection/query failed: {exc}") from exc
+            raise _wrap_remote_db_exception(exc) from exc
 
     env = _runtime_env()
     connect_timeout = _env_int(env, REMOTE_DB_CONNECT_TIMEOUT_ENV, 2, min_value=1)
@@ -11613,7 +13124,7 @@ def connect() -> Iterator[Any]:
     except RemoteDBError:
         raise
     except Exception as exc:
-        raise RemoteDBError(f"Remote DB connection/query failed: {exc}") from exc
+        raise _wrap_remote_db_exception(exc) from exc
     finally:
         conn.close()
 
@@ -12004,6 +13515,18 @@ def _fetch_event_source_metadata(conn: Any, schema: str, cluster_ids: list[int])
     return _build_event_source_metadata(normalized)
 
 
+def _display_score_from_max_flag_score10(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        score10 = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score10):
+        return None
+    return int(round(score10 * 10))
+
+
 def _row_to_event(
     row: dict[str, Any],
     *,
@@ -12015,10 +13538,11 @@ def _row_to_event(
     live_version = int(row.get("live_version") or 0)
     seen = seen_map.get(cid)
     metadata = (source_metadata or {}).get(cid, {})
-    return {
+    event = {
         "id": cid,
         "ai_title": row.get("ai_title"),
         "ai_summary": row.get("ai_summary"),
+        "why_read": row.get("why_read"),
         "doc_count": int(row.get("doc_count") or 0),
         "unique_source_count": int(row.get("unique_source_count") or 0),
         "category": metadata.get("category"),
@@ -12031,6 +13555,11 @@ def _row_to_event(
         "live_version": live_version,
         "last_seen_version": seen,
     }
+    if "max_flag_score10" in row:
+        event["display_score"] = _display_score_from_max_flag_score10(
+            row.get("max_flag_score10")
+        )
+    return event
 
 
 def _public_cluster_filter(schema: str, cluster_alias: str = "c") -> str:
@@ -12149,6 +13678,7 @@ def _event_from_highlights_card(
         "id": cluster_id,
         "ai_title": card.get("ai_title"),
         "ai_summary": card.get("ai_summary"),
+        "why_read": card.get("why_read"),
         "doc_count": int(card.get("doc_count") or 0),
         "unique_source_count": int(card.get("unique_source_count") or 0),
         "category": card.get("category"),
@@ -12178,6 +13708,7 @@ def _query_highlights_read_model_events(
     enabled: bool,
     categories: list[str] | None,
     timezone_offset_minutes: int,
+    display_threshold: float | None = None,
 ) -> dict[str, Any] | None:
     if not _highlights_read_model_enabled():
         return None
@@ -12190,6 +13721,12 @@ def _query_highlights_read_model_events(
     scope_key = _highlights_scope_for_categories(categories)
     if not scope_key:
         return None
+    display_join = f"LEFT JOIN {schema}.clusters c ON c.id = h.cluster_id"
+    display_filter = _highlights_display_cluster_filter(
+        schema,
+        "c",
+        threshold=display_threshold,
+    )
     safe_limit = max(1, min(int(limit), 100))
     safe_page = max(1, int(page or 1))
     try:
@@ -12247,11 +13784,23 @@ def _query_highlights_read_model_events(
         version_id = str(active_data.get("version_id") or "")
         rank_after = int(cursor_state["rank_after"]) if cursor_state else (safe_page - 1) * safe_limit
         rows = conn.execute(
-            f"""SELECT rank, cluster_id, sort_at, card_json
-                  FROM {schema}.highlights_scope_items
-                 WHERE version_id = %(version_id)s::uuid
-                   AND scope_key = %(scope_key)s
-                 ORDER BY {_highlights_scope_item_order_sql("highlights_scope_items")}
+            f"""SELECT h.rank, h.cluster_id, h.sort_at, h.card_json,
+                       c.why_read AS why_read,
+                       d.highlight_score AS highlight_score,
+                       (d.score_inputs->>'max_flag_score10')::float AS max_flag_score10,
+                       d.cluster_verdict AS cluster_verdict,
+                       (d.verdict_counts_json->>'featured')::int AS featured_count,
+                       di.highlight_value_path AS value_path
+                  FROM {schema}.highlights_scope_items h
+                  {display_join}
+                  LEFT JOIN {schema}.highlight_cluster_decisions d
+                    ON d.cluster_id = h.cluster_id
+                  LEFT JOIN {schema}.items di
+                    ON di.id = d.deciding_item_id
+                 WHERE h.version_id = %(version_id)s::uuid
+                   AND h.scope_key = %(scope_key)s
+                   {display_filter}
+                 ORDER BY {_highlights_scope_item_order_sql("h")}
                  OFFSET %(rank_after)s
                  LIMIT %(limit_plus_one)s""",
             {
@@ -12270,20 +13819,23 @@ def _query_highlights_read_model_events(
             int(active_data.get("total_count") or 0),
             _timestamp_value(active_data.get("max_sort_at")),
             _timestamp_value(active_data.get("generated_at")),
+            display_threshold,
         )
         date_counts = _cache_get_copy(date_counts_cache_key)
         if date_counts is None:
             date_count_rows = conn.execute(
                 f"""SELECT COALESCE(
                               to_char((
-                                sort_at - (%(timezone_offset_minutes)s::int * interval '1 minute')
+                                h.sort_at - (%(timezone_offset_minutes)s::int * interval '1 minute')
                               )::date, 'YYYY-MM-DD'),
                               'unknown'
                             ) AS day,
                            count(*) AS n
-                      FROM {schema}.highlights_scope_items
-                     WHERE version_id = %(version_id)s::uuid
-                       AND scope_key = %(scope_key)s
+                      FROM {schema}.highlights_scope_items h
+                      {display_join}
+                     WHERE h.version_id = %(version_id)s::uuid
+                       AND h.scope_key = %(scope_key)s
+                       {display_filter}
                      GROUP BY day""",
                 {
                     "version_id": version_id,
@@ -12306,6 +13858,17 @@ def _query_highlights_read_model_events(
         for row in page_rows:
             event = _event_from_highlights_card(row.get("card_json"), user_last_seen=seen_map)
             if event:
+                # v25.0 F-B：decisions 侧质量字段（LEFT JOIN 缺行时全为 null，前端 fallback）
+                score = row.get("highlight_score")
+                featured = row.get("featured_count")
+                event["highlight_score"] = float(score) if score is not None else None
+                event["display_score"] = _display_score_from_max_flag_score10(
+                    row.get("max_flag_score10")
+                )
+                event["why_read"] = row.get("why_read")
+                event["cluster_verdict"] = row.get("cluster_verdict")
+                event["value_path"] = row.get("value_path")
+                event["featured_count"] = int(featured) if featured is not None else None
                 events.append(event)
         next_cursor = None
         if has_more and page_rows:
@@ -12319,7 +13882,11 @@ def _query_highlights_read_model_events(
             "events": events,
             "next_cursor": next_cursor,
             "new_since_last_fetch": 0,
-            "total_available_within_30d": int(active_data.get("total_count") or 0),
+            "total_available_within_30d": (
+                sum(int(count or 0) for count in date_counts.values())
+                if display_threshold is not None
+                else int(active_data.get("total_count") or 0)
+            ),
             "date_counts": date_counts,
             "data_backend": event_read_backend(),
             "read_model": HIGHLIGHTS_READ_MODEL_VERSION,
@@ -12429,6 +13996,12 @@ def _fetch_events_content(
     public_filter = _public_cluster_filter(schema, "c") if public_only else ""
     github_filter = _github_display_filter(schema, min_github_stars, "c")
     verdict_filter = _highlights_verdict_cluster_filter(schema, "c")
+    display_threshold = _highlights_display_threshold()
+    display_filter = _highlights_display_cluster_filter(
+        schema,
+        "c",
+        threshold=display_threshold,
+    )
     # v17.0: categories filter（Postgres split_part 提取 L1 段）
     categories_filter = ""
     if categories:
@@ -12460,6 +14033,7 @@ def _fetch_events_content(
       {public_filter}
       {github_filter}
       {verdict_filter}
+      {display_filter}
       {categories_filter}
     """
     params = {
@@ -12484,6 +14058,7 @@ def _fetch_events_content(
         int(min_github_stars),
         bool(enabled),
         tz_offset,
+        display_threshold,
         tuple(categories or []),
     )
     prefer_highlights_read_model = (
@@ -12541,6 +14116,7 @@ def _fetch_events_content(
             enabled=enabled,
             categories=categories,
             timezone_offset_minutes=tz_offset,
+            display_threshold=display_threshold,
         )
         local_cache_name = _feed_events_local_cache_name(
             limit=limit,
@@ -12549,6 +14125,7 @@ def _fetch_events_content(
             enabled=enabled,
             categories=categories,
             timezone_offset_minutes=tz_offset,
+            display_threshold=display_threshold,
         )
         fresh_fallback = _read_local_read_cache(
             local_cache_name,
@@ -12562,6 +14139,11 @@ def _fetch_events_content(
             if cached_inside is not None:
                 return cached_inside
             with connect() as conn:
+                # BF-0708-3: bound this read. Without it the query ran 129s on a
+                # cold cache and Cloudflare cut the connection at ~100s (524),
+                # leaving the feed stuck on skeletons forever. On timeout the
+                # route serves the last-good snapshot instead.
+                _set_short_statement_timeout(conn, _feed_events_timeout_ms())
                 read_model_result = _query_highlights_read_model_events(
                     conn=conn,
                     schema=schema,
@@ -12576,6 +14158,7 @@ def _fetch_events_content(
                     enabled=enabled,
                     categories=categories,
                     timezone_offset_minutes=tz_offset,
+                    display_threshold=display_threshold,
                 )
             if read_model_result is not None:
                 if snapshot_key:
@@ -12620,6 +14203,7 @@ def _fetch_events_content(
         bool(user_id),
         int(min_github_stars),
         fetched_since or "",
+        display_threshold,
         tuple(categories or []),
     )
     date_counts_cache_key = (
@@ -12630,10 +14214,18 @@ def _fetch_events_content(
         int(min_github_stars),
         fetched_since or "",
         tz_offset,
+        display_threshold,
         tuple(categories or []),
     )
     try:
         with connect() as conn:
+            # BF-0708-3: bound EVERY feed read, not just the read-model branch.
+            # When the read model goes stale, prefer_highlights_read_model flips
+            # to False and we fall through to the live-aggregation path — which
+            # is exactly the 129s query that made Cloudflare 524. Setting the
+            # timeout only inside the read-model branch would leave the slow
+            # path unbounded, which is the failure this bug is about.
+            _set_short_statement_timeout(conn, _feed_events_timeout_ms())
             if prefer_highlights_read_model:
                 read_model_result = _query_highlights_read_model_events(
                     conn=conn,
@@ -12649,6 +14241,7 @@ def _fetch_events_content(
                     enabled=enabled,
                     categories=categories,
                     timezone_offset_minutes=tz_offset,
+                    display_threshold=display_threshold,
                 )
                 if read_model_result is not None:
                     if snapshot_key:
@@ -12681,6 +14274,7 @@ def _fetch_events_content(
                     enabled=enabled,
                     categories=categories,
                     timezone_offset_minutes=tz_offset,
+                    display_threshold=display_threshold,
                 )
                 if read_model_result is not None:
                     if snapshot_key:
@@ -12689,12 +14283,13 @@ def _fetch_events_content(
                             _write_local_read_cache_async(local_cache_name, read_model_result)
                     return _cache_set_copy(result_cache_key, read_model_result)
             rows = conn.execute(
-                f"""SELECT c.id, c.ai_title, c.ai_summary, c.doc_count,
+                f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.doc_count,
                            c.unique_source_count, c.first_doc_at, c.last_doc_at,
                            c.platforms_json,
                            COALESCE(NULLIF(c.cover_url, ''), event_cover.cover_url) AS cover_url,
                            c.live_version,
-                           c.last_updated_at
+                           c.last_updated_at,
+                           (d.score_inputs->>'max_flag_score10')::float AS max_flag_score10
                       FROM {schema}.clusters c
                       LEFT JOIN LATERAL (
                         SELECT i.cover_url
@@ -12708,6 +14303,8 @@ def _fetch_events_content(
                                   ci.rank_in_cluster ASC NULLS LAST
                          LIMIT 1
                       ) event_cover ON true
+                      LEFT JOIN {schema}.highlight_cluster_decisions d
+                        ON d.cluster_id = c.id
                      WHERE {where_sql}
                      ORDER BY c.first_doc_at DESC NULLS LAST,
                               c.last_updated_at DESC NULLS LAST,
@@ -12877,7 +14474,7 @@ def search_recommend_remote(
           {categories_filter}
         """
         ev_rows = conn.execute(
-            f"""SELECT c.id, c.ai_title, c.ai_summary, c.doc_count,
+            f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.doc_count,
                        c.unique_source_count, c.first_doc_at, c.last_doc_at,
                        c.platforms_json, c.cover_url, c.live_version
                   FROM {schema}.clusters c
@@ -12910,7 +14507,7 @@ def cluster_detail(*, cluster_id: int, public_only: bool = False,
     public_filter = _public_cluster_filter(schema, "c") if public_only else ""
     with connect() as conn:
         row = conn.execute(
-            f"""SELECT c.id, c.ai_title, c.ai_summary, c.ai_key_points, c.doc_count,
+            f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.ai_key_points, c.doc_count,
                        c.unique_source_count, c.platforms_json,
                        COALESCE(NULLIF(c.cover_url, ''), detail_cover.cover_url) AS cover_url,
                        c.first_doc_at, c.last_doc_at, c.live_version, c.merged_into,
@@ -12940,11 +14537,17 @@ def cluster_detail(*, cluster_id: int, public_only: bool = False,
         return None
     data = dict(row)
     user_last_seen = None
-    viewer_status = {"clicked_at": None, "starred_at": None, "last_seen_version": None}
+    viewer_status = {
+        "clicked_at": None,
+        "starred_at": None,
+        "last_seen_version": None,
+        "feedback_kind": None,
+        "feedback_note": None,
+    }
     if user_id:
         with connect() as conn:
             seen = conn.execute(
-                f"""SELECT clicked_at, starred_at, last_seen_version
+                f"""SELECT clicked_at, starred_at, last_seen_version, feedback_kind, feedback_note
                       FROM {schema}.cluster_status
                      WHERE user_id = %(user_id)s
                        AND cluster_id = %(cluster_id)s""",
@@ -12956,11 +14559,14 @@ def cluster_detail(*, cluster_id: int, public_only: bool = False,
                 "clicked_at": to_utc_iso(seen.get("clicked_at")) if seen.get("clicked_at") else None,
                 "starred_at": to_utc_iso(seen.get("starred_at")) if seen.get("starred_at") else None,
                 "last_seen_version": user_last_seen,
+                "feedback_kind": seen.get("feedback_kind"),
+                "feedback_note": seen.get("feedback_note"),
             }
     body = {
         "id": int(data["id"]),
         "ai_title": data.get("ai_title"),
         "ai_summary": data.get("ai_summary"),
+        "why_read": data.get("why_read"),
         "ai_key_points": _json_array(data.get("ai_key_points")),
         "doc_count": int(data.get("doc_count") or 0),
         "unique_source_count": int(data.get("unique_source_count") or 0),
@@ -13071,7 +14677,7 @@ def cluster_bundle(
         bool(public_only),
         user_id or "",
     )
-    cached = _cache_get_copy(cache_key)
+    cached = _cache_get_copy_with_ttl(cache_key, _cluster_bundle_cache_ttl_sec())
     if cached is not None:
         return cached
     offset = (page - 1) * limit
@@ -13080,7 +14686,7 @@ def cluster_bundle(
     source_filter = (" AND " + " AND ".join(source_where)) if source_where else ""
     with connect() as conn:
         row = conn.execute(
-            f"""SELECT c.id, c.ai_title, c.ai_summary, c.ai_key_points, c.doc_count,
+            f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.ai_key_points, c.doc_count,
                        c.unique_source_count, c.platforms_json,
                        COALESCE(NULLIF(c.cover_url, ''), detail_cover.cover_url) AS cover_url,
                        c.first_doc_at, c.last_doc_at, c.live_version, c.merged_into,
@@ -13107,10 +14713,16 @@ def cluster_bundle(
         data = dict(row)
         metadata = _fetch_event_source_metadata(conn, schema, [cluster_id]).get(cluster_id, {})
         user_last_seen = None
-        viewer_status = {"clicked_at": None, "starred_at": None, "last_seen_version": None}
+        viewer_status = {
+            "clicked_at": None,
+            "starred_at": None,
+            "last_seen_version": None,
+            "feedback_kind": None,
+            "feedback_note": None,
+        }
         if user_id:
             seen = conn.execute(
-                f"""SELECT clicked_at, starred_at, last_seen_version
+                f"""SELECT clicked_at, starred_at, last_seen_version, feedback_kind, feedback_note
                       FROM {schema}.cluster_status
                      WHERE user_id = %(user_id)s
                        AND cluster_id = %(cluster_id)s""",
@@ -13122,6 +14734,8 @@ def cluster_bundle(
                     "clicked_at": to_utc_iso(seen.get("clicked_at")) if seen.get("clicked_at") else None,
                     "starred_at": to_utc_iso(seen.get("starred_at")) if seen.get("starred_at") else None,
                     "last_seen_version": user_last_seen,
+                    "feedback_kind": seen.get("feedback_kind"),
+                    "feedback_note": seen.get("feedback_note"),
                 }
         source_rows = conn.execute(
             f"""SELECT i.id AS item_id, i.title, i.author_name, i.platform,
@@ -13147,6 +14761,7 @@ def cluster_bundle(
         "id": int(data["id"]),
         "ai_title": data.get("ai_title"),
         "ai_summary": data.get("ai_summary"),
+        "why_read": data.get("why_read"),
         "ai_key_points": _json_array(data.get("ai_key_points")),
         "doc_count": int(data.get("doc_count") or 0),
         "unique_source_count": int(data.get("unique_source_count") or 0),
@@ -13194,7 +14809,7 @@ def cluster_bundle(
         "sources_next_cursor": (page + 1) if has_more else None,
         "data_backend": event_read_backend(),
     }
-    return _cache_set_copy(cache_key, result)
+    return _cache_set_copy_with_ttl(cache_key, result, _cluster_bundle_cache_ttl_sec())
 
 
 def mark_cluster_clicked(*, cluster_id: int, user_id: str) -> dict[str, Any] | None:
@@ -13246,6 +14861,174 @@ def mark_cluster_seen(*, cluster_id: int, user_id: str) -> dict[str, Any] | None
     return {
         "cluster_id": cluster_id,
         "last_seen_version": live_version,
+        "data_backend": status_backend(),
+    }
+
+
+def set_cluster_feedback(
+    *,
+    cluster_id: int,
+    user_id: str,
+    kind: str,
+    note: str | None = None,
+) -> dict[str, Any] | None:
+    """v25.0 F-D — per-user cluster 质量反馈，同 kind 再提交=撤销。"""
+    schema = remote_schema()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            row = cur.execute(
+                f"SELECT 1 FROM {schema}.clusters WHERE id = %(cluster_id)s",
+                {"cluster_id": cluster_id},
+            ).fetchone()
+            if not row:
+                return None
+            status = cur.execute(
+                f"""SELECT feedback_kind
+                      FROM {schema}.cluster_status
+                     WHERE user_id = %(user_id)s
+                       AND cluster_id = %(cluster_id)s""",
+                {"user_id": user_id, "cluster_id": cluster_id},
+            ).fetchone()
+            if status and status.get("feedback_kind") == kind:
+                cur.execute(
+                    f"""UPDATE {schema}.cluster_status
+                           SET feedback_kind = NULL,
+                               feedback_at = NULL,
+                               feedback_note = NULL
+                         WHERE user_id = %(user_id)s
+                           AND cluster_id = %(cluster_id)s""",
+                    {"user_id": user_id, "cluster_id": cluster_id},
+                )
+                conn.commit()
+                clear_user_cache_keys(user_id)
+                return {
+                    "ok": True,
+                    "feedback_kind": None,
+                    "feedback_note": None,
+                    "data_backend": status_backend(),
+                }
+
+            cur.execute(
+                f"""INSERT INTO {schema}.cluster_status (
+                         user_id, cluster_id, feedback_kind, feedback_at, feedback_note
+                       )
+                       VALUES (%(user_id)s, %(cluster_id)s, %(kind)s, now(), %(note)s)
+                       ON CONFLICT (user_id, cluster_id) DO UPDATE SET
+                         feedback_kind = excluded.feedback_kind,
+                         feedback_at = excluded.feedback_at,
+                         feedback_note = excluded.feedback_note""",
+                {
+                    "user_id": user_id,
+                    "cluster_id": cluster_id,
+                    "kind": kind,
+                    "note": note,
+                },
+            )
+        conn.commit()
+    clear_user_cache_keys(user_id)
+    return {
+        "ok": True,
+        "feedback_kind": kind,
+        "feedback_note": note,
+        "data_backend": status_backend(),
+    }
+
+
+def set_admin_highlight_cluster_override_remote(
+    *,
+    cluster_id: int,
+    user_id: str,
+    action: str,
+    note: str | None = None,
+) -> dict[str, Any] | None:
+    """Set/clear display override and its admin label in one transaction."""
+    if action not in {"force_show", "force_hide", "clear"}:
+        raise ValueError("invalid override action")
+    schema = remote_schema()
+    with connect() as conn:
+        exists = conn.execute(
+            f"SELECT 1 FROM {schema}.clusters WHERE id = %(cluster_id)s",
+            {"cluster_id": cluster_id},
+        ).fetchone()
+        if not exists:
+            return None
+
+        if action == "clear":
+            row = conn.execute(
+                f"""UPDATE {schema}.highlight_cluster_decisions
+                       SET manual_display = NULL,
+                           manual_display_at = NULL
+                     WHERE cluster_id = %(cluster_id)s
+                 RETURNING manual_display, manual_display_at""",
+                {"cluster_id": cluster_id},
+            ).fetchone()
+            conn.execute(
+                f"""UPDATE {schema}.cluster_status
+                       SET feedback_kind = NULL,
+                           feedback_at = NULL,
+                           feedback_note = NULL
+                     WHERE user_id = %(user_id)s
+                       AND cluster_id = %(cluster_id)s""",
+                {"user_id": user_id, "cluster_id": cluster_id},
+            )
+            feedback_kind = None
+            feedback_note = None
+        else:
+            feedback_kind = "should_feature" if action == "force_show" else "irrelevant"
+            row = conn.execute(
+                f"""INSERT INTO {schema}.highlight_cluster_decisions AS target (
+                         cluster_id, decision, cluster_verdict, verdict_counts_json,
+                         snapshot_json, manual_display, manual_display_at
+                       )
+                       SELECT id, 'pending', 'pending', '{{}}'::jsonb,
+                              '{{}}'::jsonb, %(action)s, now()
+                         FROM {schema}.clusters
+                        WHERE id = %(cluster_id)s
+                       ON CONFLICT (cluster_id) DO UPDATE SET
+                         manual_display = excluded.manual_display,
+                         manual_display_at = CASE
+                           WHEN target.manual_display IS DISTINCT FROM excluded.manual_display
+                             THEN excluded.manual_display_at
+                           ELSE target.manual_display_at
+                         END
+                   RETURNING manual_display, manual_display_at""",
+                {"cluster_id": cluster_id, "action": action},
+            ).fetchone()
+            conn.execute(
+                f"""INSERT INTO {schema}.cluster_status (
+                         user_id, cluster_id, feedback_kind, feedback_at, feedback_note
+                       )
+                       VALUES (
+                         %(user_id)s, %(cluster_id)s, %(feedback_kind)s, now(), %(note)s
+                       )
+                       ON CONFLICT (user_id, cluster_id) DO UPDATE SET
+                         feedback_kind = excluded.feedback_kind,
+                         feedback_at = excluded.feedback_at,
+                         feedback_note = excluded.feedback_note""",
+                {
+                    "user_id": user_id,
+                    "cluster_id": cluster_id,
+                    "feedback_kind": feedback_kind,
+                    "note": note,
+                },
+            )
+            feedback_note = note
+        conn.execute(
+            f"""UPDATE {schema}.clusters
+                   SET last_updated_at = now()
+                 WHERE id = %(cluster_id)s""",
+            {"cluster_id": cluster_id},
+        )
+        conn.commit()
+
+    clear_feed_cache_keys()
+    clear_user_cache_keys(user_id)
+    return {
+        "ok": True,
+        "manual_display": (row or {}).get("manual_display"),
+        "manual_display_at": to_utc_iso((row or {}).get("manual_display_at")),
+        "feedback_kind": feedback_kind,
+        "feedback_note": feedback_note,
         "data_backend": status_backend(),
     }
 
@@ -13324,6 +15107,7 @@ def _library_cluster_entry(row: dict[str, Any], *, status_field: str) -> dict[st
         "id": int(row["id"]),
         "ai_title": row.get("ai_title"),
         "ai_summary": row.get("ai_summary"),
+        "why_read": row.get("why_read"),
         "doc_count": int(row.get("doc_count") or 0),
         "unique_source_count": int(row.get("unique_source_count") or 0),
         "platforms": _json_array(row.get("platforms_json")),
@@ -13422,7 +15206,7 @@ def query_library(
             cluster_params,
         ).fetchone()
         cluster_rows = conn.execute(
-            f"""SELECT c.id, c.ai_title, c.ai_summary, c.doc_count,
+            f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.doc_count,
                        c.unique_source_count, c.platforms_json,
                        COALESCE(NULLIF(c.cover_url, ''), detail_cover.cover_url) AS cover_url,
                        c.first_doc_at, c.last_doc_at, c.live_version,
@@ -13762,7 +15546,7 @@ def context_search(
         out["degraded_reason"] = "context_search_events_unavailable"
         return out
     def _events_search_sql(where_clause: str) -> str:
-        return f"""SELECT c.id, c.ai_title, c.ai_summary, c.doc_count,
+        return f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.doc_count,
                            c.unique_source_count, c.first_doc_at, c.last_doc_at,
                            c.platforms_json,
                            COALESCE(NULLIF(c.cover_url, ''), event_cover.cover_url) AS cover_url,
@@ -13972,8 +15756,9 @@ def query_feed_sections(
     # v18.0 Spec-2.5: 分组键优先 multi-tag ai_categories[0]，缺失时 fallback
     # 到单字段 ai_category（OR 过滤后允许此分支），仍空兜底 _uncategorized。
     category_expr = _section_category_expr("i")
-    live_overlay_enabled = bool(_info_live_overlay_enabled())
-    result_cache_ttl = _feed_result_cache_lookup_ttl(live_overlay_enabled=live_overlay_enabled)
+    # perf-v27 P3: live overlay 已删——读模型刷新绑定抓取(≤15min 旧),
+    # 不再需要请求时现场补新鲜(1500ms 超时反复失败正是两次冻结事故的级联症状)。
+    result_cache_ttl = _feed_result_cache_ttl_sec()
     result_cache_key = (
         "feed_sections_result",
         schema,
@@ -13983,9 +15768,6 @@ def query_feed_sections(
         bool(public_only),
         manual_owner_user_id or "",
         int(min_github_stars),
-        live_overlay_enabled,
-        int(_info_live_overlay_limit()),
-        int(_info_live_overlay_per_scope_limit()),
     )
     cached_result = _cache_get_copy_with_ttl(result_cache_key, result_cache_ttl)
     if cached_result is not None:
@@ -14196,6 +15978,8 @@ def query_feed_by_category(
             return search_read_model_result
         if (
             not keyword
+            # ENG-0710: 子板块搜索 scope 已不物化,该组合放行到下方 live(带独立预算)
+            and not subcategory
             and not manual_owner_user_id
             and _can_use_info_search_read_model(
                 search=search,
@@ -14240,13 +16024,9 @@ def query_feed_by_category(
     _add_search_filter(where, params, search, param_key="global_search_like")
     _add_search_filter(where, params, keyword, param_key="keyword_search_like")
     if subcategory:
-        params["subcategory"] = subcategory
-        where.append(
-            """EXISTS (
-              SELECT 1 FROM jsonb_array_elements_text(i.ai_subcategories) AS subcat(value)
-              WHERE subcat.value = %(subcategory)s
-            )"""
-        )
+        # ENG-0710: @> 走 GIN(jsonb_path_ops) 索引;SRF 展开形态实测 11.75s 必超预算
+        params["subcategory_arr"] = json.dumps([subcategory])
+        where.append("i.ai_subcategories @> %(subcategory_arr)s::jsonb")
     where.append("i.visible = 1")
     _add_ai_relevance_filter(where)
     count_cache_key = (
@@ -14261,11 +16041,24 @@ def query_feed_by_category(
         user_id or "",
         int(min_github_stars),
     )
-    if _remote_feed_live_circuit_open():
+    live_blocked = (
+        _remote_feed_live_runtime_circuit_open()
+        if subcategory
+        else _remote_feed_live_circuit_open()
+    )
+    if live_blocked:
         return _degraded_feed_category_result(category)
+    live_timeout_ms = _remote_feed_live_timeout_ms()
+    if subcategory:
+        # 子板块视图不再物化、只此一条路;热门子板块冷缓存 @> count 实测 ~4s,
+        # 给独立更宽预算(请求级 30s 墙钟仍兜底),count 命中缓存后秒回
+        live_timeout_ms = max(
+            live_timeout_ms,
+            _env_int(_runtime_env(), SUBCATEGORY_LIVE_TIMEOUT_MS_ENV, 10000, min_value=1000),
+        )
     try:
         with connect() as conn:
-            _set_short_statement_timeout(conn, _remote_feed_live_timeout_ms())
+            _set_short_statement_timeout(conn, live_timeout_ms)
             count = _cache_get(count_cache_key)
             if count is None:
                 count_params = dict(params)
@@ -14902,13 +16695,13 @@ def _can_use_info_search_read_model(
     public_only: bool,
     min_github_stars: int,
 ) -> bool:
-    if not search:
-        return False
-    if not _info_read_model_enabled():
-        return False
-    if not public_only and not user_id:
-        return False
-    return int(min_github_stars) == INFO_READ_MODEL_MIN_GITHUB_STARS
+    # perf-v27 P4: 恒 False——搜索统一改走 live(items trgm 索引,覆盖 90 天
+    # 全保留期)。读模型 card_items 已收缩到 7 天热窗口,继续在卡片上搜会把
+    # 搜索覆盖面静默砍到 7 天(违反"搜 OpenAI 出全部历史"的产品承诺)。
+    # gate 关闭后:4 个 *_search_read_model 函数早退 None、各入口的
+    # "search read model unavailable" 降级短路全部跳过 → 既有 live 搜索段
+    # (自带预算+熔断)接管。函数保留作路由地标;函数体清理列入 backlog。
+    return False
 
 
 def _read_model_card_search_sql(
@@ -15066,13 +16859,8 @@ def _private_manual_category_where(
         where.append(f"{category_expr} = ANY(%(category_ids)s)")
     clean_subcategory = str(subcategory or "").strip()
     if clean_subcategory:
-        params["subcategory"] = clean_subcategory
-        where.append(
-            """EXISTS (
-              SELECT 1 FROM jsonb_array_elements_text(i.ai_subcategories) AS subcat(value)
-              WHERE subcat.value = %(subcategory)s
-            )"""
-        )
+        params["subcategory_arr"] = json.dumps([clean_subcategory])
+        where.append("i.ai_subcategories @> %(subcategory_arr)s::jsonb")
     return where, params
 
 
@@ -15414,37 +17202,6 @@ def _item_from_read_model_card(value: Any) -> dict[str, Any] | None:
     return _normalize_item(data)
 
 
-def _info_live_overlay_enabled(env: dict[str, str] | None = None) -> bool:
-    return _truthy((env or _runtime_env()).get(INFO_READ_MODEL_LIVE_OVERLAY_ENV))
-
-
-def _info_live_overlay_limit(env: dict[str, str] | None = None) -> int:
-    return _env_int(env or _runtime_env(), INFO_READ_MODEL_LIVE_OVERLAY_LIMIT_ENV, 120, min_value=0)
-
-
-def _info_live_overlay_per_scope_limit(env: dict[str, str] | None = None) -> int:
-    return _env_int(env or _runtime_env(), INFO_READ_MODEL_LIVE_OVERLAY_PER_SCOPE_LIMIT_ENV, 20, min_value=1)
-
-
-def _info_live_overlay_timeout_ms(env: dict[str, str] | None = None) -> int:
-    return _env_int(env or _runtime_env(), INFO_READ_MODEL_LIVE_OVERLAY_TIMEOUT_MS_ENV, 1500, min_value=250)
-
-
-def _info_live_overlay_result_cache_ttl(env: dict[str, str] | None = None) -> int:
-    values = env or _runtime_env()
-    ttl = _env_int(values, INFO_READ_MODEL_LIVE_OVERLAY_RESULT_CACHE_TTL_ENV, 30, min_value=0)
-    remote_ttl = _remote_cache_ttl(values)
-    if ttl <= 0 or remote_ttl <= 0:
-        return 0
-    return min(ttl, remote_ttl)
-
-
-def _feed_result_cache_lookup_ttl(*, live_overlay_enabled: bool) -> int:
-    if live_overlay_enabled:
-        return _info_live_overlay_result_cache_ttl()
-    return _remote_cache_ttl()
-
-
 def _feed_result_cache_ttl(result: dict[str, Any] | None) -> int:
     if not isinstance(result, dict):
         return 0
@@ -15452,11 +17209,7 @@ def _feed_result_cache_ttl(result: dict[str, Any] | None) -> int:
         return 0
     if result.get("read_model_stale"):
         return 0
-    if result.get("live_overlay_enabled"):
-        if result.get("live_overlay_error"):
-            return 0
-        return _info_live_overlay_result_cache_ttl()
-    return _remote_cache_ttl()
+    return _feed_result_cache_ttl_sec()
 
 
 def _feed_result_cacheable(result: dict[str, Any] | None) -> bool:
@@ -15484,302 +17237,6 @@ def _max_item_fetched_at(*groups: list[dict[str, Any]]) -> str | None:
     if not timestamps:
         return None
     return max(timestamps, key=sort_key)
-
-
-def _query_info_live_overlay_items(
-    conn: Any,
-    schema: str,
-    *,
-    active_version_id: Any,
-    active_max_fetched_at: Any,
-    scope_dimension: str,
-    user_id: str | None,
-    public_only: bool,
-    manual_owner_user_id: str | None,
-    min_github_stars: int,
-) -> dict[str, Any]:
-    env = _runtime_env()
-    enabled = _info_live_overlay_enabled(env)
-    limit = _info_live_overlay_limit(env)
-    per_scope_limit = min(max(limit, 0), _info_live_overlay_per_scope_limit(env)) if limit > 0 else 0
-    meta: dict[str, Any] = {
-        "enabled": enabled,
-        "attempted": False,
-        "limit": limit,
-        "per_scope_limit": per_scope_limit,
-        "timeout_ms": _info_live_overlay_timeout_ms(env),
-        "after": _timestamp_value(active_max_fetched_at),
-    }
-    if not enabled:
-        return {"items": [], "meta": meta, "cacheable": True}
-    if limit <= 0 or not active_version_id or not active_max_fetched_at:
-        meta["skipped"] = "missing_active_version_or_limit"
-        return {"items": [], "meta": meta, "cacheable": False}
-
-    where, params = _base_item_where(
-        public_only=public_only,
-        manual_owner_user_id=manual_owner_user_id,
-        min_github_stars=min_github_stars,
-    )
-    where.append("i.visible = 1")
-    _add_ai_relevance_filter(where)
-    where.append("i.fetched_at > %(overlay_after)s::timestamptz")
-    params["version_id"] = str(active_version_id)
-    params["overlay_after"] = _timestamp_value(active_max_fetched_at) or str(active_max_fetched_at)
-    params["overlay_limit"] = limit
-    params["overlay_per_scope_limit"] = per_scope_limit
-    status_join, status_params, status_alias = _item_status_join(schema, user_id)
-    params.update(status_params)
-    section_expr = _section_category_expr("i")
-    if scope_dimension == "platform":
-        partition_expr = "recent.platform"
-    elif scope_dimension == "section_category":
-        partition_expr = "recent.section_category"
-    else:
-        meta["skipped"] = "unsupported_scope_dimension"
-        return {"items": [], "meta": meta, "cacheable": False}
-
-    try:
-        meta["attempted"] = True
-        if not _set_info_read_model_timeouts(
-            conn,
-            statement_timeout_ms=_info_live_overlay_timeout_ms(env),
-        ):
-            meta["fallback_reason"] = "info_live_overlay_timeout_setup_failed"
-            return {"items": [], "meta": meta, "cacheable": False}
-        rows = conn.execute(
-            f"""WITH recent AS MATERIALIZED (
-                    SELECT {_feed_cols(status_alias, include_heavy_json=False)},
-                           {section_expr} AS section_category
-                      FROM {schema}.items i
-                      {status_join}
-                     {_where_sql(where)}
-                     ORDER BY COALESCE(i.published_at, i.fetched_at) DESC NULLS LAST,
-                              i.fetched_at DESC NULLS LAST,
-                              i.relevance_score DESC NULLS LAST,
-                              i.id DESC
-                     LIMIT %(overlay_limit)s
-                ),
-                ranked AS (
-                    SELECT recent.*,
-                           row_number() OVER (
-                               PARTITION BY {partition_expr}
-                               ORDER BY COALESCE(recent.published_at, recent.fetched_at) DESC NULLS LAST,
-                                        recent.fetched_at DESC NULLS LAST,
-                                        recent.relevance_score DESC NULLS LAST,
-                                        recent.id DESC
-                           ) AS overlay_rn
-                      FROM recent
-                )
-                SELECT *
-                 FROM ranked
-                 WHERE overlay_rn <= %(overlay_per_scope_limit)s
-                 ORDER BY COALESCE(published_at, fetched_at) DESC NULLS LAST,
-                          fetched_at DESC NULLS LAST,
-                          relevance_score DESC NULLS LAST,
-                          id DESC""",
-            params,
-        ).fetchall()
-        # End the read-only transaction before Python-side normalization and
-        # response merging. Under client timeouts, keeping the transaction open
-        # here can strand Supavisor sessions as idle-in-transaction.
-        _commit_safely(conn)
-    except Exception as exc:
-        _rollback_safely(conn)
-        meta["error"] = str(exc)[:200]
-        meta["fallback_reason"] = "info_live_overlay_failed"
-        return {"items": [], "meta": meta, "cacheable": False}
-
-    items: list[dict[str, Any]] = []
-    for row in rows:
-        data = dict(row)
-        data.pop("overlay_rn", None)
-        category = data.get("section_category") or _section_category_from_row(data)
-        item = _normalize_item(data)
-        item["section_category"] = category
-        items.append(item)
-    meta["count"] = len(items)
-    meta["latest_fetched_at"] = _max_item_fetched_at(items)
-    return {"items": items, "meta": meta, "cacheable": False}
-
-
-def _attach_info_live_overlay_meta(
-    result: dict[str, Any],
-    overlay: dict[str, Any],
-) -> dict[str, Any]:
-    meta = overlay.get("meta") if isinstance(overlay, dict) else None
-    if not isinstance(meta, dict) or not meta.get("enabled"):
-        return result
-    out = dict(result)
-    out["live_overlay_enabled"] = True
-    out["live_overlay"] = bool(out.get("live_overlay"))
-    out["live_overlay_count"] = int(out.get("live_overlay_count") or meta.get("count") or 0)
-    out["live_overlay_after"] = meta.get("after")
-    out["live_overlay_limit"] = meta.get("limit")
-    out["live_overlay_per_scope_limit"] = meta.get("per_scope_limit")
-    out["live_overlay_timeout_ms"] = meta.get("timeout_ms")
-    out["live_overlay_attempted"] = bool(meta.get("attempted"))
-    if meta.get("latest_fetched_at"):
-        out["live_overlay_latest_fetched_at"] = meta.get("latest_fetched_at")
-    if meta.get("skipped"):
-        out["live_overlay_skipped"] = meta.get("skipped")
-    if meta.get("error"):
-        out["live_overlay_error"] = meta.get("error")
-        out["fallback_reason"] = meta.get("fallback_reason")
-    return out
-
-
-def _merge_info_live_overlay_platforms(
-    result: dict[str, Any],
-    overlay_items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not overlay_items:
-        return result
-    limit = max(1, min(int(result.get("sample_limit") or 50), 200))
-    out = dict(result)
-    sections = {key: list(items) for key, items in (result.get("sections") or {}).items()}
-    platform_counts = dict(result.get("platform_counts") or {})
-    source_counts = {
-        key: dict(value)
-        for key, value in (result.get("source_counts") or {}).items()
-    }
-    category_counts = {
-        key: dict(value)
-        for key, value in (result.get("category_counts") or {}).items()
-    }
-    platform_next_cursors = dict(result.get("platform_next_cursors") or {})
-    base_ids_by_platform = {
-        key: {str(item.get("id") or "") for item in items if item.get("id")}
-        for key, items in sections.items()
-    }
-    existing_ids = {
-        str(item.get("id") or "")
-        for items in sections.values()
-        for item in items
-        if item.get("id")
-    }
-    applied: list[dict[str, Any]] = []
-    by_platform: dict[str, list[dict[str, Any]]] = {}
-    for item in overlay_items:
-        item_id = str(item.get("id") or "")
-        is_duplicate = bool(item_id and item_id in existing_ids)
-        if item_id and not is_duplicate:
-            existing_ids.add(item_id)
-        platform = item.get("platform") or "_unknown"
-        source = item.get("source") or ""
-        by_platform.setdefault(platform, []).append(item)
-        if not is_duplicate:
-            platform_counts[platform] = int(platform_counts.get(platform) or 0) + 1
-            source_bucket = source_counts.setdefault(platform, {})
-            source_bucket[source] = int(source_bucket.get(source) or 0) + 1
-            category_bucket = category_counts.setdefault(platform, {})
-            for category in _item_info_categories(item):
-                category_bucket[category] = int(category_bucket.get(category) or 0) + 1
-        applied.append(item)
-
-    if not applied:
-        return result
-    for platform, items in by_platform.items():
-        sections[platform] = _merge_overlay_items(sections.get(platform, []), items, limit=limit)
-    for platform, cursor in list(platform_next_cursors.items()):
-        if not cursor:
-            continue
-        base_ids = base_ids_by_platform.get(platform, set())
-        retained = sum(
-            1
-            for item in sections.get(platform, [])
-            if str(item.get("id") or "") in base_ids
-        )
-        platform_next_cursors[platform] = _info_read_model_next_cursor(
-            version_id=cursor.get("version_id"),
-            scope_key=cursor.get("scope_key"),
-            rank_after=retained,
-            total_count=int(platform_counts.get(platform) or 0),
-            exclude_ids=_item_ids_for_cursor(sections.get(platform, [])),
-        )
-
-    out["sections"] = sections
-    out["platform_counts"] = platform_counts
-    out["source_counts"] = source_counts
-    out["category_counts"] = category_counts
-    if platform_next_cursors:
-        out["platform_next_cursors"] = platform_next_cursors
-    out["overview_max_fetched_at"] = _max_item_fetched_at(
-        [{"fetched_at": result.get("overview_max_fetched_at")}],
-        applied,
-    )
-    out["live_overlay"] = True
-    out["live_overlay_count"] = len(applied)
-    return out
-
-
-def _merge_info_live_overlay_sections(
-    result: dict[str, Any],
-    overlay_items: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not overlay_items:
-        return result
-    limit = max(1, min(int(result.get("sample_limit") or 50), 200))
-    out = dict(result)
-    sections = {key: list(items) for key, items in (result.get("sections") or {}).items()}
-    cat_counts = dict(result.get("cat_counts") or {})
-    section_next_cursors = dict(result.get("section_next_cursors") or {})
-    base_ids_by_category = {
-        key: {str(item.get("id") or "") for item in items if item.get("id")}
-        for key, items in sections.items()
-    }
-    existing_ids = {
-        str(item.get("id") or "")
-        for items in sections.values()
-        for item in items
-        if item.get("id")
-    }
-    applied: list[dict[str, Any]] = []
-    by_category: dict[str, list[dict[str, Any]]] = {}
-    for item in overlay_items:
-        item_id = str(item.get("id") or "")
-        is_duplicate = bool(item_id and item_id in existing_ids)
-        if item_id and not is_duplicate:
-            existing_ids.add(item_id)
-        category = item.get("section_category") or _section_category_from_row(item)
-        by_category.setdefault(category, []).append(item)
-        if not is_duplicate:
-            cat_counts[category] = int(cat_counts.get(category) or 0) + 1
-        applied.append(item)
-
-    if not applied:
-        return result
-    for category, items in by_category.items():
-        sections[category] = _merge_overlay_items(sections.get(category, []), items, limit=limit)
-    for category, cursor in list(section_next_cursors.items()):
-        if not cursor:
-            continue
-        base_ids = base_ids_by_category.get(category, set())
-        retained = sum(
-            1
-            for item in sections.get(category, [])
-            if str(item.get("id") or "") in base_ids
-        )
-        section_next_cursors[category] = _info_read_model_next_cursor(
-            version_id=cursor.get("version_id"),
-            scope_key=cursor.get("scope_key"),
-            rank_after=retained,
-            total_count=int(cat_counts.get(category) or 0),
-            exclude_ids=_item_ids_for_cursor(sections.get(category, [])),
-        )
-
-    out["sections"] = sections
-    out["cat_counts"] = cat_counts
-    out["total"] = sum(int(value or 0) for value in cat_counts.values())
-    if section_next_cursors:
-        out["section_next_cursors"] = section_next_cursors
-    out["overview_max_fetched_at"] = _max_item_fetched_at(
-        [{"fetched_at": result.get("overview_max_fetched_at")}],
-        applied,
-    )
-    out["live_overlay"] = True
-    out["live_overlay_count"] = len(applied)
-    return out
 
 
 def _query_feed_sections_search_read_model(
@@ -16159,7 +17616,6 @@ def _query_feed_platforms_read_model(
     ):
         return None
     safe_limit = max(1, min(int(per_platform), 200))
-    live_overlay: dict[str, Any] = {"items": [], "meta": {"enabled": False}, "cacheable": True}
     try:
         with connect() as conn:
             if not _set_info_read_model_timeouts(conn):
@@ -16220,18 +17676,13 @@ def _query_feed_platforms_read_model(
                 {"version_id": version_id, "limit": safe_limit},
             ).fetchall()
             _commit_safely(conn)
-            live_overlay = _query_info_live_overlay_items(
-                conn,
-                schema,
-                active_version_id=active.get("version_id"),
-                active_max_fetched_at=active.get("max_fetched_at"),
-                scope_dimension="platform",
-                user_id=user_id,
-                public_only=public_only,
-                manual_owner_user_id=manual_owner_user_id,
-                min_github_stars=min_github_stars,
-            )
     except Exception:
+        return None
+
+    # perf-v27 P4: platform/source/category 维度已不再物化——新版本读模型里
+    # 这些 scope 不存在,必须显式返回 None 让调用方落到 live 现场查,
+    # 否则会把"维度已下线"渲染成空平台视图。
+    if not scope_rows:
         return None
 
     platform_counts: dict[str, int] = {}
@@ -16304,8 +17755,6 @@ def _query_feed_platforms_read_model(
         "read_model_version_id": version_id_str,
         "platform_next_cursors": platform_next_cursors,
     }
-    result = _merge_info_live_overlay_platforms(result, list(live_overlay.get("items") or []))
-    result = _attach_info_live_overlay_meta(result, live_overlay)
     overlay = _query_private_manual_platforms_overlay(
         schema=schema,
         per_platform=per_platform,
@@ -16338,7 +17787,6 @@ def _query_feed_sections_read_model(
     ):
         return None
     safe_limit = max(1, min(int(per_category), 200))
-    live_overlay: dict[str, Any] = {"items": [], "meta": {"enabled": False}, "cacheable": True}
     try:
         with connect() as conn:
             if not _set_info_read_model_timeouts(conn):
@@ -16398,18 +17846,10 @@ def _query_feed_sections_read_model(
                                page.item_id DESC""",
                 {"version_id": version_id, "limit": safe_limit},
             ).fetchall()
+            # perf-v27 P4: 表头计数用全量快照覆盖(90 天保留期总量,post-fetch
+            # 重算)——scopes.total_count 现在只反映 7 天热窗口。
+            snapshot_counts = _info_pill_counts_overlay(conn, schema, "section_category")
             _commit_safely(conn)
-            live_overlay = _query_info_live_overlay_items(
-                conn,
-                schema,
-                active_version_id=active.get("version_id"),
-                active_max_fetched_at=active.get("max_fetched_at"),
-                scope_dimension="section_category",
-                user_id=user_id,
-                public_only=public_only,
-                manual_owner_user_id=manual_owner_user_id,
-                min_github_stars=min_github_stars,
-            )
     except Exception:
         return None
 
@@ -16418,6 +17858,8 @@ def _query_feed_sections_read_model(
         data = dict(row)
         category = data.get("category") or UNCATEGORIZED_SENTINEL
         total = int(data.get("total_count") or 0)
+        snapshot_total = int(snapshot_counts.get(category) or 0)
+        total = max(total, snapshot_total)
         if total > 0:
             cat_counts[category] = total
     if not cat_counts:
@@ -16475,7 +17917,7 @@ def _query_feed_sections_read_model(
         }
         if next_cursor:
             page["next_cursor"] = next_cursor
-        if not user_id and bool(live_overlay.get("cacheable", True)):
+        if not user_id:
             _cache_set_copy(
                 _info_read_model_section_category_page_cache_key(
                     schema=schema,
@@ -16499,8 +17941,6 @@ def _query_feed_sections_read_model(
         "read_model_version_id": version_id_str,
         "section_next_cursors": section_next_cursors,
     }
-    result = _merge_info_live_overlay_sections(result, list(live_overlay.get("items") or []))
-    result = _attach_info_live_overlay_meta(result, live_overlay)
     overlay = _query_private_manual_sections_overlay(
         schema=schema,
         per_category=per_category,
@@ -16558,6 +17998,12 @@ def _query_feed_by_category_read_model(
     cursor_version_id = str(cursor_state["version_id"]) if cursor_state else None
     cursor_exclude_ids = list(cursor_state.get("exclude_ids") or []) if cursor_state else []
     effective_offset = int(cursor_state["rank_after"]) if cursor_state else safe_offset
+    # perf-v27 P4: 读模型只物化每 scope 首屏 TOP_N(7 天热窗口)——它只服务
+    # 第一页;任何续页(offset>0 或带 cursor)一律返回 None,落到 live 现场
+    # keyset 查询(覆盖 90 天全保留期,含滑进冷数据)。若在这里继续用被
+    # 封顶的 total 判 has_more,模块流会在 7 天/50 条处假性到底。
+    if effective_offset > 0 or cursor_state:
+        return None
     page_cache_key = _info_read_model_section_category_page_cache_key(
         schema=schema,
         category=cache_category,
@@ -16579,7 +18025,7 @@ def _query_feed_by_category_read_model(
     exclude_predicate_sql = "NOT (si.item_id = ANY(%(exclude_ids)s))" if cursor_exclude_ids else "TRUE"
     try:
         with connect() as conn:
-            _set_short_statement_timeout(conn, 2500)
+            _set_short_statement_timeout(conn, _feed_more_timeout_ms())
             rows = conn.execute(
                 f"""WITH active_version AS (
                        SELECT v.version_id, v.generated_at, v.max_fetched_at
@@ -16599,7 +18045,7 @@ def _query_feed_by_category_read_model(
                         LIMIT 1
                      ),
                      scope_rows AS (
-                       SELECT sc.version_id, sc.scope_key
+                       SELECT sc.version_id, sc.scope_key, sc.total_count
                          FROM {schema}.info_scopes sc
                          JOIN active_version av
                            ON av.version_id = sc.version_id
@@ -16608,17 +18054,8 @@ def _query_feed_by_category_read_model(
                      ),
                      summary AS (
                        SELECT count(*)::integer AS scope_count,
-                              (
-                                SELECT count(*)::integer
-                                  FROM scope_rows sr
-                                  JOIN {schema}.info_scope_items si
-                                    ON si.version_id = sr.version_id
-                                   AND si.scope_key = sr.scope_key
-                                  JOIN {schema}.info_card_items ci
-                                    ON ci.version_id = si.version_id
-                                   AND ci.item_id = si.item_id
-                                 WHERE {_info_display_source_filter("ci")}
-                              ) AS total_count
+                              max(total_count)::integer AS total_count
+                         FROM scope_rows
                      ),
                      page_rows AS (
                        SELECT si.rank, si.fetched_at, si.relevance_score, si.item_id,
@@ -16672,16 +18109,23 @@ def _query_feed_by_category_read_model(
         if item
     ]
     items = _apply_user_status_overlay(schema=schema, items=items, user_id=user_id)
+    if not items:
+        # perf-v27 P4: 模型有 scope 但首页无可渲染行(如展示源过滤后为空)——
+        # 交给 live,别把空首页当"该模块没内容"。
+        return None
     next_offset = effective_offset + len(items)
     version_id = str(first_row.get("version_id")) if first_row.get("version_id") else None
+    # perf-v27 P4: has_more 恒 True + 不下发读模型 cursor——模型只知道 7 天
+    # 热窗口的 total,判不了"90 天里还有没有更老的"。续页由前端带 offset 发起,
+    # 本函数对 offset>0 返回 None → live keyset 接管直到真正到底。
     result = {
         "items": items,
         "category": category,
         "total": total,
         "offset": effective_offset,
         "limit": safe_limit,
-        "has_more": next_offset < total,
-        "next_offset": next_offset if next_offset < total else None,
+        "has_more": True,
+        "next_offset": next_offset,
         "data_backend": feed_read_backend(),
         "read_model": "info_platforms_v1",
         "read_model_version_id": version_id,
@@ -16691,14 +18135,6 @@ def _query_feed_by_category_read_model(
         "overview_generated_at": _timestamp_value(first_row.get("generated_at")),
         "overview_max_fetched_at": _timestamp_value(first_row.get("max_fetched_at")),
     }
-    if next_offset < total:
-        result["next_cursor"] = {
-            "version_id": version_id,
-            "scope_key": scope_key,
-            "rank_after": next_offset,
-        }
-        if cursor_exclude_ids:
-            result["next_cursor"]["exclude_ids"] = cursor_exclude_ids
     if user_id:
         return result
     if cursor_exclude_ids:
@@ -16950,6 +18386,7 @@ def _query_feed_by_platform_read_model(
     exclude_sql = "AND NOT (si.item_id = ANY(%(exclude_ids)s))" if effective_exclude_ids else ""
     try:
         with connect() as conn:
+            _set_short_statement_timeout(conn, _feed_more_timeout_ms())
             rows = conn.execute(
                 f"""WITH active_version AS (
                        SELECT v.version_id, v.generated_at, v.max_fetched_at
@@ -16969,16 +18406,7 @@ def _query_feed_by_platform_read_model(
                         LIMIT 1
                      ),
                      scope_row AS (
-                       SELECT (
-                                SELECT count(*)::integer
-                                  FROM {schema}.info_scope_items si
-                                  JOIN {schema}.info_card_items ci
-                                    ON ci.version_id = si.version_id
-                                   AND ci.item_id = si.item_id
-                                 WHERE si.version_id = sc.version_id
-                                   AND si.scope_key = sc.scope_key
-                                   AND {_info_display_source_filter("ci")}
-                              ) AS total_count
+                       SELECT sc.total_count
                          FROM {schema}.info_scopes sc
                          JOIN active_version av
                            ON av.version_id = sc.version_id
@@ -17252,17 +18680,17 @@ def prewarm_info_read_model_pages(*, max_scopes: int = 5, page_limit: int = 50, 
             version_id = active["version_id"]
             rows = conn.execute(
                 f"""WITH ranked_scopes AS (
+                       -- perf-v27 P4: 只剩 section_category 维度(其余维度已不物化,
+                       -- 走 live)。此查询原是 info 侧最重循环负载(生产实测均耗
+                       -- 14.9-16.35s/峰值顶满 30s 超时);收缩后仅 ~14 个 scope ×
+                       -- TOP_N 行,退化为平凡查询。
                        SELECT scope_key, platform, dimension, value, total_count,
                               row_number() OVER (
-                                PARTITION BY CASE
-                                  WHEN dimension IN ('section_category', 'section_subcategory') THEN dimension
-                                  ELSE 'platform_scope'
-                                END
                                 ORDER BY total_count DESC, scope_key
                               ) AS scope_rank
                          FROM {schema}.info_scopes
                         WHERE version_id = %(version_id)s
-                          AND dimension IN ('source', 'group', 'group_source', 'category', 'section_category', 'section_subcategory')
+                          AND dimension = 'section_category'
                           AND total_count > 0
                      ),
                      hot_scopes AS (
@@ -17413,8 +18841,7 @@ def query_feed_platforms(
     # BF-0515-singleflight: cache full /api/feed/platforms response (no result
     # cache existed before — every call ran 5 SQLs). Singleflight prevents N
     # cold-start callers from each running the same SQLs.
-    live_overlay_enabled = bool(_info_live_overlay_enabled())
-    result_cache_ttl = _feed_result_cache_lookup_ttl(live_overlay_enabled=live_overlay_enabled)
+    result_cache_ttl = _feed_result_cache_ttl_sec()
     result_cache_key = (
         "feed_platforms_result",
         schema,
@@ -17424,9 +18851,6 @@ def query_feed_platforms(
         bool(public_only),
         manual_owner_user_id or "",
         int(min_github_stars),
-        live_overlay_enabled,
-        int(_info_live_overlay_limit()),
-        int(_info_live_overlay_per_scope_limit()),
     )
     cached_result = _cache_get_copy_with_ttl(result_cache_key, result_cache_ttl)
     if cached_result is not None:
@@ -17686,9 +19110,12 @@ def query_feed_by_platform(
         )
         if search_read_model_result is not None:
             return search_read_model_result
+        platform_scope = _info_platform_scope(platform=platform, source=source, group=group, category=category)
         if (
             not (platform == "manual" and manual_owner_user_id)
-            and _info_platform_scope(platform=platform, source=source, group=group, category=category)
+            and platform_scope
+            # ENG-0710: group_source scope 已不物化,搜索组合放行到下方 live(无 circuit 门控)
+            and platform_scope[0] != "group_source"
             and _can_use_info_search_read_model(
                 search=search,
                 user_id=user_id,

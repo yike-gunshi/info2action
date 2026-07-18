@@ -30,13 +30,6 @@ const config: Config = {
           800: '#1A1917',
           900: '#0F0F0E',
         },
-        // Brand indigo
-        indigo: {
-          50:  '#EEEDFF',
-          400: '#818CF8',
-          500: '#6366F1',
-          600: '#4F52E4',
-        },
         // Semantic: amber (AI/suggestions/high score)
         amber: {
           DEFAULT: '#D97706',

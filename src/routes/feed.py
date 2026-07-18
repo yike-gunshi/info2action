@@ -91,6 +91,7 @@ def _cluster_entry_from_row(row, *, status_field: str) -> dict:
         'id': row['id'],
         'ai_title': row['ai_title'],
         'ai_summary': row['ai_summary'],
+        'why_read': row['why_read'],
         'doc_count': row['doc_count'],
         'unique_source_count': int(row['unique_source_count'] or 0),
         'platforms': platforms,
@@ -123,6 +124,27 @@ def load_json(path):
 
 def _github_display_min_stars() -> int:
     return db.github_min_stars_for_display()
+
+
+_FEED_FIRST_PAINT_PER_GROUP_ENV = "INFO2ACTION_FEED_FIRST_PAINT_PER_GROUP"
+_FEED_FIRST_PAINT_PER_GROUP_DEFAULT = 20
+_FEED_FIRST_PAINT_PER_GROUP_MIN = 5
+_FEED_FIRST_PAINT_PER_GROUP_MAX = 100
+
+
+def _feed_first_paint_per_group() -> int:
+    raw = (os.environ.get(_FEED_FIRST_PAINT_PER_GROUP_ENV) or "").strip()
+    if not raw:
+        value = _FEED_FIRST_PAINT_PER_GROUP_DEFAULT
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = _FEED_FIRST_PAINT_PER_GROUP_DEFAULT
+    return min(
+        _FEED_FIRST_PAINT_PER_GROUP_MAX,
+        max(_FEED_FIRST_PAINT_PER_GROUP_MIN, value),
+    )
 
 
 def _disabled_platforms() -> set[str]:
@@ -425,9 +447,15 @@ def get_feed(
     starred: bool = Query(False),
     clicked: bool = Query(False),
     search: str = Query(None),
-    limit: int = Query(0),
-    offset: int = Query(0),
+    limit: int = Query(0, ge=0, le=500),
+    offset: int = Query(0, ge=0, le=100000),
 ):
+    # 稳定性加固(2026-07-10): 该端点匿名可达。limit<=0 在本地/远端两个后端都表示
+    # "不加 LIMIT 全表拉取"(db.py:1551 / remote_db.py:14009),冷查询会撞
+    # statement_timeout 并触发 /api/feed 全局熔断,拖垮所有用户。给未指定/0 一个
+    # 有界默认;显式超大值由 Query(le=500) 直接 422 拒绝。
+    if limit <= 0:
+        limit = 100
     user_id = _get_user_id(request)
     public_only = _is_anonymous_public_request(request)
     manual_owner_user_id = _manual_owner_user_id(request)
@@ -561,7 +589,7 @@ def get_library(
         ]
 
         cluster_rows = conn.execute(
-            f"""SELECT c.id, c.ai_title, c.ai_summary, c.doc_count,
+            f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.doc_count,
                       c.unique_source_count, c.platforms_json,
                       COALESCE(NULLIF(c.cover_url, ''), (
                         SELECT i.cover_url
@@ -636,7 +664,7 @@ def _get_user_weights(conn, user_id):
 
 @router.get("/api/feed/sections")
 def get_feed_sections(request: Request, search: str = Query(None)):
-    """Return items grouped by ai_category (max 50 per category + real totals).
+    """Return items grouped by ai_category (first-paint sample per category + real totals).
 
     Ranking: quality × engagement × freshness_decay (× match_score for logged-in users with profile).
     """
@@ -645,17 +673,19 @@ def get_feed_sections(request: Request, search: str = Query(None)):
     public_only = _is_anonymous_public_request(request)
     manual_owner_user_id = _manual_owner_user_id(request)
     min_github_stars = _github_display_min_stars()
+    first_paint_per_group = _feed_first_paint_per_group()
+    per_category = 50 if search else first_paint_per_group
     feed_remote = remote_db.feed_read_from_remote()
     cache_key = None
     if feed_remote and search is None and is_public_get_request(request, public_only=public_only):
-        cache_key = ("feed_sections", _public_cache_scope(), min_github_stars)
+        cache_key = ("feed_sections", _public_cache_scope(), min_github_stars, first_paint_per_group)
         cached = get_public_json_response(cache_key)
         if cached is not None:
             return cached
     if feed_remote:
         try:
             result = remote_db.query_feed_sections(
-                per_category=50,
+                per_category=per_category,
                 search=search,
                 user_id=user_id,
                 public_only=public_only,
@@ -670,7 +700,7 @@ def get_feed_sections(request: Request, search: str = Query(None)):
 
     conn = db.get_conn()
     try:
-        sections, cat_counts = db.query_feed_sections(conn, user_id=user_id, per_category=50,
+        sections, cat_counts = db.query_feed_sections(conn, user_id=user_id, per_category=per_category,
                                                        public_only=public_only,
                                                        manual_owner_user_id=manual_owner_user_id)
         if search:
@@ -712,8 +742,8 @@ def get_feed_sections(request: Request, search: str = Query(None)):
 def get_feed_sections_more(
     request: Request,
     category: str = Query(...),
-    offset: int = Query(0),
-    limit: int = Query(50),
+    offset: int = Query(0, ge=0, le=100000),
+    limit: int = Query(50, ge=1, le=200),
     keyword: str = Query(None),
     search: str = Query(None),
     subcategory: str = Query(None),
@@ -828,7 +858,7 @@ def _get_category_counts_for_all_platforms(conn, *, user_id, public_only,
 
 @router.get("/api/feed/platforms")
 def get_feed_platforms(request: Request, search: str = Query(None)):
-    """Get items grouped by platform (each platform up to 50 items) + platform_counts.
+    """Get items grouped by platform (first-paint sample per platform) + platform_counts.
 
     v16.0 W3.T7: 同时返回 category_counts (每平台近 7 天 L1 分布) 给所有平台,
     前端按 PLATFORM_ORDER 区分 source 维度 vs L1 维度 section（decision-anchor #17/#18），
@@ -839,17 +869,19 @@ def get_feed_platforms(request: Request, search: str = Query(None)):
     public_only = _is_anonymous_public_request(request)
     manual_owner_user_id = _manual_owner_user_id(request)
     min_github_stars = _github_display_min_stars()
+    first_paint_per_group = _feed_first_paint_per_group()
+    per_platform = 50 if search else first_paint_per_group
     feed_remote = remote_db.feed_read_from_remote()
     cache_key = None
     if feed_remote and search is None and is_public_get_request(request, public_only=public_only):
-        cache_key = ("feed_platforms", _public_cache_scope(), min_github_stars)
+        cache_key = ("feed_platforms", _public_cache_scope(), min_github_stars, first_paint_per_group)
         cached = get_public_json_response(cache_key)
         if cached is not None:
             return cached
     if feed_remote:
         try:
             result = remote_db.query_feed_platforms(
-                per_platform=50,
+                per_platform=per_platform,
                 search=search,
                 user_id=user_id,
                 public_only=public_only,
@@ -866,7 +898,7 @@ def get_feed_platforms(request: Request, search: str = Query(None)):
     conn = db.get_conn()
     try:
         sections, platform_counts, source_counts = db.query_feed_platforms(
-            conn, user_id=user_id, per_platform=50, public_only=public_only,
+            conn, user_id=user_id, per_platform=per_platform, public_only=public_only,
             manual_owner_user_id=manual_owner_user_id)
         if search:
             needle = search.lower()
@@ -918,8 +950,8 @@ def get_feed_platforms(request: Request, search: str = Query(None)):
 def get_feed_platforms_more(
     request: Request,
     platform: str = Query(...),
-    offset: int = Query(0),
-    limit: int = Query(50),
+    offset: int = Query(0, ge=0, le=100000),
+    limit: int = Query(50, ge=1, le=200),
     source: str = Query(None),  # 按 source 过滤（频道页 pill 切换用）
     group: str = Query(None),  # BF-0419-10: 按 detail_json.group 过滤(公众号订阅分组)
     category: str = Query(None),  # v16.0 W3.T7: L1 维度 pill 切换（github/reddit/rss/hackernews/waytoagi/manual）
@@ -1301,8 +1333,17 @@ async def post_feedback(request: Request):
     fb_type = body.get('type', '')
     topic = body.get('topic', '')
     text = body.get('text', '')
-    if not item_id or fb_type not in ('positive', 'irrelevant', 'low_quality', 'text'):
+    if not item_id or fb_type not in ('positive', 'irrelevant', 'low_quality', 'text', 'should_feature', 'should_drop'):
         return JSONResponse({'error': 'item_id and valid type required'}, status_code=400)
+    if fb_type in ('should_feature', 'should_drop'):
+        err = require_admin(request)
+        if err:
+            return err
+        if not isinstance(text, str):
+            return JSONResponse({'error': 'feedback text must be a string'}, status_code=400)
+        text = text.strip()
+        if len(text) > 500:
+            return JSONResponse({'error': 'feedback text exceeds 500 characters'}, status_code=400)
     if remote_db.app_state_to_remote():
         try:
             row = remote_db.get_feedback_item_context_remote(item_id)
@@ -1312,6 +1353,29 @@ async def post_feedback(request: Request):
                 user_id = _get_user_id(request)
                 if not user_id or str(row['user_id']) != str(user_id):
                     return JSONResponse({'error': 'Item not found'}, status_code=404)
+            if fb_type in ('should_feature', 'should_drop'):
+                toggle = (
+                    remote_db.toggle_item_should_feature_remote
+                    if fb_type == 'should_feature'
+                    else remote_db.toggle_item_admin_feedback_remote
+                )
+                kwargs = dict(
+                    item_id=item_id,
+                    platform=row.get('platform'),
+                    title=row.get('title'),
+                    author=row.get('author_name'),
+                    url=row.get('url'),
+                    reason=text or None,
+                    topic=topic or None,
+                )
+                if fb_type == 'should_drop':
+                    kwargs['action'] = fb_type
+                active = toggle(**kwargs)
+                return {
+                    'ok': True,
+                    'active': active,
+                    'data_backend': remote_db.app_state_backend(),
+                }
             remote_db.add_feedback_remote(item_id, fb_type, topic or None, text or None)
             remote_db.record_item_feedback_remote(
                 item_id=item_id,
@@ -1343,21 +1407,54 @@ async def post_feedback(request: Request):
             if not user_id or row['user_id'] != user_id:
                 return JSONResponse({'error': 'Item not found'}, status_code=404)
 
-        db.add_feedback(conn, item_id, fb_type, topic or None, text or None)
-        result = {'ok': True}
+        admin_feedback_active = None
+        if fb_type in ('should_feature', 'should_drop'):
+            existing = conn.execute(
+                "SELECT 1 FROM feedback WHERE item_id=? AND type=? LIMIT 1",
+                (item_id, fb_type),
+            ).fetchone()
+            admin_feedback_active = existing is None
+            conn.execute(
+                "DELETE FROM feedback WHERE item_id=? AND type IN ('should_feature', 'should_drop')",
+                (item_id,),
+            )
+            conn.commit()
+            if admin_feedback_active:
+                db.add_feedback(conn, item_id, fb_type, topic or None, text or None)
+            result = {'ok': True, 'active': admin_feedback_active}
+        else:
+            db.add_feedback(conn, item_id, fb_type, topic or None, text or None)
+            result = {'ok': True}
 
         # Write to independent feedback store
         try:
             fb_conn = feedback_store.get_conn()
-            feedback_store.record_item_feedback(
-                fb_conn, item_id, fb_type,
-                platform=row['platform'],
-                title=row['title'],
-                author=row['author_name'],
-                url=row['url'],
-                reason=text or None,
-                topic=topic or None,
-            )
+            if fb_type in ('should_feature', 'should_drop'):
+                for action in ('should_feature', 'should_drop'):
+                    feedback_store.set_item_feedback(
+                        fb_conn, item_id, action,
+                        active=False,
+                    )
+                feedback_store.set_item_feedback(
+                    fb_conn, item_id, fb_type,
+                    active=bool(admin_feedback_active),
+                    platform=row['platform'],
+                    title=row['title'],
+                    author=row['author_name'],
+                    url=row['url'],
+                    reason=text or None,
+                    topic=topic or None,
+                )
+            else:
+                feedback_store.record_item_feedback(
+                    fb_conn, item_id, fb_type,
+                    platform=row['platform'],
+                    title=row['title'],
+                    author=row['author_name'],
+                    url=row['url'],
+                    reason=text or None,
+                    topic=topic or None,
+                )
             fb_conn.close()
         except Exception as e:
             print(f"Feedback store write error: {e}")

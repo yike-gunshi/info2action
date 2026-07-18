@@ -21,7 +21,7 @@
       "stage1_high_confidence": 0.85,
       "stage1_boundary_low": 0.7,
       "representative_decay_tau_hours": 24,
-      "candidate_window_days": 30,
+      "candidate_window_days": 3,
       "temporal_candidate_window_days": 3,
       "max_cluster_span_days": 7,
       "summary_max_docs": 20,
@@ -37,11 +37,40 @@
     }
   },
   "twitter": {
-    "following_count": 50,
-    "for_you_count": 50,
+    "fetch_mode": "list",
+    "x_lists": [
+      {
+        "key": "official",
+        "name": "i2a · AI Official",
+        "list_id": "2076145739865190864"
+      },
+      {
+        "key": "people",
+        "name": "i2a · AI People",
+        "list_id": "2076145811382251688"
+      },
+      {
+        "key": "builders",
+        "name": "i2a · Builders",
+        "list_id": "2076145812766355542"
+      },
+      {
+        "key": "zh-community",
+        "name": "i2a · 中文社区",
+        "list_id": "2076145813999485014"
+      },
+      {
+        "key": "signals",
+        "name": "i2a · AI Signals",
+        "list_id": "2076145815270408396"
+      }
+    ],
+    "list_fetch_count": 500,
+    "list_fetch_sync_per_list": 1,
+    "list_sync_interval_seconds": 2,
     "user_posts_count": 20,
-    "x_user_batch_size": 20,
-    "x_user_gray_limit": 30
+    "user_posts_workers": 4,
+    "user_posts_retry_rounds": 2
   },
   "xiaohongshu": {
     "enabled": false,
@@ -499,6 +528,101 @@
         "name": "Hacker News Best",
         "slug": "hn-best",
         "url": "https://hnrss.org/best"
+      },
+      {
+        "name": "OpenAI News",
+        "url": "https://openai.com/news/rss.xml",
+        "slug": "openai_news"
+      },
+      {
+        "name": "Google DeepMind Blog",
+        "url": "https://deepmind.google/blog/rss.xml",
+        "slug": "deepmind_blog"
+      },
+      {
+        "name": "Google AI Blog",
+        "url": "https://blog.google/technology/ai/rss/",
+        "slug": "google_ai_blog"
+      },
+      {
+        "name": "Hugging Face Blog",
+        "url": "https://huggingface.co/blog/feed.xml",
+        "slug": "hf_blog"
+      },
+      {
+        "name": "Claude Code Releases",
+        "url": "https://github.com/anthropics/claude-code/releases.atom",
+        "slug": "claude_code_releases"
+      },
+      {
+        "name": "GitHub Changelog",
+        "url": "https://github.blog/changelog/feed/",
+        "slug": "github_changelog"
+      },
+      {
+        "name": "GitHub AI & ML Blog",
+        "url": "https://github.blog/ai-and-ml/feed/",
+        "slug": "github_ai_ml"
+      },
+      {
+        "name": "Microsoft AI Blog",
+        "url": "https://news.microsoft.com/source/topics/ai/feed/",
+        "slug": "microsoft_ai"
+      },
+      {
+        "name": "NVIDIA GenAI Blog",
+        "url": "https://developer.nvidia.com/blog/category/generative-ai/feed/",
+        "slug": "nvidia_genai"
+      },
+      {
+        "name": "Apple ML Research",
+        "url": "https://machinelearning.apple.com/rss.xml",
+        "slug": "apple_ml"
+      },
+      {
+        "name": "Thinking Machines Lab",
+        "url": "https://thinkingmachines.ai/index.xml",
+        "slug": "thinking_machines"
+      },
+      {
+        "name": "The Decoder",
+        "url": "https://the-decoder.com/feed/",
+        "slug": "the_decoder"
+      },
+      {
+        "name": "TechCrunch AI",
+        "url": "https://techcrunch.com/category/artificial-intelligence/feed/",
+        "slug": "techcrunch_ai"
+      },
+      {
+        "name": "MarkTechPost",
+        "url": "https://www.marktechpost.com/feed/",
+        "slug": "marktechpost"
+      },
+      {
+        "name": "IT之家",
+        "url": "https://www.ithome.com/rss/",
+        "slug": "ithome"
+      },
+      {
+        "name": "宝玉 Blog",
+        "url": "https://baoyu.io/feed.xml",
+        "slug": "baoyu_blog"
+      },
+      {
+        "name": "Interconnects (Nathan Lambert)",
+        "url": "https://www.interconnects.ai/feed",
+        "slug": "interconnects"
+      },
+      {
+        "name": "Dwarkesh Patel",
+        "url": "https://www.dwarkesh.com/feed",
+        "slug": "dwarkesh"
+      },
+      {
+        "name": "Google Developers Blog",
+        "url": "https://developers.googleblog.com/feeds/posts/default",
+        "slug": "google_dev_blog"
       }
     ]
   },

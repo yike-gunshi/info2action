@@ -94,6 +94,36 @@ def test_success_resets_failures_and_restores_broken_source(tmp_db):
         conn.close()
 
 
+def test_not_fetched_source_enters_active_on_success_and_broken_at_threshold(tmp_db):
+    import db
+
+    conn = db.get_conn()
+    try:
+        success_id = _insert_source(conn, status="not_fetched")
+        db.record_source_fetch_result(conn, success_id, ok=True, broken_after=2)
+        success_row = _source_row(conn, success_id)
+        assert success_row["status"] == "active"
+        assert success_row["last_success_at"]
+
+        cur = conn.execute(
+            "INSERT INTO sources(platform, source_key, status) VALUES('rss', ?, 'not_fetched')",
+            ("https://example.com/not-fetched-failure.xml",),
+        )
+        conn.commit()
+        failure_id = cur.lastrowid
+        db.record_source_fetch_result(conn, failure_id, ok=False, error="timeout", broken_after=2)
+        first_failure = _source_row(conn, failure_id)
+        assert first_failure["status"] == "not_fetched"
+        assert first_failure["consecutive_failures"] == 1
+
+        db.record_source_fetch_result(conn, failure_id, ok=False, error="timeout", broken_after=2)
+        second_failure = _source_row(conn, failure_id)
+        assert second_failure["status"] == "broken"
+        assert second_failure["consecutive_failures"] == 2
+    finally:
+        conn.close()
+
+
 def test_paused_and_deleted_sources_are_unchanged(tmp_db):
     import db
 

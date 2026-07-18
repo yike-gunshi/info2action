@@ -1,10 +1,11 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode, UIEvent } from 'react'
-import { Activity, AlertTriangle, ArrowLeft, CheckCircle2, ChevronRight, Clock3, Copy, Database, Loader2, Plus, RefreshCw, Settings2, Trash2, X } from 'lucide-react'
+import { Activity, AlertTriangle, ArrowLeft, CheckCircle2, ChevronRight, Clock3, Copy, Database, Loader2, MoreHorizontal, Plus, RefreshCw, Search, Settings2, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '../lib/utils'
 import { buildInfoItemHash } from '../lib/itemDeepLink'
+import { HighlightsFilteredTab } from '../components/admin/HighlightsFilteredTab'
 import { OverviewTab } from '../components/admin/OverviewTab'
 import {
   createInviteCodes,
@@ -31,6 +32,8 @@ import {
   reconcileLingowhaleSources,
   getAdminSourceAlgoParams,
   updateAdminSourceAlgoParams,
+  searchWechatSources,
+  syncAdminXList,
 } from '../lib/api'
 import type {
   AdminSource,
@@ -39,17 +42,19 @@ import type {
   AdminSourcePreviewItem,
   AdminSourceReconcileResponse,
   AdminSourceValidateResponse,
+  AdminWechatSearchChannel,
+  AdminXListStatus,
+  AdminXRunSummary,
 } from '../lib/api'
 
-type AdminTab = 'overview' | 'runs' | 'subscriptions' | 'access'
+type AdminTab = 'overview' | 'runs' | 'subscriptions' | 'access' | 'filtered'
 const ADMIN_TABS: { key: AdminTab; label: string }[] = [
   { key: 'overview', label: '总览' },
   { key: 'runs', label: '抓取运行' },
   { key: 'subscriptions', label: '订阅配置' },
   { key: 'access', label: '用户与权限' },
+  { key: 'filtered', label: '精选漏斗' },
 ]
-
-const SOURCE_GROUP_PREVIEW_LIMIT = 20
 
 type SourceWizardStep = 1 | 2 | 3
 
@@ -61,7 +66,7 @@ const SOURCE_PLATFORM_OPTIONS: Array<{
   helper: string
   disabled?: boolean
 }> = [
-  { value: 'wechat_mp', label: '公众号', helper: '粘贴公众号 RSS URL（从 we-mp-rss / Wechat2RSS 等服务获取）' },
+  { value: 'wechat_mp', label: '公众号', helper: '推荐走语鲸：在语鲸 App 关注该公众号后，回总览区点「对账导入」一键纳管；此处粘贴 RSS URL 仅用于语鲸没有的号' },
   { value: 'x_user', label: 'X', helper: '只输入 handle，不含 @，最长 15 位' },
   { value: 'rss', label: 'RSS', helper: '输入 http(s) feed URL' },
   { value: 'reddit', label: 'Reddit', helper: '输入 subreddit 名，不含 r/' },
@@ -78,8 +83,6 @@ const ALGO_PARAM_SPECS: Array<{
 }> = [
   { key: 'hackernews_count', label: 'Hacker News 数量', min: 1, max: 500, note: 'HN top 抓取条数' },
   { key: 'github_trending_count', label: 'GitHub Trending 数量', min: 1, max: 500, note: 'trending 仓库条数' },
-  { key: 'twitter_following_count', label: 'X Following 数量', min: 1, max: 500, note: '过渡期 following feed' },
-  { key: 'twitter_for_you_count', label: 'X For You 数量', min: 1, max: 500, note: '个性化推荐流' },
   { key: 'bilibili_hot_count', label: 'B站热门数量', min: 1, max: 500, note: '热门榜抓取条数' },
   { key: 'bilibili_rank_count', label: 'B站排行数量', min: 1, max: 500, note: '排行榜抓取条数' },
   { key: 'bilibili_videos_per_up', label: 'B站每 UP 视频数', min: 1, max: 100, note: '单个 UP 视频上限' },
@@ -88,7 +91,7 @@ const ALGO_PARAM_SPECS: Array<{
 function readAdminTab(): AdminTab {
   const hash = window.location.hash.slice(1) // e.g. "admin/runs"
   const sub = hash.split('?')[0].split('/')[1] as AdminTab | undefined
-  if (sub === 'runs' || sub === 'subscriptions' || sub === 'access') return sub
+  if (sub === 'runs' || sub === 'subscriptions' || sub === 'access' || sub === 'filtered') return sub
   return 'overview'
 }
 
@@ -456,12 +459,14 @@ export function AdminPage() {
         </div>
       </header>
 
-      <main className="max-w-[1280px] mx-auto px-4 py-8">
+      <main className={cn('mx-auto px-4 py-8', activeTab === 'filtered' ? 'w-full max-w-none' : 'max-w-[1280px]')}>
         {activeTab === 'overview' && (
           <OverviewTab reloadSignal={reloadSignal} onOpenRuns={() => navTab('runs')} />
         )}
 
         {activeTab === 'subscriptions' && <SubscriptionConfigTab />}
+
+        {activeTab === 'filtered' && <HighlightsFilteredTab reloadSignal={reloadSignal} />}
 
         {activeTab === 'runs' &&
           (loading ? (
@@ -1031,6 +1036,9 @@ function TabLoading() {
 function SubscriptionConfigTab() {
   const [groups, setGroups] = useState<AdminSourceGroup[]>([])
   const [total, setTotal] = useState(0)
+  const [latestXRun, setLatestXRun] = useState<AdminXRunSummary | null>(null)
+  const [xList, setXList] = useState<AdminXListStatus | null>(null)
+  const [searchQuery, setSearchQuery] = useState('')
   const [algoParams, setAlgoParams] = useState<AdminSourceAlgoParams | null>(null)
   const [algoDraft, setAlgoDraft] = useState<Record<keyof AdminSourceAlgoParams, string>>(emptyAlgoDraft)
   const [algoError, setAlgoError] = useState<string | null>(null)
@@ -1038,11 +1046,12 @@ function SubscriptionConfigTab() {
   const [showReconcileList, setShowReconcileList] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [expandedPlatforms, setExpandedPlatforms] = useState<Set<string>>(new Set())
   const [savingSourceId, setSavingSourceId] = useState<number | null>(null)
   const [savingAlgo, setSavingAlgo] = useState(false)
   const [importingMissing, setImportingMissing] = useState(false)
+  const [syncingXList, setSyncingXList] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
+  const [wizardPlatform, setWizardPlatform] = useState<WizardPlatform | undefined>(undefined)
 
   async function load() {
     setLoading(true)
@@ -1055,6 +1064,8 @@ function SubscriptionConfigTab() {
       ])
       setGroups(sourceRes.groups)
       setTotal(sourceRes.total)
+      setLatestXRun(sourceRes.latest_x_run ?? null)
+      setXList(sourceRes.x_list ?? null)
       setAlgoParams(algoRes.params)
       setAlgoDraft(algoParamsToDraft(algoRes.params))
       setReconcile(reconcileRes)
@@ -1074,6 +1085,21 @@ function SubscriptionConfigTab() {
     const sourceRes = await getAdminSources()
     setGroups(sourceRes.groups)
     setTotal(sourceRes.total)
+    setLatestXRun(sourceRes.latest_x_run ?? null)
+    setXList(sourceRes.x_list ?? null)
+  }
+
+  async function handleSyncXList(full: boolean) {
+    setSyncingXList(true)
+    try {
+      const status = await syncAdminXList(full)
+      setXList(status)
+      toast.success(`X List 已同步 ${status.synced_count} / ${status.registry_count}`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'X List 同步失败')
+    } finally {
+      setSyncingXList(false)
+    }
   }
 
   async function handleStatus(source: AdminSource, status: 'active' | 'paused') {
@@ -1143,10 +1169,35 @@ function SubscriptionConfigTab() {
   function handleCreated(source: AdminSource) {
     setGroups((prev) => appendSourceToGroups(prev, source))
     setTotal((prev) => prev + 1)
+    if (source.platform === 'x_user') {
+      setXList((prev) => prev ? {
+        ...prev,
+        registry_count: prev.registry_count + 1,
+        pending_count: prev.pending_count + 1,
+        pending_handles: [...prev.pending_handles, source.source_key],
+      } : prev)
+    }
+  }
+
+  function openWizard(platform?: WizardPlatform) {
+    setWizardPlatform(platform)
+    setWizardOpen(true)
   }
 
   const latestUpdatedAt = latestSourceUpdatedAt(groups)
   const missing = reconcile?.missing ?? []
+  const attentionCount = groups.reduce(
+    (count, group) => count + group.sources.filter((source) => ['error', 'warning'].includes(sourceStatusInfo(source).kind)).length,
+    0,
+  )
+  const MODULE_ORDER = ['wechat_mp', 'x_user', 'rss', 'reddit', 'github_repo', 'bilibili_up']
+  const orderedGroups = [...groups].sort(
+    (a, b) => {
+      const ia = MODULE_ORDER.indexOf(a.platform)
+      const ib = MODULE_ORDER.indexOf(b.platform)
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
+    },
+  )
 
   if (loading) {
     return <SubscriptionSkeleton />
@@ -1174,19 +1225,58 @@ function SubscriptionConfigTab() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <button
-          type="button"
-          onClick={() => setWizardOpen(true)}
-          className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-primary px-3 text-[13px] font-semibold text-primary-foreground hover:bg-primary/90 md:w-auto"
-        >
-          <Plus className="w-3.5 h-3.5" />
-          添加信源
-        </button>
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <button
+            type="button"
+            onClick={() => openWizard()}
+            className="inline-flex h-9 items-center justify-center gap-1.5 rounded-[4px] border border-border bg-card px-3 text-[13px] font-semibold text-muted-foreground transition-colors hover:border-[var(--brand-border)] hover:text-foreground"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            添加信源
+          </button>
+          <label className="relative block sm:w-72">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              aria-label="搜索信源"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="搜索名称 / source key"
+              className="h-9 w-full rounded-[4px] border border-border bg-card pl-9 pr-3 text-[13px] text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-[var(--brand-border)]"
+            />
+          </label>
+        </div>
         <div className="text-[12px] text-muted-foreground tabular-nums">
           注册表快照时间 {latestUpdatedAt ? formatAdminDate(latestUpdatedAt) : '—'} · {formatAdminNumber(total)} 个
         </div>
       </div>
+
+      <section className="grid gap-px overflow-hidden rounded-lg border border-border bg-border shadow-subtle sm:grid-cols-2 xl:grid-cols-4">
+        <SummaryMetric label="已配置" value={formatAdminNumber(total)} helper="注册表信源" />
+        <SummaryMetric
+          label="本轮 X 覆盖"
+          value={latestXRun ? `${latestXRun.attempted} / ${latestXRun.planned}` : '—'}
+          helper={latestXRun ? `成功 ${latestXRun.succeeded}（${latestXRun.no_new} 无新增） · 失败 ${latestXRun.failed} · 漏抓 ${latestXRun.missed}` : '暂无运行记录'}
+          tone={latestXRun?.missed ? 'danger' : 'default'}
+        />
+        <SummaryMetric label="需处理" value={formatAdminNumber(attentionCount)} helper="失败或正在重试" tone={attentionCount > 0 ? 'warning' : 'default'} />
+        <div className="flex min-h-[88px] items-center justify-between gap-3 bg-card px-4 py-3">
+          <div>
+            <div className="text-[11px] text-muted-foreground">最近完成</div>
+            <div className="mt-1 text-[14px] font-semibold text-foreground tabular-nums">{formatAdminDate(latestXRun?.finished_at)}</div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              window.location.hash = '#admin/runs'
+              window.dispatchEvent(new HashChangeEvent('hashchange'))
+            }}
+            className="rounded-[4px] border border-border px-2.5 py-1.5 text-[12px] font-semibold text-muted-foreground hover:border-[var(--brand-border)] hover:text-foreground"
+          >
+            查看运行
+          </button>
+        </div>
+      </section>
 
       {missing.length > 0 && (
         <section className="rounded-lg border border-amber-300/60 bg-amber-50 px-4 py-3 text-[13px] text-amber-900">
@@ -1228,42 +1318,30 @@ function SubscriptionConfigTab() {
         </section>
       )}
 
-      <section className="bg-card border border-border rounded-lg overflow-hidden shadow-subtle">
-        <div className="flex items-center justify-between gap-4 px-5 py-4">
-          <div>
-            <h2 className="text-[15px] font-semibold text-foreground">名单型信源总览</h2>
-            <p className="mt-1 text-[12px] text-muted-foreground">按平台管理 source_key、状态和近 7 日入库健康度</p>
-          </div>
-          <div className="text-[12px] text-muted-foreground tabular-nums">{formatAdminNumber(total)} 个</div>
-        </div>
-        {groups.length === 0 ? (
-          <div className="border-t border-border px-5 py-12 text-center">
-            <p className="text-sm font-medium text-foreground">注册表为空</p>
-            <p className="mt-1 text-[12px] text-muted-foreground">可以先通过添加信源或对账导入建立注册表。</p>
-          </div>
-        ) : (
-          <div className="divide-y divide-border border-t border-border">
-            {groups.map((group) => (
-              <SourceGroupPanel
-                key={group.platform}
-                group={group}
-                expanded={expandedPlatforms.has(group.platform)}
-                onToggleExpand={() => {
-                  setExpandedPlatforms((prev) => {
-                    const next = new Set(prev)
-                    if (next.has(group.platform)) next.delete(group.platform)
-                    else next.add(group.platform)
-                    return next
-                  })
-                }}
-                onStatus={handleStatus}
-                onDelete={handleDelete}
-                savingSourceId={savingSourceId}
-              />
-            ))}
-          </div>
-        )}
-      </section>
+      {groups.length === 0 ? (
+        <section className="bg-card border border-border rounded-lg px-5 py-12 text-center shadow-subtle">
+          <p className="text-sm font-medium text-foreground">注册表为空</p>
+          <p className="mt-1 text-[12px] text-muted-foreground">用「添加信源」逐个添加公众号 / X / RSS 等信源。</p>
+        </section>
+      ) : (
+        <section data-testid="source-module-grid" className="grid grid-cols-1 gap-4 min-[1280px]:grid-cols-2">
+          {orderedGroups.map((group) => (
+            <ModulePanel
+              key={group.platform}
+              group={group}
+              onAdd={() => openWizard(group.platform as WizardPlatform)}
+              onStatus={handleStatus}
+              onDelete={handleDelete}
+              savingSourceId={savingSourceId}
+              latestXRun={latestXRun}
+              xList={xList}
+              syncingXList={syncingXList}
+              onSyncXList={handleSyncXList}
+              searchQuery={searchQuery}
+            />
+          ))}
+        </section>
+      )}
 
       <section data-testid="algo-params-panel" className="bg-card border border-border rounded-lg p-5 shadow-subtle">
         <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
@@ -1287,24 +1365,11 @@ function SubscriptionConfigTab() {
             <label key={spec.key} className="rounded-lg border border-border bg-background p-3">
               <span className="flex items-center justify-between gap-2">
                 <span className="text-[13px] font-semibold text-foreground">{spec.label}</span>
-                <span className={cn(
-                  'rounded-md px-2 py-0.5 text-[11px] font-semibold',
-                  spec.key === 'twitter_following_count'
-                    ? 'bg-amber-50 text-amber-700'
-                    : 'bg-accent text-primary',
-                )}>
-                  {spec.key === 'twitter_following_count' ? '过渡期' : '配置生效'}
+                <span className="rounded-md bg-accent px-2 py-0.5 text-[11px] font-semibold text-primary">
+                  配置生效
                 </span>
               </span>
               <span className="mt-1 block text-[12px] text-muted-foreground">{spec.note}</span>
-              {spec.key === 'twitter_following_count' && (
-                <span className="mt-2 flex items-center justify-between gap-3 rounded-md border border-border bg-card px-2 py-1.5">
-                  <span className="text-[11px] text-muted-foreground">账号名单放量完成后在此关闭退役</span>
-                  <span className="inline-flex h-5 w-9 shrink-0 items-center rounded-full bg-muted px-0.5">
-                    <span className="h-4 w-4 rounded-full bg-muted-foreground/50" />
-                  </span>
-                </span>
-              )}
               <input
                 aria-label={spec.label}
                 type="number"
@@ -1325,6 +1390,7 @@ function SubscriptionConfigTab() {
 
       <AddSourceWizard
         open={wizardOpen}
+        initialPlatform={wizardPlatform}
         onClose={() => setWizardOpen(false)}
         onCreated={handleCreated}
       />
@@ -1332,133 +1398,327 @@ function SubscriptionConfigTab() {
   )
 }
 
-function SourceGroupPanel({
+type SourceFilter = 'attention' | 'waiting' | 'all' | 'paused'
+
+function SummaryMetric({
+  label,
+  value,
+  helper,
+  tone = 'default',
+}: {
+  label: string
+  value: string
+  helper: string
+  tone?: 'default' | 'warning' | 'danger'
+}) {
+  return (
+    <div className="min-h-[88px] bg-card px-4 py-3">
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className={cn(
+        'mt-1 text-[20px] font-semibold tabular-nums',
+        tone === 'danger' ? 'text-destructive' : tone === 'warning' ? 'text-amber-700' : 'text-foreground',
+      )}>{value}</div>
+      <div className="mt-0.5 text-[11px] text-muted-foreground">{helper}</div>
+    </div>
+  )
+}
+
+function ModulePanel({
   group,
-  expanded,
-  onToggleExpand,
+  onAdd,
   onStatus,
   onDelete,
   savingSourceId,
+  latestXRun,
+  xList,
+  syncingXList,
+  onSyncXList,
+  searchQuery,
 }: {
   group: AdminSourceGroup
-  expanded: boolean
-  onToggleExpand: () => void
+  onAdd: () => void
   onStatus: (source: AdminSource, status: 'active' | 'paused') => void
   onDelete: (source: AdminSource) => void
   savingSourceId: number | null
+  latestXRun: AdminXRunSummary | null
+  xList: AdminXListStatus | null
+  syncingXList: boolean
+  onSyncXList: (full: boolean) => void
+  searchQuery: string
 }) {
-  const visibleSources = expanded ? group.sources : group.sources.slice(0, SOURCE_GROUP_PREVIEW_LIMIT)
-  const anomalyCount = group.sources.filter((source) => source.status === 'broken' || source.health?.inserted_7d === 0).length
-  const notFetchedCount = group.sources.filter((source) => source.status === 'not_fetched').length
+  const [filter, setFilter] = useState<SourceFilter>('attention')
+  const [openMenuId, setOpenMenuId] = useState<number | null>(null)
+  const [selectedSource, setSelectedSource] = useState<AdminSource | null>(null)
+  const previousSourceCount = useRef(group.sources.length)
+  useEffect(() => {
+    if (group.sources.length > previousSourceCount.current) setFilter('all')
+    previousSourceCount.current = group.sources.length
+  }, [group.sources.length])
+  const attentionCount = group.sources.filter(sourceNeedsAttention).length
+  const waitingCount = group.sources.filter(sourceIsWaiting).length
+  const pausedCount = group.sources.filter((source) => source.status === 'paused').length
+  const query = searchQuery.trim().toLocaleLowerCase()
+  const visibleSources = group.sources
+    .filter((source) => {
+      if (query) {
+        return `${source.display_name} ${source.source_key}`.toLocaleLowerCase().includes(query)
+      }
+      if (filter === 'attention') return sourceNeedsAttention(source)
+      if (filter === 'waiting') return sourceIsWaiting(source)
+      if (filter === 'paused') return source.status === 'paused'
+      return true
+    })
+    .sort((a, b) => {
+      const severity = { error: 0, warning: 1, muted: 2, ok: 3 }
+      const statusDelta = severity[sourceStatusInfo(a).kind] - severity[sourceStatusInfo(b).kind]
+      return statusDelta || (a.display_name || a.source_key).localeCompare(b.display_name || b.source_key, 'zh-CN')
+    })
+
+  const filters: Array<{ key: SourceFilter; label: string; count: number }> = [
+    { key: 'attention', label: '需处理', count: attentionCount },
+    { key: 'waiting', label: '待首次验证', count: waitingCount },
+    { key: 'all', label: '全部', count: group.sources.length },
+    { key: 'paused', label: '已停用', count: pausedCount },
+  ]
 
   return (
-    <div>
-      <div className="flex flex-col gap-2 px-5 py-3 md:flex-row md:items-center md:justify-between">
-        <div className="flex flex-wrap items-center gap-2">
-          <h3 className="text-[15px] font-semibold text-foreground">{platformLabel(group.platform)}</h3>
-          <span className="text-[12px] text-muted-foreground">
-            {group.sources.length} 个 · 显示{expanded ? '全部' : `前 ${Math.min(SOURCE_GROUP_PREVIEW_LIMIT, group.sources.length)}`}
-          </span>
-          {anomalyCount > 0 && (
-            <span className="rounded-md bg-destructive/10 px-2 py-0.5 text-[11px] font-semibold text-destructive">
-              {anomalyCount} 个异常
-            </span>
-          )}
-          {notFetchedCount > 0 && (
-            <span className="rounded-md bg-muted px-2 py-0.5 text-[11px] font-semibold text-muted-foreground">
-              {notFetchedCount} 个配置存在但未在抓
-            </span>
+    <div
+      data-testid={`module-card-${group.platform}`}
+      className="flex h-[min(520px,calc(100dvh-230px))] min-h-[360px] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-subtle"
+    >
+      <div className="flex flex-none items-start justify-between gap-3 border-b border-border px-4 py-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <h3 className="text-[14px] font-semibold text-foreground">{platformLabel(group.platform)}</h3>
+            <span className="text-[11px] text-muted-foreground tabular-nums">{group.sources.length} 已配置</span>
+            {attentionCount > 0 && (
+              <span className="rounded-md bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700 tabular-nums">{attentionCount} 需处理</span>
+            )}
+          </div>
+          {group.platform === 'x_user' && (
+            <div className="mt-1 text-[11px] text-muted-foreground tabular-nums">
+              本轮覆盖 {latestXRun ? `${latestXRun.attempted}/${latestXRun.planned}` : '待首轮验证'}
+            </div>
           )}
         </div>
-      </div>
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[720px] text-[13px]">
-          <thead>
-            <tr className="h-10 bg-secondary text-[12px] font-semibold text-muted-foreground">
-              <th className="min-w-[180px] px-5 text-left">名称</th>
-              <th className="px-3 text-left">状态</th>
-              <th className="px-3 text-right">最近抓取</th>
-              <th className="px-3 text-right">近7日入库</th>
-              <th className="px-5 text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visibleSources.map((source) => {
-              const status = sourceStatusInfo(source)
-              const paused = source.status === 'paused'
-              const saving = savingSourceId === source.id
-              return (
-                <tr
-                  key={source.id}
-                  data-testid={`source-row-${source.id}`}
-                  className={cn(
-                    'h-10 border-t border-border transition-colors hover:bg-background',
-                    status.kind === 'error' && 'bg-destructive/5',
-                    paused && 'bg-muted/20 text-muted-foreground',
-                  )}
-                >
-                  <td className="px-5 py-2 align-middle">
-                    <div className={cn('font-medium', paused ? 'text-muted-foreground' : 'text-foreground')}>{source.display_name || source.source_key}</div>
-                    <div className="mt-0.5 text-[11px] text-muted-foreground">{source.source_key}</div>
-                  </td>
-                  <td className="px-3 py-2 align-middle">
-                    <span className={cn('inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold', status.cls)}>
-                      {status.label}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 text-right align-middle text-muted-foreground tabular-nums">
-                    {formatAdminDate(source.health?.last_fetched_at)}
-                  </td>
-                  <td className={cn('px-3 py-2 text-right align-middle font-semibold tabular-nums', status.kind === 'error' ? 'text-destructive' : 'text-foreground')}>
-                    {formatAdminNumber(source.health?.inserted_7d)}
-                  </td>
-                  <td className="px-5 py-2 text-right align-middle">
-                    <div className="inline-flex items-center justify-end gap-2 text-[12px] font-semibold">
-                      {source.status !== 'not_fetched' && (
-                        <button
-                          type="button"
-                          onClick={() => onStatus(source, source.status === 'paused' ? 'active' : 'paused')}
-                          disabled={saving}
-                          className="text-muted-foreground hover:text-foreground disabled:opacity-50"
-                        >
-                          {source.status === 'paused' ? '启用' : '停用'}
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => onDelete(source)}
-                        disabled={saving}
-                        className="text-destructive hover:text-destructive/80 disabled:opacity-50"
-                      >
-                        删除
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-      {group.sources.length > SOURCE_GROUP_PREVIEW_LIMIT && !expanded && (
         <button
           type="button"
-          onClick={onToggleExpand}
-          className="w-full border-t border-border px-5 py-2 text-left text-[12px] font-semibold text-primary hover:bg-accent"
+          onClick={onAdd}
+          className="inline-flex h-8 flex-none items-center gap-1 rounded-[4px] border border-border bg-card px-3 text-[12px] font-semibold text-muted-foreground transition-colors hover:border-[var(--brand-border)] hover:text-foreground"
         >
-          展开全部 {group.sources.length} 个 ↓
+          <Plus className="h-3 w-3" />
+          添加
         </button>
+      </div>
+
+      {group.platform === 'x_user' && (
+        <div data-testid="x-list-status" className="flex flex-none flex-wrap items-center justify-between gap-2 border-b border-border bg-background/60 px-3 py-2">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <span className="font-semibold text-foreground">X List 抓取</span>
+              <span className="rounded-md bg-secondary px-2 py-0.5 font-semibold text-foreground tabular-nums">
+                {xList ? `${xList.synced_count} / ${xList.registry_count} 已同步` : '状态待加载'}
+              </span>
+              {(xList?.pending_count ?? 0) > 0 && (
+                <span className="rounded-md bg-amber-50 px-2 py-0.5 font-semibold text-amber-700 tabular-nums">{xList?.pending_count} List 待同步</span>
+              )}
+              {(xList?.pending_count ?? 0) > 0 && (
+                <span className="rounded-md bg-secondary px-2 py-0.5 font-semibold text-muted-foreground">分组搜索兜底</span>
+              )}
+            </div>
+            <div className="mt-0.5 truncate text-[10px] text-muted-foreground tabular-nums">
+              最近对账 {formatAdminDate(xList?.last_synced_at)} · {(xList?.pending_count ?? 0) > 0 ? '未同步账号仍按配置抓取' : '每轮聚合抓取'}
+            </div>
+            {(xList?.lists?.length ?? 0) > 0 && (
+              <div className="mt-1.5 flex max-w-full flex-wrap gap-1">
+                {xList?.lists?.map((item) => (
+                  <a
+                    key={item.key}
+                    href={item.list_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={`打开 ${item.name}`}
+                    title={`${item.name} · ${item.synced_count}/${item.registry_count} 已同步`}
+                    className={cn(
+                      'inline-flex h-6 max-w-full items-center rounded-[4px] border px-2 text-[10px] font-semibold tabular-nums transition-colors hover:text-foreground',
+                      item.pending_count > 0
+                        ? 'border-amber-200 bg-amber-50 text-amber-700'
+                        : 'border-border bg-card text-muted-foreground',
+                    )}
+                  >
+                    <span className="max-w-[120px] truncate">{item.name.replace(/^i2a · /, '')}</span>
+                    <span className="ml-1 flex-none">{item.synced_count}/{item.registry_count}</span>
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="flex flex-none items-center gap-1">
+            {xList?.list_url && (
+              <a
+                href={xList.list_url}
+                target="_blank"
+                rel="noreferrer"
+                aria-label="打开 X List"
+                className="inline-flex h-8 items-center rounded-[4px] px-2.5 text-[11px] font-semibold text-muted-foreground hover:bg-secondary hover:text-foreground"
+              >
+                打开 List
+              </a>
+            )}
+            <button
+              type="button"
+              aria-label={(xList?.pending_count ?? 0) > 0 ? `同步 ${xList?.pending_count} 个待同步账号` : '重新对账全部 X 账号'}
+              onClick={() => onSyncXList((xList?.pending_count ?? 0) === 0)}
+              disabled={syncingXList || !xList?.configured}
+              className="inline-flex h-8 items-center gap-1 rounded-[4px] border border-border bg-card px-2.5 text-[11px] font-semibold text-muted-foreground transition-colors hover:border-[var(--brand-border)] hover:text-foreground disabled:opacity-50"
+            >
+              {syncingXList ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+              {(xList?.pending_count ?? 0) > 0 ? '同步' : '重新对账'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-none gap-1 overflow-x-auto border-b border-border px-3 py-2">
+        {filters.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            onClick={() => setFilter(item.key)}
+            className={cn(
+              'h-7 flex-none rounded-[4px] px-2.5 text-[11px] font-semibold transition-colors',
+              !query && filter === item.key ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:bg-secondary/70 hover:text-foreground',
+            )}
+          >
+            {item.label} {item.count}
+          </button>
+        ))}
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+        {visibleSources.length === 0 ? (
+          <div className="flex min-h-40 flex-col items-center justify-center px-4 text-center">
+            <CheckCircle2 className="h-5 w-5 text-muted-foreground/60" />
+            <p className="mt-2 text-[13px] font-medium text-foreground">{query ? '没有匹配的信源' : filter === 'attention' ? '本轮全部信源已完成' : '当前筛选没有信源'}</p>
+            {!query && filter === 'attention' && group.sources.length > 0 && (
+              <button type="button" onClick={() => setFilter('all')} className="mt-2 text-[12px] font-semibold text-primary hover:underline">
+                查看全部
+              </button>
+            )}
+          </div>
+        ) : visibleSources.map((source) => {
+          const status = sourceStatusInfo(source)
+          const paused = source.status === 'paused'
+          const saving = savingSourceId === source.id
+          const name = source.display_name || source.source_key
+          return (
+            <div
+              key={source.id}
+              data-testid={`source-row-${source.id}`}
+              className={cn(
+                'relative border-b border-border px-4 py-3 transition-colors last:border-b-0 hover:bg-background',
+                status.kind === 'error' && 'border-l-2 border-l-destructive bg-destructive/[0.025]',
+                paused && 'bg-muted/20',
+              )}
+            >
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                    <span title={name} className={cn('max-w-full truncate text-[13px] font-semibold', paused ? 'text-muted-foreground' : 'text-foreground')}>{name}</span>
+                    <span className={cn('inline-flex flex-none rounded-md px-2 py-0.5 text-[11px] font-semibold leading-tight', status.cls)}>{status.label}</span>
+                  </div>
+                  <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
+                    <span title={source.source_key} className="max-w-[45%] truncate">{source.source_key}</span>
+                    <span>·</span>
+                    <span>最近成功 {formatAdminDate(source.health?.last_fetched_at)}</span>
+                    <span>·</span>
+                    <span>近7日 <strong className="font-semibold text-foreground">{formatAdminNumber(source.health?.inserted_7d)}</strong></span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  aria-label={`更多操作 ${name}`}
+                  aria-expanded={openMenuId === source.id}
+                  onClick={() => setOpenMenuId((current) => current === source.id ? null : source.id)}
+                  className="inline-flex h-11 w-11 flex-none items-center justify-center rounded-md text-muted-foreground hover:bg-secondary hover:text-foreground"
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </button>
+              </div>
+              {openMenuId === source.id && (
+                <div className="absolute right-4 top-12 z-20 w-36 rounded-md border border-border bg-card p-1 shadow-lg">
+                  <button type="button" onClick={() => { setSelectedSource(source); setOpenMenuId(null) }} className="w-full rounded px-2.5 py-2 text-left text-[12px] font-medium text-foreground hover:bg-secondary">查看详情</button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenuId(null)
+                      onStatus(source, source.status === 'paused' || source.status === 'broken' ? 'active' : 'paused')
+                    }}
+                    disabled={saving}
+                    className="w-full rounded px-2.5 py-2 text-left text-[12px] font-medium text-foreground hover:bg-secondary disabled:opacity-50"
+                  >
+                    {source.status === 'broken' ? '重新启用' : source.status === 'paused' ? '启用' : '停用'}
+                  </button>
+                  <button type="button" onClick={() => { setOpenMenuId(null); onDelete(source) }} disabled={saving} className="w-full rounded px-2.5 py-2 text-left text-[12px] font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50">删除</button>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {selectedSource && (
+        <SourceDetailDrawer source={selectedSource} onClose={() => setSelectedSource(null)} />
       )}
     </div>
   )
 }
 
+function SourceDetailDrawer({ source, onClose }: { source: AdminSource; onClose: () => void }) {
+  const status = sourceStatusInfo(source)
+  const attempt = source.health?.latest_attempt
+  return (
+    <div className="fixed inset-0 z-[80] bg-black/20" role="presentation" onMouseDown={onClose}>
+      <aside className="ml-auto flex h-full w-full max-w-md flex-col border-l border-border bg-card shadow-2xl" aria-label={`${source.display_name || source.source_key} 详情`} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
+          <div className="min-w-0">
+            <h3 className="truncate text-[15px] font-semibold text-foreground">{source.display_name || source.source_key}</h3>
+            <p className="mt-1 truncate text-[12px] text-muted-foreground">{source.source_key}</p>
+          </div>
+          <button type="button" aria-label="关闭详情" onClick={onClose} className="inline-flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-secondary hover:text-foreground"><X className="h-4 w-4" /></button>
+        </div>
+        <dl className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-4 overflow-y-auto px-5 py-5 text-[13px]">
+          <dt className="text-muted-foreground">当前状态</dt><dd><span className={cn('rounded-md px-2 py-0.5 text-[11px] font-semibold', status.cls)}>{status.label}</span></dd>
+          <dt className="text-muted-foreground">最近成功</dt><dd className="text-foreground tabular-nums">{formatAdminDate(source.health?.last_fetched_at)}</dd>
+          <dt className="text-muted-foreground">近7日入库</dt><dd className="text-foreground tabular-nums">{formatAdminNumber(source.health?.inserted_7d)}</dd>
+          <dt className="text-muted-foreground">连续失败</dt><dd className="text-foreground tabular-nums">{formatAdminNumber(source.health?.consecutive_failures)}</dd>
+          <dt className="text-muted-foreground">最近运行</dt><dd className="text-foreground tabular-nums">{attempt ? `#${attempt.run_id}` : '—'}</dd>
+          <dt className="text-muted-foreground">尝试次数</dt><dd className="text-foreground tabular-nums">{formatAdminNumber(attempt?.attempts)}</dd>
+          <dt className="text-muted-foreground">错误类型</dt><dd className="break-words text-foreground">{attempt?.error_code || '—'}</dd>
+          <dt className="text-muted-foreground">错误详情</dt><dd className="break-words text-foreground">{attempt?.error || '—'}</dd>
+        </dl>
+      </aside>
+    </div>
+  )
+}
+
+function sourceNeedsAttention(source: AdminSource) {
+  const kind = sourceStatusInfo(source).kind
+  return kind === 'error' || kind === 'warning'
+}
+
+function sourceIsWaiting(source: AdminSource) {
+  return source.status !== 'paused' && !source.health?.last_fetched_at && source.health?.latest_attempt?.outcome !== 'missed'
+}
+
 function AddSourceWizard({
   open,
+  initialPlatform,
   onClose,
   onCreated,
 }: {
   open: boolean
+  initialPlatform?: WizardPlatform
   onClose: () => void
   onCreated: (source: AdminSource) => void
 }) {
@@ -1469,16 +1729,27 @@ function AddSourceWizard({
   const [validationError, setValidationError] = useState<string | null>(null)
   const [validating, setValidating] = useState(false)
   const [creating, setCreating] = useState(false)
+  // 公众号：按名字搜索选号（语鲸）
+  const [wechatQuery, setWechatQuery] = useState('')
+  const [wechatResults, setWechatResults] = useState<AdminWechatSearchChannel[] | null>(null)
+  const [wechatSearching, setWechatSearching] = useState(false)
+  const [wechatError, setWechatError] = useState<string | null>(null)
+  const [picked, setPicked] = useState<AdminWechatSearchChannel | null>(null)
 
   useEffect(() => {
     if (!open) return
-    setStep(1)
-    setPlatform('wechat_mp')
+    setStep(initialPlatform ? 2 : 1)
+    setPlatform(initialPlatform ?? 'wechat_mp')
     setSourceKey('')
     setValidation(null)
     setValidationError(null)
     setValidating(false)
     setCreating(false)
+    setWechatQuery('')
+    setWechatResults(null)
+    setWechatSearching(false)
+    setWechatError(null)
+    setPicked(null)
   }, [open])
 
   if (!open) return null
@@ -1504,17 +1775,56 @@ function AddSourceWizard({
     }
   }
 
+  async function handleWechatSearch() {
+    const q = wechatQuery.trim()
+    if (!q || wechatSearching) return
+    setWechatSearching(true)
+    setWechatError(null)
+    setWechatResults(null)
+    try {
+      const res = await searchWechatSources(q)
+      setWechatResults(res.channels)
+    } catch (err) {
+      setWechatError(err instanceof Error ? err.message : '语鲸搜索失败，请稍后重试')
+    } finally {
+      setWechatSearching(false)
+    }
+  }
+
+  function pickWechatChannel(channel: AdminWechatSearchChannel) {
+    if (channel.already_in_registry) return
+    setPicked(channel)
+    setSourceKey(channel.channel_id)
+    setStep(3)
+  }
+
   async function handleCreate() {
-    if (!validation || validation.status === 'deferred') return
+    const isWechat = platform === 'wechat_mp'
+    if (isWechat) {
+      if (!picked) return
+    } else if (!validation || validation.status === 'deferred') {
+      return
+    }
     setCreating(true)
     try {
-      const res = await createAdminSource({
-        platform,
-        source_key: sourceKey.trim(),
-        display_name: validation.display_name || sourceKey.trim(),
-        status: 'active',
-        validated_at: new Date().toISOString(),
-      })
+      const res = await createAdminSource(
+        isWechat && picked
+          ? {
+              platform: 'wechat_mp',
+              source_key: picked.channel_id,
+              display_name: picked.name,
+              status: 'active',
+              config_json: { backend: 'lingowhale' },
+              validated_at: new Date().toISOString(),
+            }
+          : {
+              platform,
+              source_key: sourceKey.trim(),
+              display_name: validation?.display_name || sourceKey.trim(),
+              status: 'active',
+              validated_at: new Date().toISOString(),
+            },
+      )
       onCreated(res.source)
       toast.success('信源已入库')
       onClose()
@@ -1572,7 +1882,74 @@ function AddSourceWizard({
             </div>
           )}
 
-          {step === 2 && (
+          {step === 2 && platform === 'wechat_mp' && (
+            <div className="space-y-4">
+              <div className="flex gap-2">
+                <input
+                  aria-label="公众号名称"
+                  value={wechatQuery}
+                  onChange={(event) => setWechatQuery(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === 'Enter') handleWechatSearch() }}
+                  className="h-10 flex-1 rounded-md border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-primary"
+                  placeholder="输入公众号名字，如 机器之心"
+                />
+                <button
+                  type="button"
+                  onClick={handleWechatSearch}
+                  disabled={!wechatQuery.trim() || wechatSearching}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 text-[13px] font-semibold text-primary hover:bg-primary hover:text-white disabled:opacity-50"
+                >
+                  {wechatSearching && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  搜索
+                </button>
+              </div>
+              <p className="text-[12px] text-muted-foreground">经语鲸搜索公众号，选中即纳入抓取（无需订阅、无需 RSS URL）。</p>
+              {wechatError && (
+                <p className="rounded-md bg-destructive/10 px-3 py-2 text-[12px] font-medium text-destructive">{wechatError}</p>
+              )}
+              {wechatResults && wechatResults.length === 0 && !wechatSearching && (
+                <p className="px-1 py-4 text-sm text-muted-foreground">没搜到匹配的公众号，换个名字试试。</p>
+              )}
+              {wechatResults && wechatResults.length > 0 && (
+                <div className="max-h-[46vh] divide-y divide-border overflow-auto rounded-lg border border-border">
+                  {wechatResults.map((ch) => (
+                    <button
+                      key={ch.channel_id}
+                      type="button"
+                      disabled={ch.already_in_registry}
+                      onClick={() => pickWechatChannel(ch)}
+                      className={cn(
+                        'flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-background',
+                        ch.already_in_registry && 'cursor-not-allowed opacity-60',
+                      )}
+                    >
+                      {ch.avatar_url ? (
+                        <img src={ch.avatar_url} alt="" className="h-9 w-9 flex-none rounded-md object-cover" />
+                      ) : (
+                        <div className="h-9 w-9 flex-none rounded-md bg-secondary" />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate text-[13px] font-semibold text-foreground">{ch.name}</span>
+                          {ch.already_in_registry && (
+                            <span className="flex-none rounded bg-secondary px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">已在注册表</span>
+                          )}
+                          {ch.has_subscribed && !ch.already_in_registry && (
+                            <span className="flex-none rounded bg-accent px-1.5 py-0.5 text-[10px] font-semibold text-primary">语鲸已订阅</span>
+                          )}
+                        </div>
+                        {ch.description && <div className="mt-0.5 line-clamp-1 text-[12px] text-muted-foreground">{ch.description}</div>}
+                        <div className="mt-0.5 text-[11px] text-muted-foreground tabular-nums">7日更新 {ch.last_7d_count} · 订阅 {ch.subscriber_count}</div>
+                      </div>
+                      {!ch.already_in_registry && <ChevronRight className="w-4 h-4 flex-none text-muted-foreground" />}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {step === 2 && platform !== 'wechat_mp' && (
             <div className="space-y-4">
               <label className="block">
                 <span className="text-[12px] font-semibold text-muted-foreground">source_key</span>
@@ -1597,7 +1974,31 @@ function AddSourceWizard({
             </div>
           )}
 
-          {step === 3 && validation && (
+          {step === 3 && platform === 'wechat_mp' && picked && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-3 rounded-lg border border-border bg-background p-3">
+                {picked.avatar_url ? (
+                  <img src={picked.avatar_url} alt="" className="h-11 w-11 flex-none rounded-md object-cover" />
+                ) : (
+                  <div className="h-11 w-11 flex-none rounded-md bg-secondary" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 flex-none text-primary" />
+                    <span className="truncate text-[14px] font-semibold text-foreground">{picked.name}</span>
+                  </div>
+                  {picked.description && <p className="mt-1 line-clamp-2 text-[12px] text-muted-foreground">{picked.description}</p>}
+                  <p className="mt-1 text-[11px] text-muted-foreground tabular-nums">7日更新 {picked.last_7d_count} · 订阅 {picked.subscriber_count} · channel {picked.channel_id}</p>
+                </div>
+              </div>
+              <p className="text-[12px] text-muted-foreground">确认后该公众号纳入注册表，下一轮抓取即开始按名单拉取其文章。</p>
+              {validationError && (
+                <p className="rounded-md bg-destructive/10 px-3 py-2 text-[12px] font-medium text-destructive">{validationError}</p>
+              )}
+            </div>
+          )}
+
+          {step === 3 && platform !== 'wechat_mp' && validation && (
             <div className="space-y-4">
               <div className="rounded-lg border border-border bg-background p-3">
                 <div className="flex items-center gap-2">
@@ -1643,7 +2044,7 @@ function AddSourceWizard({
               下一步
             </button>
           )}
-          {step === 2 && (
+          {step === 2 && platform !== 'wechat_mp' && (
             <button
               type="button"
               onClick={handleValidate}
@@ -1709,13 +2110,37 @@ function sourceStatusInfo(source: AdminSource): {
   kind: 'ok' | 'error' | 'warning' | 'muted'
 } {
   if (source.status === 'paused') return { label: '已停用', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
-  if (source.status === 'not_fetched') return { label: '配置存在但未在抓', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
   if (source.status === 'pending') return { label: '待放量', cls: 'bg-amber-50 text-amber-700', kind: 'warning' }
-  if (source.status === 'broken') return { label: '异常 · broken', cls: 'bg-destructive/10 text-destructive', kind: 'error' }
-  if (source.health?.inserted_7d === 0) return { label: '异常 · 7 日 0 产出', cls: 'bg-destructive/10 text-destructive', kind: 'error' }
-  if (!source.health?.last_fetched_at && (source.health?.inserted_7d === null || source.health?.inserted_7d === undefined)) {
-    return { label: '待首抓', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
+  if (source.status === 'not_fetched' && source.platform === 'bilibili_up') {
+    return { label: '管线未接入', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
   }
+  const latestAttempt = source.health?.latest_attempt
+  const lastSuccessMs = Date.parse(source.health?.last_fetched_at || '')
+  const attemptFinishedMs = Date.parse(latestAttempt?.finished_at || '')
+  const attempt = Number.isFinite(lastSuccessMs)
+    && Number.isFinite(attemptFinishedMs)
+    && lastSuccessMs > attemptFinishedMs
+    ? null
+    : latestAttempt
+  if (attempt?.outcome === 'missed') return { label: '本轮漏抓', cls: 'bg-destructive/10 text-destructive', kind: 'error' }
+  if (source.status === 'broken') return { label: '连续失败', cls: 'bg-destructive/10 text-destructive', kind: 'error' }
+  if (attempt?.outcome === 'failed' || attempt?.outcome === 'interrupted') {
+    return { label: '本轮失败', cls: 'bg-amber-50 text-amber-700', kind: 'warning' }
+  }
+  const failures = source.health?.consecutive_failures ?? 0
+  if (failures > 0 || attempt?.outcome === 'retrying') {
+    return { label: `抓取重试中 · ${Math.max(failures, attempt?.attempts ?? 1)}`, cls: 'bg-amber-50 text-amber-700', kind: 'warning' }
+  }
+  if (attempt?.outcome === 'success' && (attempt.new_count ?? 0) > 0) {
+    return { label: `成功 · 新增 ${attempt.new_count}`, cls: 'bg-accent text-accent-foreground', kind: 'ok' }
+  }
+  if (attempt?.outcome === 'success' || attempt?.outcome === 'no_new') {
+    return { label: '成功 · 无新增', cls: 'bg-secondary text-muted-foreground', kind: 'muted' }
+  }
+  if (!source.health?.last_fetched_at) {
+    return { label: '待首次验证', cls: 'bg-muted text-muted-foreground', kind: 'muted' }
+  }
+  if (source.health?.inserted_7d === 0) return { label: '近7日无更新', cls: 'bg-secondary text-muted-foreground', kind: 'muted' }
   return { label: '正常', cls: 'bg-accent text-accent-foreground', kind: 'ok' }
 }
 

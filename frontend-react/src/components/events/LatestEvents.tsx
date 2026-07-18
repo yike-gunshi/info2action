@@ -1,5 +1,7 @@
 /**
  * v15.0 LatestEvents — 时间线容器（DESIGN.md §15.5）
+ * v24.0 批次①: 报眉 Scotch rule、日界收束（页面版式保留）。
+ * 头版 tier 装配（头条/次条/简讯 + 防翻牌记忆）已退役：全部条目严格按时间倒序平铺。
  *
  * 仅当 enabled=true（event_aggregation_ready=true）时渲染。
  * 容器固定高 450px（移动 360px），内部 overflow-y: auto。
@@ -34,7 +36,7 @@ interface LatestEventsProps {
 function SkeletonCard() {
   return (
     <div data-testid="event-skeleton" className="border-b border-border/70 px-5 py-3.5 sm:px-6 sm:py-4" style={{ minHeight: 120 }}>
-      <div className="grid grid-cols-1 gap-y-2 sm:grid-cols-[72px_minmax(0,1fr)_200px] sm:gap-x-5 sm:gap-y-0 lg:grid-cols-[80px_minmax(0,1fr)_200px] lg:gap-x-6">
+      <div className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-[52px_minmax(0,1fr)_200px] sm:gap-y-0 lg:grid-cols-[56px_minmax(0,1fr)_200px]">
         <div
           className="mt-1 rounded bg-muted"
           style={{ height: 12, animation: 'event-skeleton-shimmer 1.5s linear infinite', backgroundImage: 'linear-gradient(90deg, var(--border) 0%, var(--muted) 50%, var(--border) 100%)', backgroundSize: '200% 100%' }}
@@ -153,6 +155,20 @@ function formatEventTime(date: Date | null): string {
   })
 }
 
+/** §21.2 日界收束: 「· M 月 D 日 共 N 条 ·」mono 12px 居中,两侧 hairline 延伸 */
+function DayEndRule({ date, count }: { date: Date | null; count: number }) {
+  if (!date) return null
+  return (
+    <div data-testid="event-day-end" className="flex items-center gap-4 pb-1.5 pt-[22px]">
+      <span aria-hidden="true" className="h-px flex-1 bg-border" />
+      <span className="font-mono text-[12px] text-muted-foreground">
+        {`· ${date.getMonth() + 1} 月 ${date.getDate()} 日 共 ${count} 条 ·`}
+      </span>
+      <span aria-hidden="true" className="h-px flex-1 bg-border" />
+    </div>
+  )
+}
+
 function groupByDate(events: ClusterEvent[]): TimelineGroup[] {
   const groups: TimelineGroup[] = []
   const indexByKey = new Map<string, number>()
@@ -240,6 +256,8 @@ export function LatestEvents({ containerHeight, showEmptyState = true, topSlot, 
   useEffect(() => {
     if (enabled === false || !isPageVariant || !canLoadMore || loading || refreshing) return
     const handleWindowScroll = () => {
+      // bf-0711 #2: 弹窗打开时不触发触底加载(同下拉刷新守卫)。
+      if (document.documentElement.style.overflow === 'hidden') return
       const root = document.documentElement
       const viewportHeight = window.innerHeight || root.clientHeight
       const scrollTop = window.scrollY || root.scrollTop
@@ -262,6 +280,9 @@ export function LatestEvents({ containerHeight, showEmptyState = true, topSlot, 
   useEffect(() => {
     if (!isPageVariant || enabled !== true || isSearchActive) return
     const maybeRefreshAtTop = () => {
+      // bf-0711 #2: 弹窗打开时(modal 锁 html overflow:hidden)禁用下拉刷新——
+      // 否则弹窗内滚轮/触摸事件冒泡到 window,背景在顶部时会误触发精选页刷新。
+      if (document.documentElement.style.overflow === 'hidden') return
       const now = Date.now()
       if (now - manualRefreshAtRef.current < 1200) return
       if (window.scrollY > 1 || loading || refreshing) return
@@ -406,7 +427,8 @@ export function LatestEvents({ containerHeight, showEmptyState = true, topSlot, 
             )}
           >
             {timelineGroups.map((group, groupIndex) => {
-              const weekday = formatWeekday(eventDate(group.events[0]))
+              const groupDate = eventDate(group.events[0])
+              const weekday = formatWeekday(groupDate)
               const fullDayCount = isSearchActive ? group.events.length : (dateCounts[group.key] ?? group.events.length)
               const metaLabel = [weekday, `${fullDayCount} 条更新`].filter(Boolean).join(' · ')
 
@@ -415,19 +437,21 @@ export function LatestEvents({ containerHeight, showEmptyState = true, topSlot, 
                   key={group.key}
                   data-testid="event-date-group"
                   aria-label={group.label}
-                  className="relative"
+                  // v24.1: 日组整体内缩 16px——正文区 ~960 宽,略窄于上方筛选 tab 行的 992(宽度层级)
+                  className={cn('relative', isPageVariant && 'sm:px-4')}
                 >
                   <div
                     data-testid="event-date-heading"
                     className={cn(
                       'relative text-[14px]',
                       isPageVariant
-                        ? 'sticky top-[var(--highlights-date-top)] z-40 grid min-h-12 grid-cols-1 items-center bg-background sm:grid-cols-[72px_minmax(0,1fr)] sm:gap-x-5 lg:grid-cols-[80px_minmax(0,1fr)] lg:gap-x-6'
+                        ? 'sticky top-[var(--highlights-date-top)] z-40 grid min-h-12 grid-cols-1 items-center gap-x-4 bg-background sm:grid-cols-[52px_minmax(0,1fr)] lg:grid-cols-[56px_minmax(0,1fr)]'
                         : 'sticky top-0 z-30 -mx-5 flex items-center gap-2.5 border-b border-border bg-card px-5 py-3 sm:-mx-6 sm:px-6',
                     )}
                   >
                     {!isPageVariant && <CalendarDays data-testid="event-date-icon" size={17} className="shrink-0 text-[var(--brand)]" aria-hidden="true" />}
-                    <div className={cn(isPageVariant && 'flex items-baseline gap-2.5 sm:col-span-2 sm:ml-[30px] lg:ml-[38px]')}>
+                    {/* v24.1: 去缩进——日期文字、Scotch rule、时间列共享同一 x0 左缘 */}
+                    <div className={cn(isPageVariant && 'flex items-baseline gap-2.5 sm:col-span-2')}>
                       <span
                         data-testid="event-date-label"
                         className={cn(
@@ -449,21 +473,40 @@ export function LatestEvents({ containerHeight, showEmptyState = true, topSlot, 
                         {metaLabel}
                       </span>
                     </div>
+                    {/* §21.2 报眉: Scotch rule 上粗下细双线(2px foreground + 3px 间隔 + 1px border),
+                        随日期头 sticky,兼作滚动遮挡边界 */}
+                    {isPageVariant && (
+                      <div
+                        data-testid="event-scotch-rule"
+                        aria-hidden="true"
+                        className="mt-1 h-[6px] border-b border-t-2 border-b-border border-t-foreground sm:col-span-2"
+                      />
+                    )}
                   </div>
                   {isPageVariant && groupIndex === 0 && refreshing && <RefreshInlineSpinner />}
-                  {group.events.map((c, idx) => {
-                    const date = eventDate(c)
-                    return (
-                      <EventCard
-                        key={c.id}
-                        cluster={c}
-                        onSelect={handleSelectEvent}
-                        onPrefetch={prefetchBundle}
-                        timeLabel={formatEventTime(date)}
-                        isFirstInGroup={idx === 0}
-                      />
-                    )
-                  })}
+                  {/* 严格时间倒序平铺(头版提升已退役)。
+                      行区再缩进一档(v24.2): 筛选 tab > 日期/Scotch rule > 行区 的嵌套层级,行分隔线随行区缩进 */}
+                  <div className={cn(isPageVariant && 'sm:pl-4')} data-testid="event-rows">
+                    {group.events.map((c, idx) => {
+                      const date = eventDate(c)
+                      return (
+                        <EventCard
+                          key={c.id}
+                          cluster={c}
+                          onSelect={handleSelectEvent}
+                          onPrefetch={prefetchBundle}
+                          timeLabel={formatEventTime(date)}
+                          isFirstInGroup={idx === 0}
+                        />
+                      )
+                    })}
+                  </div>
+                  {/* §21.2 日界收束: 无限流切成「一天一版」;搜索是检索模式不渲染;
+                      整天加载完才渲染——半加载画收束线是对「完结感」撒谎 */}
+                  {isPageVariant && !isSearchActive && group.key !== 'unknown' &&
+                    group.events.length >= (dateCounts[group.key] ?? group.events.length) && (
+                    <DayEndRule date={groupDate} count={fullDayCount} />
+                  )}
                 </section>
               )
             })}

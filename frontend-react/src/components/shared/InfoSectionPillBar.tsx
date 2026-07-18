@@ -112,20 +112,21 @@ function InfoSectionPillRowView({
       aria-label={row.ariaLabel}
       data-testid="info-section-pill-row-shell"
     >
+      {/* v24 §21.3 导航增强：溢出渐隐从 group-hover 改常显（触屏无 hover） */}
       {scrollState.hasOverflow && (
         <>
           <span
             className={cn(
-              'pointer-events-none absolute inset-y-0 left-0 z-10 w-8 bg-gradient-to-r from-background to-transparent opacity-0 transition-opacity duration-150',
-              scrollState.canLeft && 'group-hover/section-pill:opacity-100',
+              'pointer-events-none absolute inset-y-0 left-0 z-10 w-8 bg-gradient-to-r from-background to-transparent transition-opacity duration-150',
+              scrollState.canLeft ? 'opacity-100' : 'opacity-0',
             )}
             aria-hidden="true"
             data-testid={`info-section-pill-fade-left-${sectionKey}-${rowIndex}`}
           />
           <span
             className={cn(
-              'pointer-events-none absolute inset-y-0 right-0 z-10 w-8 bg-gradient-to-l from-background to-transparent opacity-0 transition-opacity duration-150',
-              scrollState.canRight && 'group-hover/section-pill:opacity-100',
+              'pointer-events-none absolute inset-y-0 right-0 z-10 w-8 bg-gradient-to-l from-background to-transparent transition-opacity duration-150',
+              scrollState.canRight ? 'opacity-100' : 'opacity-0',
             )}
             aria-hidden="true"
             data-testid={`info-section-pill-fade-right-${sectionKey}-${rowIndex}`}
@@ -136,7 +137,7 @@ function InfoSectionPillRowView({
             className={cn(
               'absolute left-0 top-1/2 z-20 hidden h-10 w-5 -translate-y-1/2 items-center justify-center bg-transparent px-0 text-muted-foreground/55 transition-[color,opacity] duration-150 hover:text-muted-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-background sm:inline-flex',
               scrollState.canLeft
-                ? 'opacity-0 group-hover/section-pill:opacity-80 focus:opacity-100'
+                ? 'opacity-80 hover:opacity-100 focus:opacity-100'
                 : 'pointer-events-none opacity-0',
             )}
             aria-label="向左滚动 section 筛选"
@@ -151,7 +152,7 @@ function InfoSectionPillRowView({
             className={cn(
               'absolute right-0 top-1/2 z-20 hidden h-10 w-5 -translate-y-1/2 items-center justify-center bg-transparent px-0 text-muted-foreground/55 transition-[color,opacity] duration-150 hover:text-muted-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-background sm:inline-flex',
               scrollState.canRight
-                ? 'opacity-0 group-hover/section-pill:opacity-80 focus:opacity-100'
+                ? 'opacity-80 hover:opacity-100 focus:opacity-100'
                 : 'pointer-events-none opacity-0',
             )}
             aria-label="向右滚动 section 筛选"
@@ -190,7 +191,7 @@ function InfoSectionPillRowView({
                 row.onSelect(nextKey)
               }}
               className={cn(
-                'flex h-full shrink-0 items-center whitespace-nowrap border-b-2 px-0.5 font-body-cjk text-[14px] font-medium tracking-normal transition-colors duration-150',
+                'flex h-full shrink-0 items-center whitespace-nowrap border-b-2 px-0.5 font-event-title text-[16px] font-medium tracking-normal transition-colors duration-150',
                 'cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-offset-2 focus-visible:ring-offset-background',
                 selected
                   ? 'border-[var(--brand)] text-[var(--brand)]'

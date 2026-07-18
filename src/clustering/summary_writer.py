@@ -360,6 +360,26 @@ def _extract_relaxed_string_field(text: str, field: str) -> str | None:
     return None
 
 
+def _normalize_why_read(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 240:
+        truncated = normalized[:240]
+        sentence_end = max(truncated.rfind(mark) for mark in '。！？；')
+        if sentence_end >= 0:
+            truncated = truncated[:sentence_end + 1]
+        _log_event(
+            'cluster_summary_why_read_truncated',
+            original_chars=len(normalized),
+            stored_chars=len(truncated),
+        )
+        return truncated
+    return normalized
+
+
 def _extract_relaxed_warnings(text: str) -> list[str]:
     marker_idx = text.find('"warnings"')
     if marker_idx < 0:
@@ -406,12 +426,14 @@ def _parse_relaxed_llm_json(text: str) -> dict[str, Any] | None:
     title = _extract_relaxed_string_field(text, 'title')
     summary = _extract_relaxed_string_field(text, 'summary')
     breakdown = _extract_relaxed_string_field(text, 'breakdown')
+    why_read = _extract_relaxed_string_field(text, 'why_read')
     warnings = _extract_relaxed_warnings(text)
     if title and summary and (breakdown or '【全文拆解】' in summary):
         return {
             'title': title,
             'summary': _compose_summary_sections(summary, breakdown),
             'key_points': [],
+            'why_read': _normalize_why_read(why_read),
             'warnings': warnings,
         }
     if warnings and _check_invalid_warnings(warnings):
@@ -519,6 +541,7 @@ def _parse_llm_json(raw: str) -> dict[str, Any] | None:
     title = obj.get('title')
     summary = obj.get('summary')
     breakdown = obj.get('breakdown')
+    why_read = _normalize_why_read(obj.get('why_read'))
     kps = obj.get('key_points')
     # BF-0428-2: kps 允许为空 list (空 [] 也算合法输出)。
     # BF-0428-5: kps 元素允许 string 或 {title, points: []} 嵌套对象,与单 doc
@@ -597,6 +620,7 @@ def _parse_llm_json(raw: str) -> dict[str, Any] | None:
         'title': normalized_title,
         'summary': normalized_summary,
         'key_points': cleaned_kps,
+        'why_read': why_read,
         'warnings': warnings,
         'bold_term_count': 0,
     }
@@ -657,6 +681,7 @@ def _single_member_item_summary_payload(rows) -> dict[str, Any] | None:
         'title': title,
         'summary': normalized_summary,
         'key_points': key_points,
+        'why_read': None,
         'warnings': [],
         'bold_term_count': 0,
     }
@@ -1086,6 +1111,7 @@ def regenerate_and_swap(
             title=parsed['title'],
             summary=parsed['summary'],
             key_points=parsed['key_points'],
+            why_read=parsed.get('why_read'),
             is_visible=bool(is_visible),
             warnings=warnings,
             run_id=run_id,
@@ -1096,12 +1122,14 @@ def regenerate_and_swap(
                  ai_title_draft = ?,
                  ai_summary_draft = ?,
                  ai_key_points_draft = ?,
+                 why_read = ?,
                  pending_is_visible_in_feed = ?,
                  pending_summary_warnings_json = ?,
                  last_touched_run_id = COALESCE(?, last_touched_run_id)
                WHERE id = ?""",
             (parsed['title'], parsed['summary'],
              json.dumps(parsed['key_points'], ensure_ascii=False),
+             parsed.get('why_read'),
              is_visible, warnings_json, run_id,
              cluster_id),
         )

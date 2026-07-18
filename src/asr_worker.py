@@ -78,6 +78,24 @@ def _http_post_json(url: str, headers: dict, body: dict, timeout: int = 30) -> t
 
 # ---------- 下载 / ffmpeg ----------
 
+
+def _ffmpeg_timeout(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+        return n if n > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+# ffmpeg 抽音频上限(默认 300s):一段音频再长也应在数分钟内抽完;超时即判损坏。
+_FFMPEG_EXTRACT_TIMEOUT_SEC = _ffmpeg_timeout("INFO2ACTION_FFMPEG_EXTRACT_TIMEOUT_SEC", 300)
+# ffprobe 只读元数据,几秒足矣。
+_FFPROBE_TIMEOUT_SEC = _ffmpeg_timeout("INFO2ACTION_FFPROBE_TIMEOUT_SEC", 30)
+
+
 class NoAudioStreamError(RuntimeError):
     """Raised when a video has no extractable audio stream for ASR."""
 
@@ -114,7 +132,13 @@ def ffmpeg_extract_mp3(mp4_path: str, mp3_path: str, bitrate: str = "48k") -> tu
         "-b:a", bitrate, mp3_path,
     ]
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    # 稳定性加固(2026-07-10): 补 timeout。损坏/半截音频流会让 ffmpeg 永久阻塞,
+    # 该函数经 asyncio.to_thread 执行——挂死会永久占住一个 anyio 线程池线程,
+    # 累积到上限后所有同步路由(含鉴权)一起卡。其它 fetch/media 子进程都已设 timeout。
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFMPEG_EXTRACT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffmpeg extract timed out after {_FFMPEG_EXTRACT_TIMEOUT_SEC}s")
     if r.returncode != 0:
         if _ffmpeg_error_has_no_audio(r.stderr):
             raise NoAudioStreamError("no audio stream in video")
@@ -128,7 +152,10 @@ def ffprobe_duration(path: str) -> float:
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", path,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=_FFPROBE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        return 0.0
     try:
         return float(r.stdout.strip())
     except Exception:

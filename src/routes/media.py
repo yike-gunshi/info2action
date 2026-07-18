@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -31,6 +32,7 @@ from urllib.parse import urljoin, urlparse
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 
 # BF-0515-twitter-image-perf: in-memory LRU cache for Twitter photo/poster
@@ -124,6 +126,30 @@ _media_cold_path_slots = threading.BoundedSemaphore(_media_cold_path_concurrency
 _MEDIA_COLD_PATH_INFLIGHT_LOCK = threading.Lock()
 _MEDIA_COLD_PATH_INFLIGHT: dict[tuple, dict] = {}
 _MEDIA_COLD_PATH_SINGLEFLIGHT_TIMEOUT_SEC = 150
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+        return n if n > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+# 稳定性加固(2026-07-10):/api/media/image-proxy 与 twitter-mp4 是匿名可达的外链代理。
+# 每个 image-proxy 请求会 run_in_threadpool 拉外站图(≤12MB / 30s);每个 mp4 stream
+# 是 StreamingResponse 的同步生成器,占一个 anyio 线程直到客户端断开。默认线程池
+# 40 tokens 同时也承载 JWT 鉴权和所有同步 DB 路由——外链代理不设并发上限时,
+# 约 40 个慢请求即可耗尽线程池,拖垮全站(含鉴权)。这里给两类外链代理各设一个
+# 有上限的信号量,超限返回 503,给核心读路径留出线程池余量。
+_IMAGE_PROXY_MAX_CONCURRENCY = _env_positive_int("INFO2ACTION_IMAGE_PROXY_MAX_CONCURRENCY", 8)
+_MP4_PROXY_MAX_CONCURRENCY = _env_positive_int("INFO2ACTION_MP4_PROXY_MAX_CONCURRENCY", 24)
+_IMAGE_PROXY_ACQUIRE_TIMEOUT = float(_env_positive_int("INFO2ACTION_IMAGE_PROXY_ACQUIRE_TIMEOUT_SEC", 5))
+_image_proxy_sem = asyncio.Semaphore(_IMAGE_PROXY_MAX_CONCURRENCY)
+_mp4_proxy_sem = asyncio.Semaphore(_MP4_PROXY_MAX_CONCURRENCY)
 
 
 # BF-0515-image-etag: utility for ETag + 304 Not Modified handling on image
@@ -339,7 +365,25 @@ async def image_proxy(url: str, request: Request):
     etag = _make_etag("image", hashlib.sha256(url.encode("utf-8")).hexdigest()[:24])
     if _check_if_none_match(request, etag):
         return _not_modified_response(etag)
-    data, content_type = await run_in_threadpool(_fetch_external_image, url)
+    # Cache hits skip the concurrency slot entirely (an image-heavy page re-viewing
+    # cached covers must not serialize behind the network fetch limit).
+    cache_key = ("external-image", hashlib.sha256(url.encode("utf-8")).hexdigest())
+    cached = _twitter_image_lru.get(cache_key)
+    if cached is not None:
+        data, content_type = cached
+        return _image_response_with_etag(data, etag, media_type=content_type)
+    # Cache miss: bound concurrent external fetches so a flood of anonymous
+    # image-proxy requests cannot drain the shared anyio threadpool (which also
+    # serves JWT auth and every sync DB route). Fail fast with 503 when saturated
+    # rather than queueing requests (and their reserved threads) indefinitely.
+    try:
+        await asyncio.wait_for(_image_proxy_sem.acquire(), timeout=_IMAGE_PROXY_ACQUIRE_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="image proxy busy")
+    try:
+        data, content_type = await run_in_threadpool(_fetch_external_image, url)
+    finally:
+        _image_proxy_sem.release()
     return _image_response_with_etag(data, etag, media_type=content_type)
 
 
@@ -410,7 +454,23 @@ async def twitter_mp4_proxy(request: Request, item_id: str):
     if range_header:
         headers["Range"] = range_header
 
-    upstream = await run_in_threadpool(_open_twitter_mp4_upstream, item_id, headers)
+    # Bound concurrent stream sessions: an anonymous flood of mp4 proxy requests
+    # otherwise pins anyio threadpool threads (StreamingResponse reads each chunk
+    # in the pool) and open upstream sockets. The slot is held for the whole
+    # stream and released by an async background task after the response finishes.
+    try:
+        await asyncio.wait_for(_mp4_proxy_sem.acquire(), timeout=_IMAGE_PROXY_ACQUIRE_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="video proxy busy")
+
+    async def _release_mp4_slot():
+        _mp4_proxy_sem.release()
+
+    try:
+        upstream = await run_in_threadpool(_open_twitter_mp4_upstream, item_id, headers)
+    except BaseException:
+        _mp4_proxy_sem.release()
+        raise
     status_code = upstream.status  # 200 或 206
 
     def iter_upstream():
@@ -437,6 +497,7 @@ async def twitter_mp4_proxy(request: Request, item_id: str):
         status_code=status_code,
         media_type="video/mp4",
         headers=resp_headers,
+        background=BackgroundTask(_release_mp4_slot),
     )
 
 

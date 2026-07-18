@@ -1,6 +1,7 @@
 """Health check and credential sync endpoints."""
 
 import base64
+import functools
 import json
 import os
 import subprocess
@@ -8,6 +9,7 @@ import time
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 import db
 import remote_db
@@ -192,7 +194,7 @@ def get_health(recheck: str = Query(None)):
 
         cli_env = {k: v for k, v in os.environ.items()
                    if not any(p in k for p in ('PYTHON', 'VIRTUAL_ENV', '__PYVENV'))}
-        for cli_name, cli_cmd in [('twitter', ['twitter', 'feed', '-t', 'following', '-n', '1', '--json']),
+        for cli_name, cli_cmd in [('twitter', ['twitter', '--compact', 'whoami', '--json']),
                                    ('xiaohongshu', ['xhs', 'feed', '--json'])]:
             try:
                 r = subprocess.run(cli_cmd, capture_output=True, text=True, timeout=15, env=cli_env)
@@ -365,7 +367,17 @@ async def sync_credentials(request: Request):
             return {'ok': False, 'message': 'sync_credentials.sh 不存在'}
         env = os.environ.copy()
         env['PATH'] = LOCAL_BIN_PATH + ':' + env.get('PATH', '')
-        r = subprocess.run(['bash', script, '--extract'], capture_output=True, text=True, timeout=30, env=env, cwd=BASE)
+        r = await run_in_threadpool(
+            functools.partial(
+                subprocess.run,
+                ['bash', script, '--extract'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+                cwd=BASE,
+            )
+        )
         output = r.stdout + r.stderr
         if r.returncode == 0:
             return {'ok': True, 'message': '凭证同步完成'}

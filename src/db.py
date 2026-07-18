@@ -221,7 +221,7 @@ CREATE TABLE IF NOT EXISTS search_keywords (
 CREATE TABLE IF NOT EXISTS feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   item_id TEXT NOT NULL REFERENCES items(id),
-  type TEXT NOT NULL,  -- 'positive', 'irrelevant', 'low_quality', 'text'
+  type TEXT NOT NULL,  -- 'positive', 'irrelevant', 'low_quality', 'text', 'should_feature'
   topic TEXT,
   text TEXT,  -- free-text feedback
   created_at TEXT DEFAULT (datetime('now'))
@@ -437,6 +437,7 @@ CREATE TABLE IF NOT EXISTS clusters (
   ai_title              TEXT,
   ai_summary            TEXT,
   ai_key_points         TEXT,
+  why_read              TEXT,
   ai_summary_draft      TEXT,
   ai_title_draft        TEXT,
   ai_key_points_draft   TEXT,
@@ -483,6 +484,9 @@ CREATE TABLE IF NOT EXISTS cluster_status (
   clicked_at        TIMESTAMP,
   starred_at        TIMESTAMP,
   last_seen_version INTEGER NOT NULL DEFAULT 0,
+  feedback_kind     TEXT,
+  feedback_at       TIMESTAMP,
+  feedback_note     TEXT,
   PRIMARY KEY (user_id, cluster_id)
 );
 
@@ -831,6 +835,7 @@ def get_conn():
         'published_at TIMESTAMP',
         'pending_is_visible_in_feed INTEGER',
         'pending_summary_warnings_json TEXT',
+        'why_read TEXT',
     ):
         try:
             conn.execute(f"ALTER TABLE clusters ADD COLUMN {col}")
@@ -895,6 +900,17 @@ def get_conn():
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
+    # v25.0 highlights-quality: per-user cluster quality feedback (只落库不改排序).
+    for _fb_sql in (
+        "ALTER TABLE cluster_status ADD COLUMN feedback_kind TEXT",
+        "ALTER TABLE cluster_status ADD COLUMN feedback_at TIMESTAMP",
+        "ALTER TABLE cluster_status ADD COLUMN feedback_note TEXT",
+    ):
+        try:
+            conn.execute(_fb_sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     for idx_sql in (
         "CREATE INDEX IF NOT EXISTS idx_cluster_status_user_clicked "
         "ON cluster_status(user_id, clicked_at DESC) WHERE clicked_at IS NOT NULL",
@@ -1145,14 +1161,23 @@ def normalize_active_source_row(row):
 
 
 def list_active_sources(conn, platform):
-    """Return active sources for one platform, with config_json parsed."""
-    rows = conn.execute(
-        """SELECT id, source_key, display_name, config_json
-           FROM sources
-           WHERE platform = ? AND status = 'active'
-           ORDER BY id""",
-        (platform,),
-    ).fetchall()
+    """Return sources eligible for scheduled fetch and broken recovery."""
+    if platform == 'x_user':
+        rows = conn.execute(
+            """SELECT id, source_key, display_name, config_json
+               FROM sources
+               WHERE platform = ? AND status IN ('active', 'broken', 'not_fetched')
+               ORDER BY id""",
+            (platform,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, source_key, display_name, config_json
+               FROM sources
+               WHERE platform = ? AND status IN ('active', 'broken')
+               ORDER BY id""",
+            (platform,),
+        ).fetchall()
     return [normalize_active_source_row(row) for row in rows]
 
 
@@ -1179,12 +1204,12 @@ def record_source_fetch_result(conn, source_id, *, ok, error=None, broken_after=
         if row is None:
             return
         status = row['status']
-        if status not in {'active', 'broken'}:
+        if status not in {'active', 'broken', 'not_fetched'}:
             return
 
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         if ok:
-            new_status = 'active' if status == 'broken' else status
+            new_status = 'active'
             conn.execute(
                 """UPDATE sources
                       SET status = ?,
@@ -1206,7 +1231,7 @@ def record_source_fetch_result(conn, source_id, *, ok, error=None, broken_after=
             threshold = 5
         current_failures = int(row['consecutive_failures'] or 0)
         failures = current_failures + 1
-        new_status = 'broken' if status == 'active' and failures >= threshold else status
+        new_status = 'broken' if failures >= threshold else status
         last_error = None if error is None else str(error)[:500]
         conn.execute(
             """UPDATE sources

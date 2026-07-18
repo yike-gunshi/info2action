@@ -13,7 +13,7 @@
   - 已存在 → 只更新 display_name/config_json/updated_at,**保留 status 与 origin**
              (不覆盖 admin 手工改过的状态)
 
-X(twitter following)不在本脚本: 需 twitter CLI 在线,留到 Wave 2 的 fetch_x_users。
+X 注册表账号不在本脚本: 需由管理页配置或显式同步后交给 fetch_x_users。
 
 用法: python3 scripts/seed_sources_registry.py
 测试: 先设 db.DB_PATH 指向临时库再 import 调用 seed()。
@@ -26,6 +26,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE, 'src'))
 
 import db  # noqa: E402
+import remote_db  # noqa: E402
 
 
 def _now():
@@ -132,12 +133,7 @@ def _iter_lingowhale_channels(groups):
     yield from walk(groups)
 
 
-def seed(conn=None):
-    """Idempotent seed. Returns summary dict {platform: {inserted, updated}} + skipped notes."""
-    own_conn = conn is None
-    if own_conn:
-        conn = db.get_conn()
-
+def _seed_into(conn, *, remote):
     seeds = _collect_seeds()
     summary = {}
     lingowhale_present = os.path.exists(
@@ -146,35 +142,61 @@ def seed(conn=None):
     for s in seeds:
         plat = s['platform']
         summary.setdefault(plat, {'inserted': 0, 'updated': 0})
-        row = conn.execute(
-            "SELECT id FROM sources WHERE platform=? AND source_key=?",
-            (plat, s['source_key']),
-        ).fetchone()
-        if row:
-            # 已存在: 更新展示信息, 保留 status/origin(不覆盖 admin 改动)
-            conn.execute(
-                "UPDATE sources SET display_name=?, config_json=?, updated_at=? "
-                "WHERE platform=? AND source_key=?",
-                (s['display_name'], s['config_json'], _now(),
-                 plat, s['source_key']),
+        now = _now()
+        if remote:
+            action = remote_db.upsert_source_registry_remote(
+                conn,
+                platform=plat,
+                source_key=s['source_key'],
+                display_name=s['display_name'],
+                status=s['status'],
+                config_json=s['config_json'],
+                origin='seed_import',
+                now=now,
             )
-            summary[plat]['updated'] += 1
         else:
-            conn.execute(
-                "INSERT INTO sources(platform, source_key, display_name, status, "
-                "config_json, origin, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (plat, s['source_key'], s['display_name'], s['status'],
-                 s['config_json'], 'seed_import', _now(), _now()),
-            )
-            summary[plat]['inserted'] += 1
+            row = conn.execute(
+                "SELECT id FROM sources WHERE platform=? AND source_key=?",
+                (plat, s['source_key']),
+            ).fetchone()
+            if row:
+                # 已存在: 更新展示信息, 保留 status/origin(不覆盖 admin 改动)
+                conn.execute(
+                    "UPDATE sources SET display_name=?, config_json=?, updated_at=? "
+                    "WHERE platform=? AND source_key=?",
+                    (s['display_name'], s['config_json'], now,
+                     plat, s['source_key']),
+                )
+                action = 'updated'
+            else:
+                conn.execute(
+                    "INSERT INTO sources(platform, source_key, display_name, status, "
+                    "config_json, origin, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (plat, s['source_key'], s['display_name'], s['status'],
+                     s['config_json'], 'seed_import', now, now),
+                )
+                action = 'inserted'
+        summary[plat][action] += 1
 
     conn.commit()
-    if own_conn:
-        conn.close()
-
     summary['_lingowhale_groups_present'] = lingowhale_present
     return summary
+
+
+def seed(conn=None):
+    """Idempotent seed. Returns summary dict {platform: {inserted, updated}} + skipped notes."""
+    if conn is not None:
+        return _seed_into(conn, remote=False)
+    if remote_db.fetch_write_to_remote():
+        with remote_db.connect() as remote_conn:
+            return _seed_into(remote_conn, remote=True)
+
+    local_conn = db.get_conn()
+    try:
+        return _seed_into(local_conn, remote=False)
+    finally:
+        local_conn.close()
 
 
 def main():
@@ -192,7 +214,7 @@ def main():
     if not summary.get('_lingowhale_groups_present'):
         print("  注: data/lingowhale/groups.json 不存在 → 公众号(wechat_mp)本轮跳过,"
               "待有语鲸频道数据后再导入。")
-    print("  注: X(twitter following)不在本脚本,留到 Wave 2 fetch_x_users。")
+    print("  注: X 注册表账号由管理页配置，fetch_x_users 只消费注册表。")
 
 
 if __name__ == '__main__':

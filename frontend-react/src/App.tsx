@@ -33,6 +33,7 @@ import { ResetPasswordPage } from './pages/ResetPasswordPage'
 import { PrivacyPage } from './pages/PrivacyPage'
 import { TermsPage } from './pages/TermsPage'
 import { ClusterFullPage } from './pages/ClusterFullPage'
+import { BrandWordmark } from './components/shared/BrandWordmark'
 
 type AuthView = 'login' | 'register' | 'verify-email' | 'forgot-password' | 'reset-password'
 // v18.0 nav-merge: starred / history 从 L1 tab 升级为全屏路由（Spec-3 D5）
@@ -47,6 +48,8 @@ function AppFrame({ children }: { children: ReactNode }) {
     <>
       {children}
       <DetailModalHost />
+      {/* v24.0 §21.6: Toaster 接主题 token(此前 sonner 恒亮色,暗色下 62 处 toast 弹白) —
+          走 --card/--border/--foreground CSS 变量,亮暗随 .dark 自动切换,无需 theme 订阅 */}
       <Toaster
         position="top-center"
         style={{
@@ -62,6 +65,10 @@ function AppFrame({ children }: { children: ReactNode }) {
             maxWidth: 'min(calc(100vw - 32px), 560px)',
             paddingLeft: 18,
             paddingRight: 18,
+            background: 'var(--card)',
+            color: 'var(--foreground)',
+            border: '1px solid var(--border)',
+            borderRadius: '6px',
           },
           duration: 3000,
         }}
@@ -159,10 +166,9 @@ export default function App() {
   if ((!isChecked || isLoading) && (appView === 'settings' || appView === 'admin')) {
     return (
       <AppFrame>
+        {/* v24.0 §21.6: 启动 loader 靛蓝「N」块退役 → brand wordmark 脉冲 */}
         <div className="min-h-screen flex items-center justify-center bg-background">
-          <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center text-primary-foreground font-bold text-sm animate-pulse">
-            N
-          </div>
+          <BrandWordmark aria-hidden="true" className="animate-pulse text-[34px]" />
         </div>
       </AppFrame>
     )

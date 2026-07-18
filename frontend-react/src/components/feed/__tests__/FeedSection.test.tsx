@@ -112,7 +112,8 @@ describe('FeedSection', () => {
     expect(allButton.className).toContain('border-b-2')
     expect(allButton.className).toContain('border-[var(--brand)]')
     expect(allButton.className).toContain('text-[var(--brand)]')
-    expect(allButton.className).toContain('font-body-cjk')
+    expect(allButton.className).toContain('font-event-title')  // v24.2: pill 字体对齐 topbar 导航(16px 衬线)
+    expect(allButton.className).toContain('text-[16px]')
     expect(allButton.className).not.toContain('rounded-full')
     expect(allButton.className).not.toContain('bg-foreground')
     expect(videoButton.className).toContain('border-transparent')
@@ -143,7 +144,7 @@ describe('FeedSection', () => {
     expect(screen.queryByText('AI 视频 15 条')).not.toBeInTheDocument()
   })
 
-  it('L2 pill 结果中的卡片会叠加本地已点击状态', async () => {
+  it('L2 pill 结果中的卡片会叠加本地已点击状态（v24 墨水降档,不再整卡 opacity-40）', async () => {
     const user = userEvent.setup()
     mockFetchSectionMore.mockResolvedValue({
       items: [makeItem('filtered-a')],
@@ -155,13 +156,16 @@ describe('FeedSection', () => {
     await user.click(screen.getByRole('button', { name: 'AI 视频' }))
 
     await waitFor(() => expect(screen.getByText('Item filtered-a')).toBeInTheDocument())
-    expect(screen.getByTestId('info-card').className).not.toContain('opacity-40')
+    expect(screen.getByTestId('info-card')).toHaveAttribute('data-read', 'false')
+    expect(screen.getByTestId('info-card-title').className).toContain('text-foreground')
 
     act(() => {
       useFeedStore.getState().markClicked('filtered-a')
     })
 
-    await waitFor(() => expect(screen.getByTestId('info-card').className).toContain('opacity-40'))
+    await waitFor(() => expect(screen.getByTestId('info-card')).toHaveAttribute('data-read', 'true'))
+    expect(screen.getByTestId('info-card').className).not.toContain('opacity-40')
+    expect(screen.getByTestId('info-card-title').className).toContain('text-muted-foreground')
   })
 
   it('切换 section 局部 pill 后不主动滚动页面', async () => {
@@ -271,6 +275,23 @@ describe('FeedSection', () => {
 
     expect(screen.queryByText('15 条')).not.toBeInTheDocument()
     expect(screen.getByText('137 条')).toBeInTheDocument()
+  })
+
+  it('v24.1 瀑布流回滚：首批 50 条全部渲染进 masonry，展开按钮显示剩余数', () => {
+    const firstPage = makeItems('initial', 50)
+    useFeedStore.setState({
+      sectionItems: new Map([['products', firstPage]]),
+      catCounts: { products: 120 },
+    })
+
+    render(<FeedSectionHarness />)
+
+    // 折叠态 = 前 BATCH(50) 条 masonry + 裁切蒙版；不再是 lead/rail/brief 行分型
+    const cards = screen.getAllByTestId('info-card')
+    expect(cards).toHaveLength(50)
+    cards.forEach((card) => expect(card).not.toHaveAttribute('data-variant'))
+    expect(screen.getByTestId('masonry-columns')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /展开更多/ })).toHaveTextContent('还有 70 条')
   })
 
   it('展开更多命中预取时仍追加在已有卡片后面', async () => {

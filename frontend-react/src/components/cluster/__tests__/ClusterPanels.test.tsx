@@ -24,20 +24,23 @@ vi.mock('../../../lib/api', () => ({
   fetchFeedItem: vi.fn(),
 }))
 
+// v24.0 §21.5-②: 右栏行动列表复用 ClusterActionZone(从 store 取 actions),
+// mock 改为可变对象以便按用例注入 store.actions。
+const clusterStoreState = vi.hoisted(() => ({
+  startGenerate: vi.fn(),
+  cancelGenerate: vi.fn(),
+  generating: false,
+  generateStages: [0, 0, 0, 0],
+  generateThinkingLines: [] as unknown[],
+  generateAction: null,
+  generateError: null,
+  actions: [] as unknown[],
+  loadActions: vi.fn(),
+  resetGenerate: vi.fn(),
+}))
+
 vi.mock('../../../store/clusterDetailStore', () => ({
-  useClusterDetailStore: (selector: (s: unknown) => unknown) =>
-    selector({
-      startGenerate: vi.fn(),
-      cancelGenerate: vi.fn(),
-      generating: false,
-      generateStages: [0, 0, 0, 0],
-      generateThinkingLines: [],
-      generateAction: null,
-      generateError: null,
-      actions: [],
-      loadActions: vi.fn(),
-      resetGenerate: vi.fn(),
-    }),
+  useClusterDetailStore: (selector: (s: unknown) => unknown) => selector(clusterStoreState),
 }))
 
 vi.mock('../../shared/AuthGate', () => ({
@@ -91,6 +94,7 @@ describe('ClusterFullPage panels', () => {
     cleanup()
     scrollIntoView.mockClear()
     vi.mocked(fetchFeedItem).mockReset()
+    clusterStoreState.actions = []
   })
 
   it('右栏 AI 区块渲染速览,summary 存在时不重复渲染 keyPoints', () => {
@@ -164,12 +168,13 @@ describe('ClusterFullPage panels', () => {
     const expanded = await screen.findByTestId('cluster-expanded-content')
     expect(expanded).toHaveClass('font-event-title', 'text-[16px]', 'leading-[1.82]', 'tracking-[0]')
     expect(expanded).not.toHaveClass('border-t')
+    // v24.0 §21.5-①: 正文墨色走 modal-text 语义 token(硬编码亮色墨是暗色模式真 bug)
     expect(await screen.findByTestId('item-left-body-text')).toHaveClass(
       'font-event-title',
       'text-[16px]',
       'leading-[1.82]',
       'tracking-[0]',
-      'text-[#3F3A34]',
+      'text-[var(--modal-text-soft)]',
     )
     expect(expanded).toHaveTextContent('第 1 段正文')
     expect(await screen.findByRole('button', { name: '收起当前展开全文' })).toBeInTheDocument()
@@ -213,31 +218,72 @@ describe('ClusterFullPage panels', () => {
     expect(screen.queryByText('来源标题')).not.toBeInTheDocument()
   })
 
-  it('已生成行动点展示 prompt 或失败原因,避免只有标题', () => {
+  // v24.0 §21.5-②: v15 手写行动列表(12px+靛蓝 badge)删除,右栏复用 ClusterActionZone 存量列表
+  it('已生成行动点复用 ClusterActionZone 列表(标题行入口),不再渲染手写 12px 列表', () => {
+    const existingActions = [
+      {
+        id: 'action-1',
+        title: '[Event] OpenAI 发布新模型路线更新',
+        action_type: 'investigate',
+        prompt: '整理 OpenAI 新模型路线更新的事实脉络和待验证问题。',
+        priority: 'normal',
+        status: 'pending',
+        cluster_version: 1,
+        is_stale: 1,
+        reason: 'fallback: LLM 输出未能解析为 action JSON',
+      },
+    ] as ClusterAction[]
+    clusterStoreState.actions = existingActions
+
     render(
       <ClusterRightPanel
         cluster={cluster}
         sources={sources}
         showActions
-        actions={[
-          {
-            id: 'action-1',
-            title: '[Event] OpenAI 发布新模型路线更新',
-            action_type: 'investigate',
-            prompt: '整理 OpenAI 新模型路线更新的事实脉络和待验证问题。',
-            priority: 'normal',
-            status: 'pending',
-            cluster_version: 1,
-            is_stale: 0,
-            reason: 'fallback: LLM 输出未能解析为 action JSON',
-          },
-        ] as ClusterAction[]}
+        actions={existingActions}
       />,
     )
 
-    expect(screen.getByText('行动内容')).toBeInTheDocument()
-    expect(screen.getByText(/整理 OpenAI 新模型路线更新/)).toBeInTheDocument()
-    expect(screen.getByText('生成依据')).toBeInTheDocument()
-    expect(screen.getByText(/fallback: LLM 输出未能解析/)).toBeInTheDocument()
+    // ClusterActionZone 的存量列表入口(标题行 + 陈旧徽章走 score 语义 token)
+    expect(screen.getByTestId('cluster-action-list')).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: '打开行动点: [Event] OpenAI 发布新模型路线更新' }),
+    ).toBeInTheDocument()
+    const staleBadge = screen.getByText('陈旧')
+    expect(staleBadge.className).toContain('bg-[var(--score-high-bg)]')
+    expect(staleBadge.className).toContain('text-[var(--score-high)]')
+    // 旧手写列表的分节文案不复存在
+    expect(screen.queryByText('行动内容')).not.toBeInTheDocument()
+    expect(screen.queryByText('生成依据')).not.toBeInTheDocument()
+  })
+
+  it('存在过期行动时渲染 lucide 提示条(score token),不再用 emoji 与硬编码琥珀', () => {
+    const staleActions = [
+      {
+        id: 'action-1',
+        title: '过期行动',
+        action_type: 'investigate',
+        priority: 'normal',
+        status: 'pending',
+        cluster_version: 0,
+        is_stale: 1,
+      },
+    ] as ClusterAction[]
+    clusterStoreState.actions = staleActions
+
+    render(
+      <ClusterRightPanel
+        cluster={cluster}
+        sources={sources}
+        showActions
+        actions={staleActions}
+      />,
+    )
+
+    const note = screen.getByTestId('cluster-stale-note')
+    expect(note).toHaveTextContent('此事件已有更新，建议重新生成行动点')
+    expect(note.textContent).not.toContain('⚠️')
+    expect(note.className).toContain('bg-[var(--score-high-bg)]')
+    expect(note.querySelector('svg')).toBeInTheDocument()
   })
 })

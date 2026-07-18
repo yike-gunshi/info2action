@@ -3,7 +3,7 @@
 Usage: python3 fetch_feeds.py [--rss] [--wechat] [--hn] [--reddit] [--github]
   No flags = fetch all.
 """
-import json, logging, os, sys, time, hashlib
+import html, json, logging, os, re, sys, time, hashlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -355,6 +355,104 @@ def fetch_hackernews():
 # ============================================================
 # REDDIT
 # ============================================================
+# BF-0716-1: 生产数据中心 IP(Vultr Tokyo)被 reddit 全部 JSON 端点 403
+# (www/old/api,与 UA 无关),6 个源全走 RSS 兜底;而该 IP 未认证 RSS 配额是
+# 每 ~60s 窗口 1 次请求(x-ratelimit-remaining: 0.0)。原实现以 ≤2s 间隔串行
+# 连打且无 429 退避 → 每周期只有 ORDER BY id 最前的源成功,其余稳定 429
+# 累积失败进 broken(5/6 broken)。因此 RSS 路径按响应头做窗口 pacing +
+# 429 退避重试一次,总等待预算封顶(耗尽退化为原行为,保证周期有上界)。
+# Reddit OAuth 是长期解,见 docs/ops 运维记录。
+REDDIT_RSS_DEFAULT_BACKOFF_SEC = 61.0  # 实测窗口 ~60s;响应头缺失时的兜底
+REDDIT_RSS_MAX_WAIT_SEC = 90.0         # 单次等待上限
+REDDIT_RSS_WAIT_BUDGET_SEC = 360.0     # 每轮 fetch_reddit 的总等待预算
+
+
+def _reddit_ratelimit_seconds(resp):
+    """从 reddit 响应头推算下一次未认证请求前应等待的秒数（0 = 不用等）。"""
+    headers = getattr(resp, 'headers', None) or {}
+
+    def _num(key):
+        try:
+            value = float(headers.get(key, ''))
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    reset = _num('x-ratelimit-reset')
+    if getattr(resp, 'status_code', None) == 429:
+        wait = reset if reset is not None else _num('retry-after')
+        if wait is None:
+            wait = REDDIT_RSS_DEFAULT_BACKOFF_SEC
+        return min(max(wait, 1.0), REDDIT_RSS_MAX_WAIT_SEC)
+    remaining = _num('x-ratelimit-remaining')
+    if remaining is not None and remaining <= 0 and reset is not None:
+        return min(reset + 1.0, REDDIT_RSS_MAX_WAIT_SEC)
+    return 0.0
+
+
+class _RedditRssPacer:
+    """RSS 兜底的限流步调器：窗口 pacing + 429 退避，共享总等待预算。"""
+
+    def __init__(self, *, budget_sec=REDDIT_RSS_WAIT_BUDGET_SEC, sleep=None, monotonic=None):
+        self._budget = float(budget_sec)
+        self._sleep = sleep if sleep is not None else time.sleep
+        self._monotonic = monotonic if monotonic is not None else time.monotonic
+        self._next_allowed_at = 0.0
+
+    def _pause(self, seconds):
+        seconds = min(float(seconds), self._budget)
+        if seconds <= 0:
+            return False
+        self._budget -= seconds
+        self._sleep(seconds)
+        return True
+
+    def wait_for_slot(self):
+        """RSS 请求前调用：等到上一个响应宣告的窗口重置。"""
+        self._pause(self._next_allowed_at - self._monotonic())
+
+    def observe(self, resp):
+        """每个 RSS 响应后调用：记录下一请求的最早时间。"""
+        self._next_allowed_at = self._monotonic() + _reddit_ratelimit_seconds(resp)
+
+    def backoff_for_retry(self, resp):
+        """429 后调用：按响应头退避。返回 True 表示已等待、值得重试一次。"""
+        return self._pause(_reddit_ratelimit_seconds(resp))
+
+
+def _reddit_posts_from_rss(content, sub, count):
+    import feedparser
+
+    feed = feedparser.parse(content)
+    posts = []
+    for entry in list(getattr(feed, 'entries', []) or [])[:count]:
+        link = entry.get('link', '')
+        entry_id = str(entry.get('id') or entry.get('guid') or '').strip()
+        if entry_id.startswith('t3_'):
+            entry_id = entry_id[3:]
+        if not entry_id:
+            parts = [part for part in urlparse(link).path.split('/') if part]
+            entry_id = parts[3] if len(parts) > 3 and parts[2] == 'comments' else hashlib.sha1(link.encode()).hexdigest()[:16]
+        summary = html.unescape(re.sub(r'<[^>]+>', ' ', entry.get('summary', '') or '')).strip()
+        posts.append({
+            'id': entry_id,
+            'title': entry.get('title', ''),
+            'selftext': summary,
+            'author': entry.get('author', ''),
+            'url': link,
+            'permalink': urlparse(link).path if 'reddit.com' in urlparse(link).netloc else '',
+            'score': 0,
+            'upvote_ratio': 0,
+            'num_comments': 0,
+            'created_utc': 0,
+            'thumbnail': '',
+            'link_flair_text': '',
+            'is_self': True,
+            'subreddit': sub,
+        })
+    return posts
+
+
 def fetch_reddit():
     """Fetch hot posts from configured subreddits."""
     import requests
@@ -368,6 +466,8 @@ def fetch_reddit():
     out_dir = source_dir('reddit')
     os.makedirs(out_dir, exist_ok=True)
     headers = {'User-Agent': 'info2action/1.0'}
+    # BF-0716-1: RSS 兜底共享的限流步调器(budget 在调用时读模块常量,便于测试覆盖)
+    pacer = _RedditRssPacer(budget_sec=REDDIT_RSS_WAIT_BUDGET_SEC)
 
     for source in subs:
         source_id = source.get('source_id') if isinstance(source, dict) else None
@@ -383,47 +483,58 @@ def fetch_reddit():
             # → fetch_run 看不到失败,运维盲点。现在显式拒绝 non-200,让错误冒到 stderr
             # 和 fetch_runs.error_msg。Reddit OAuth 是长期解,见 docs/ops/runbook §5
             if r.status_code != 200:
-                print(f"  ❌ r/{sub}: HTTP {r.status_code} (Reddit may block this IP — see runbook §5.6 Reddit IP block)")
-                _record_source_fetch_result(source_id, False, f"HTTP {r.status_code}")
-                continue
-            data = r.json()
-            posts = []
-            for child in data.get('data', {}).get('children', []):
-                post = child.get('data', {})
-                thumbnail = post.get('thumbnail', '')
-                if thumbnail in ('self', 'default', 'nsfw', 'spoiler', ''):
-                    thumbnail = ''
-                # 2026-04-29: 优先取高清原图替代 140×80 缩略图
-                # 优先级: preview.images[0].source.url(800-1200px 原图) >
-                #         url_overridden_by_dest(图片帖直链 i.redd.it/xxx.jpg) >
-                #         post.url(post_hint=image 时是直链) > thumbnail(140 缩略图兜底)
-                preview_imgs = (post.get('preview') or {}).get('images') or []
-                preview_src = ''
-                if preview_imgs:
-                    src = preview_imgs[0].get('source') or {}
-                    # reddit JSON 把 & 编码成 &amp;,要还原
-                    preview_src = (src.get('url') or '').replace('&amp;', '&')
-                direct_url = post.get('url_overridden_by_dest') or ''
-                post_hint = post.get('post_hint', '')
-                if not preview_src and post_hint == 'image':
-                    preview_src = direct_url
-                cover = preview_src or thumbnail
-                posts.append({
-                    'id': post.get('id', ''),
-                    'title': post.get('title', ''),
-                    'selftext': post.get('selftext', ''),
-                    'author': post.get('author', ''),
-                    'url': post.get('url', ''),
-                    'permalink': post.get('permalink', ''),
-                    'score': post.get('score', 0),
-                    'upvote_ratio': post.get('upvote_ratio', 0),
-                    'num_comments': post.get('num_comments', 0),
-                    'created_utc': post.get('created_utc', 0),
-                    'thumbnail': cover,
-                    'link_flair_text': post.get('link_flair_text', ''),
-                    'is_self': post.get('is_self', False),
-                    'subreddit': sub,
-                })
+                print(f"  ⚠️  r/{sub}: JSON HTTP {r.status_code}，降级 RSS")
+                # BF-0716-1: 未认证 RSS 配额 = 每 ~60s 窗口 1 次(按 IP)。
+                # 先等上一响应宣告的窗口重置,429 再按响应头退避重试一次。
+                rss_url = f'https://www.reddit.com/r/{sub}/.rss'
+                pacer.wait_for_slot()
+                rss = requests.get(rss_url, headers=headers, timeout=15)
+                pacer.observe(rss)
+                if rss.status_code == 429 and pacer.backoff_for_retry(rss):
+                    print(f"  ⏳ r/{sub}: RSS 429，等待限流窗口后重试")
+                    rss = requests.get(rss_url, headers=headers, timeout=15)
+                    pacer.observe(rss)
+                if rss.status_code != 200:
+                    error = f"JSON HTTP {r.status_code}; RSS HTTP {rss.status_code}"
+                    print(f"  ❌ r/{sub}: {error}")
+                    _record_source_fetch_result(source_id, False, error)
+                    continue
+                posts = _reddit_posts_from_rss(rss.content, sub, count)
+            else:
+                data = r.json()
+                posts = []
+                for child in data.get('data', {}).get('children', []):
+                    post = child.get('data', {})
+                    thumbnail = post.get('thumbnail', '')
+                    if thumbnail in ('self', 'default', 'nsfw', 'spoiler', ''):
+                        thumbnail = ''
+                    # 2026-04-29: 优先取高清原图替代 140×80 缩略图
+                    preview_imgs = (post.get('preview') or {}).get('images') or []
+                    preview_src = ''
+                    if preview_imgs:
+                        src = preview_imgs[0].get('source') or {}
+                        preview_src = (src.get('url') or '').replace('&amp;', '&')
+                    direct_url = post.get('url_overridden_by_dest') or ''
+                    post_hint = post.get('post_hint', '')
+                    if not preview_src and post_hint == 'image':
+                        preview_src = direct_url
+                    cover = preview_src or thumbnail
+                    posts.append({
+                        'id': post.get('id', ''),
+                        'title': post.get('title', ''),
+                        'selftext': post.get('selftext', ''),
+                        'author': post.get('author', ''),
+                        'url': post.get('url', ''),
+                        'permalink': post.get('permalink', ''),
+                        'score': post.get('score', 0),
+                        'upvote_ratio': post.get('upvote_ratio', 0),
+                        'num_comments': post.get('num_comments', 0),
+                        'created_utc': post.get('created_utc', 0),
+                        'thumbnail': cover,
+                        'link_flair_text': post.get('link_flair_text', ''),
+                        'is_self': post.get('is_self', False),
+                        'subreddit': sub,
+                    })
 
             out_path = os.path.join(out_dir, f'{sub}.json')
             with open(out_path, 'w') as f:

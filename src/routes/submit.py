@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from urllib.parse import urlparse as _urlparse
 
@@ -92,11 +93,56 @@ def _is_blocked_submit_target(hostname: str) -> bool:
     return any(_is_blocked_submit_ip(info[4][0]) for info in infos)
 
 # Module-level state
-_submit_tasks = {}  # task_id -> {status, url, title, error}
+def _submit_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+_submit_tasks = {}  # task_id -> {status, url, title, error, created_at}
+_submit_tasks_lock = threading.RLock()
+_submit_concurrency_lock = threading.Lock()
+_submit_active_total = 0
+_submit_active_by_user: dict[str, int] = {}
+_SUBMIT_MAX_GLOBAL = _submit_env_int('INFO2ACTION_SUBMIT_MAX_GLOBAL', 12)
+_SUBMIT_MAX_PER_USER = _submit_env_int('INFO2ACTION_SUBMIT_MAX_PER_USER', 3)
+_SUBMIT_TASKS_MAX = _submit_env_int('INFO2ACTION_SUBMIT_TASKS_MAX', 256)
+_SUBMIT_TASK_TTL_SEC = _submit_env_int('INFO2ACTION_SUBMIT_TASK_TTL_SEC', 900)
+
+
+def _evict_stale_submit_tasks():
+    now = time.time()
+    with _submit_tasks_lock:
+        stale_ids = [
+            task_id
+            for task_id, task in _submit_tasks.items()
+            if task.get('status') not in ('fetching', 'processing')
+            and now - task.get('created_at', 0) > _SUBMIT_TASK_TTL_SEC
+        ]
+        for task_id in stale_ids:
+            del _submit_tasks[task_id]
+
+        if len(_submit_tasks) >= _SUBMIT_TASKS_MAX:
+            terminal_ids = sorted(
+                (
+                    task_id
+                    for task_id, task in _submit_tasks.items()
+                    if task.get('status') not in ('fetching', 'processing')
+                ),
+                key=lambda task_id: _submit_tasks[task_id].get('created_at', 0),
+            )
+            for task_id in terminal_ids:
+                if len(_submit_tasks) < _SUBMIT_TASKS_MAX:
+                    break
+                del _submit_tasks[task_id]
 
 
 @router.post('/api/submit-url')
 async def post_submit_url(request: Request):
+    global _submit_active_total
+
     body = await request.json()
     url = body.get('url', '').strip()
     manual_content = body.get('content', '').strip()
@@ -180,15 +226,34 @@ async def post_submit_url(request: Request):
 
     # Start background processing
     submit_user_id = _get_user_id(request)
-    _submit_tasks[item_id] = {
+    uid = str(submit_user_id)
+    with _submit_concurrency_lock:
+        if _submit_active_total >= _SUBMIT_MAX_GLOBAL:
+            return JSONResponse({
+                'error': '服务器提交任务已满,请稍后重试',
+                'code': 'submit_busy',
+            }, status_code=429)
+        if _submit_active_by_user.get(uid, 0) >= _SUBMIT_MAX_PER_USER:
+            return JSONResponse({
+                'error': '你有太多提交任务在进行中,请等待完成后再试',
+                'code': 'submit_user_limit',
+            }, status_code=429)
+        _submit_active_total += 1
+        _submit_active_by_user[uid] = _submit_active_by_user.get(uid, 0) + 1
+
+    task_entry = {
         'status': 'fetching',
         'url': url,
         'title': '',
         'error': '',
         'user_id': submit_user_id,
+        'created_at': time.time(),
     }
+    with _submit_tasks_lock:
+        _evict_stale_submit_tasks()
+        _submit_tasks[item_id] = task_entry
 
-    def _bg_submit(sid, surl, has_existing, bg_user_id=None, norm_platform='manual', norm_canonical=None):
+    def _bg_submit_inner(sid, surl, has_existing, bg_user_id=None, norm_platform='manual', norm_canonical=None):
         task = _submit_tasks[sid]
         conn2 = None
         use_remote_bg = remote_db.app_state_to_remote()
@@ -393,13 +458,43 @@ async def post_submit_url(request: Request):
                 try: conn2.close()
                 except: pass
 
+    def _bg_submit(sid, surl, has_existing, bg_user_id=None, norm_platform='manual', norm_canonical=None):
+        global _submit_active_total
+
+        bg_uid = str(bg_user_id)
+        try:
+            return _bg_submit_inner(
+                sid, surl, has_existing, bg_user_id, norm_platform, norm_canonical,
+            )
+        finally:
+            with _submit_concurrency_lock:
+                _submit_active_total = max(0, _submit_active_total - 1)
+                user_active = _submit_active_by_user.get(bg_uid, 0)
+                if user_active <= 1:
+                    _submit_active_by_user.pop(bg_uid, None)
+                else:
+                    _submit_active_by_user[bg_uid] = user_active - 1
+
     t = threading.Thread(
         target=_bg_submit,
         args=(item_id, url, bool(existing), submit_user_id,
               norm.platform, norm.canonical_url),
         daemon=True,
     )
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        with _submit_concurrency_lock:
+            _submit_active_total = max(0, _submit_active_total - 1)
+            user_active = _submit_active_by_user.get(uid, 0)
+            if user_active <= 1:
+                _submit_active_by_user.pop(uid, None)
+            else:
+                _submit_active_by_user[uid] = user_active - 1
+        with _submit_tasks_lock:
+            if _submit_tasks.get(item_id) is task_entry:
+                del _submit_tasks[item_id]
+        raise
     return {'ok': True, 'task_id': item_id, 'status': 'fetching', 'platform': norm.platform}
 
 
@@ -459,16 +554,22 @@ async def post_submit_url_status(request: Request):
                 min_github_stars=0,
             )
             resp['item'] = row
-            del _submit_tasks[task_id]
+            with _submit_tasks_lock:
+                if _submit_tasks.get(task_id) is task:
+                    del _submit_tasks[task_id]
             return resp
         conn = db.get_conn()
         join_sql, join_params = _status_join_sql(conn, user_id)
         row = conn.execute(f"SELECT i.*, s.starred_at FROM items i {join_sql} WHERE i.id=?", join_params + [task_id]).fetchone()
         conn.close()
         resp['item'] = db.strip_blob_columns(dict(row)) if row and _can_access_manual_row(request, row) else None
-        del _submit_tasks[task_id]
+        with _submit_tasks_lock:
+            if _submit_tasks.get(task_id) is task:
+                del _submit_tasks[task_id]
     elif task['status'] == 'error':
-        del _submit_tasks[task_id]
+        with _submit_tasks_lock:
+            if _submit_tasks.get(task_id) is task:
+                del _submit_tasks[task_id]
     return resp
 
 

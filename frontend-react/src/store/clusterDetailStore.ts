@@ -10,13 +10,14 @@
  * Fast Refresh 硬约束：本文件只导出 useClusterDetailStore + ClusterModalState 类型。
  */
 import { create } from 'zustand'
-import type { ClusterDetail, ClusterSource, ClusterAction, ClusterBundleResponse, ClusterEvent } from '../lib/types'
+import type { ClusterDetail, ClusterSource, ClusterAction, ClusterBundleResponse, ClusterEvent, ClusterFeedbackKind } from '../lib/types'
 import {
   fetchClusterBundle,
   fetchClusterDetail,
   fetchClusterSources,
   clickCluster,
   setClusterStar,
+  setClusterFeedback,
   fetchClusterActions,
   generateClusterAction,
 } from '../lib/api'
@@ -109,6 +110,16 @@ interface ClusterDetailState {
   loadSources: (clusterId: number, append?: boolean) => Promise<void>
   loadActions: (clusterId: number) => Promise<void>
   toggleClusterStar: (clusterId: number) => Promise<{ ok: boolean; starred_at: string | null }>
+  /** v25.0 F-D：cluster 质量反馈（同 kind 再提交=撤销），乐观更新失败回滚 */
+  submitClusterFeedback: (
+    clusterId: number,
+    kind: ClusterFeedbackKind,
+    note?: string,
+  ) => Promise<{
+    ok: boolean
+    feedback_kind: ClusterFeedbackKind | null
+    feedback_note?: string | null
+  }>
   startGenerate: (clusterId: number, userHint?: string, actionType?: string) => void
   cancelGenerate: () => void
   /** 重置 generate-* 字段而不影响 modal/sources/actions 主流程 */
@@ -310,6 +321,7 @@ export const useClusterDetailStore = create<ClusterDetailState>((set, get) => ({
         cluster: {
           ...current,
           viewer_status: {
+            ...current.viewer_status,
             clicked_at: current.viewer_status?.clicked_at ?? null,
             last_seen_version: current.viewer_status?.last_seen_version ?? current.user_last_seen_version ?? null,
             starred_at: starredAt,
@@ -329,6 +341,44 @@ export const useClusterDetailStore = create<ClusterDetailState>((set, get) => ({
       return result
     } catch (err) {
       applyStarredAt(prevStarredAt)
+      throw err
+    }
+  },
+
+  submitClusterFeedback: async (clusterId, kind, note) => {
+    // v25.0 F-D: 与收藏同款乐观更新;同 kind 再提交=撤销(以服务端返回为准)
+    const applyFeedback = (feedbackKind: ClusterFeedbackKind | null, feedbackNote?: string | null) => {
+      const current = get().cluster
+      if (current?.id !== clusterId) return
+      set({
+        cluster: {
+          ...current,
+          viewer_status: {
+            ...current.viewer_status,
+            clicked_at: current.viewer_status?.clicked_at ?? null,
+            starred_at: current.viewer_status?.starred_at ?? null,
+            last_seen_version: current.viewer_status?.last_seen_version ?? current.user_last_seen_version ?? null,
+            feedback_kind: feedbackKind,
+            feedback_note: feedbackKind ? feedbackNote ?? null : null,
+          },
+        },
+      })
+    }
+    const snapshot = get().cluster
+    const prevKind = snapshot?.id === clusterId
+      ? snapshot.viewer_status?.feedback_kind ?? null
+      : null
+    const prevNote = snapshot?.id === clusterId
+      ? snapshot.viewer_status?.feedback_note ?? null
+      : null
+    applyFeedback(prevKind === kind ? null : kind, note)
+    try {
+      const result = await setClusterFeedback(clusterId, kind, note)
+      _bundleCache.delete(clusterId)
+      applyFeedback(result.feedback_kind, result.feedback_note)
+      return result
+    } catch (err) {
+      applyFeedback(prevKind, prevNote)
       throw err
     }
   },

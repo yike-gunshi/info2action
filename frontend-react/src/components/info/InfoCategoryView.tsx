@@ -28,7 +28,7 @@ import { cn } from '../../lib/utils'
 function InfoCategorySkeleton({ embedded = false }: { embedded?: boolean }) {
   return (
     <div
-      className={cn(embedded ? 'py-0' : 'px-4 py-4 max-w-[1200px] mx-auto')}
+      className={cn(embedded ? 'py-0' : 'px-4 py-4 max-w-[1168px] mx-auto')}
       data-testid="info-category-skeleton"
     >
       <div className="mb-4 space-y-2">
@@ -36,9 +36,10 @@ function InfoCategorySkeleton({ embedded = false }: { embedded?: boolean }) {
           <div key={i} className="h-6 bg-muted rounded animate-skeleton" style={{ width: `${70 + i * 10}%` }} />
         ))}
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      {/* v24.1: 骨架回瀑布流卡片同形（三列卡片块） */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {Array.from({ length: 9 }).map((_, i) => (
-          <div key={i} className="h-48 bg-muted rounded-lg animate-skeleton" />
+          <div key={i} className="h-48 animate-skeleton rounded-[4px] bg-muted" />
         ))}
       </div>
     </div>
@@ -101,12 +102,12 @@ export function InfoCategoryView({ onLoadingChange, embedded = false }: InfoCate
 
   if (error && sections.length === 0) {
     return (
-      <div className={cn(embedded ? 'py-12' : 'max-w-[1200px] mx-auto px-4 py-12', 'text-center')}>
+      <div className={cn(embedded ? 'py-12' : 'max-w-[1168px] mx-auto px-4 py-12', 'text-center')}>
         <p className="text-muted-foreground mb-4">{error}</p>
         <button
           type="button"
           onClick={loadSections}
-          className="px-5 py-2 text-sm font-medium text-foreground bg-card border border-border hover:border-warm-400 shadow-subtle hover:shadow-medium rounded-full transition-all cursor-pointer"
+          className="inline-flex cursor-pointer items-center rounded-[4px] border border-border bg-card px-5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:border-[var(--brand-border)] hover:text-foreground"
         >
           重试
         </button>
@@ -129,7 +130,7 @@ export function InfoCategoryView({ onLoadingChange, embedded = false }: InfoCate
   if (isSearching && sections.length === 0) {
     return (
       <div
-        className={cn(embedded ? 'py-12' : 'max-w-[1200px] mx-auto px-4 py-12', 'text-center')}
+        className={cn(embedded ? 'py-12' : 'max-w-[1168px] mx-auto px-4 py-12', 'text-center')}
         data-testid="info-category-search-empty"
       >
         {degradedBanner ?? (
@@ -142,7 +143,7 @@ export function InfoCategoryView({ onLoadingChange, embedded = false }: InfoCate
   }
 
   return (
-    <div className={cn(embedded ? 'py-0' : 'max-w-[1200px] mx-auto px-4 py-4')}>
+    <div className={cn(embedded ? 'py-0' : 'max-w-[1168px] mx-auto px-4 py-4')}>
       {/* BF-0704-6 rev3: 搜索加载状态条(不随旧内容压暗) */}
       {searchLoading && searchQuery ? (
         <div

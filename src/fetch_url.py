@@ -23,6 +23,41 @@ _TIMEOUT = 15
 _BLOCKED_FETCH_HOSTS = {'localhost', 'localhost.localdomain'}
 
 
+def _max_fetch_bytes():
+    raw = (os.environ.get('INFO2ACTION_FETCH_URL_MAX_BYTES') or '').strip()
+    if not raw:
+        return 20 * 1024 * 1024  # 20MB: 富化正文再大也够,挡住无限流/超大响应打爆内存
+    try:
+        n = int(raw)
+        return n if n > 0 else 20 * 1024 * 1024
+    except (ValueError, TypeError):
+        return 20 * 1024 * 1024
+
+
+_MAX_FETCH_BYTES = _max_fetch_bytes()
+
+
+def _read_capped(resp, max_bytes=None):
+    """Read a response body with a hard byte ceiling.
+
+    ``/api/submit-url`` fetches arbitrary user-supplied URLs in a background
+    thread; an unbounded ``resp.read()`` against a slow multi-GB / endless
+    stream pulls everything reachable within the timeout into RAM. Cap it.
+    """
+    limit = _MAX_FETCH_BYTES if max_bytes is None else max_bytes
+    # Reject obvious oversize declarations up front.
+    try:
+        declared = int(resp.headers.get('Content-Length') or 0)
+    except (ValueError, TypeError):
+        declared = 0
+    if declared and declared > limit:
+        raise ValueError(f'response too large: {declared} bytes > {limit} cap')
+    data = resp.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f'response exceeded {limit} byte cap')
+    return data
+
+
 def _gh_token():
     """Get GitHub token from gh CLI or env."""
     t = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN', '')
@@ -100,7 +135,7 @@ def _fetch_raw(url):
     _assert_public_http_url(url)
     req = urllib.request.Request(url, headers={'User-Agent': _UA})
     with _open_url(req, timeout=_TIMEOUT) as resp:
-        data = resp.read()
+        data = _read_capped(resp)
         ct = resp.headers.get('Content-Type', '')
     return data, ct
 
@@ -113,7 +148,7 @@ def _get_json(url, auth_token=''):
     _assert_public_http_url(url)
     req = urllib.request.Request(url, headers=headers)
     with _open_url(req, timeout=_TIMEOUT) as resp:
-        return json.loads(resp.read())
+        return json.loads(_read_capped(resp))
 
 
 # ── GitHub repo special handling ──

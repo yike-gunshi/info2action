@@ -115,7 +115,11 @@ describe('TopBar v19 Image2 constraints', () => {
     expect(search.className).toContain('sm:flex')
     expect(search.className).toContain('w-9')
     expect(screen.queryByRole('textbox', { name: '搜索信息' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '搜索' })).toBeInTheDocument()
+    expect(within(search).getByRole('button', { name: '搜索' })).toBeInTheDocument()
+    // v24.0 §21.6: <sm 搜索入口补缺 — 移动端 icon 按钮(sm:hidden)与桌面入口并存
+    const mobileTrigger = screen.getByTestId('topbar-search-mobile-trigger')
+    expect(mobileTrigger.className).toContain('sm:hidden')
+    expect(screen.queryByTestId('topbar-search-mobile')).not.toBeInTheDocument()
     expect(screen.getByLabelText('提交链接')).toBeInTheDocument()
     expect(screen.getByLabelText('切换主题')).toBeInTheDocument()
     const login = screen.getByTestId('topbar-login')
@@ -139,17 +143,42 @@ describe('TopBar v19 Image2 constraints', () => {
   it('expands search into a compact pinned topbar input', () => {
     render(<TopBar />)
 
-    fireEvent.click(screen.getByRole('button', { name: '搜索' }))
+    fireEvent.click(within(screen.getByTestId('topbar-search')).getByRole('button', { name: '搜索' }))
 
     const search = screen.getByTestId('topbar-search')
     expect(search.className).toContain('w-[180px]')
     expect(search.className).toContain('md:w-[220px]')
     expect(search.className).toContain('lg:w-[260px]')
-    const input = screen.getByRole('textbox', { name: '搜索信息' })
+    const input = within(search).getByRole('textbox', { name: '搜索信息' })
     expect(input).toBeInTheDocument()
     expect(input.className).toContain('bg-transparent')
     expect(input.className).toContain('font-event-title')
-    expect(screen.getByRole('button', { name: '清除搜索' })).toBeInTheDocument()
+    expect(within(search).getByRole('button', { name: '清除搜索' })).toBeInTheDocument()
+  })
+
+  // v24.0 §21.6: 移动端搜索入口 — icon 点击展开 TopBar 下方输入行,复用同一搜索状态
+  it('mobile search trigger expands an underline input row below the bar', () => {
+    render(<TopBar />)
+
+    fireEvent.click(screen.getByTestId('topbar-search-mobile-trigger'))
+
+    const mobileRow = screen.getByTestId('topbar-search-mobile')
+    expect(mobileRow.className).toContain('sm:hidden')
+    const input = screen.getByTestId('topbar-search-mobile-input')
+    expect(input).toHaveAttribute('aria-label', '搜索信息')
+    expect(input.className).toContain('bg-transparent')
+    expect(input.className).toContain('font-event-title')
+    // 展开后移动 icon 触发器让位(避免重复入口)
+    expect(screen.queryByTestId('topbar-search-mobile-trigger')).not.toBeInTheDocument()
+
+    // 输入走同一 uiStore searchQuery
+    fireEvent.change(input, { target: { value: 'claude' } })
+    expect(useUIStore.getState().searchQuery).toBe('claude')
+
+    // 清除按钮收起输入行
+    fireEvent.click(within(mobileRow).getByRole('button', { name: '清除搜索' }))
+    expect(screen.queryByTestId('topbar-search-mobile')).not.toBeInTheDocument()
+    expect(useUIStore.getState().searchQuery).toBe('')
   })
 
   it('keeps account-only items inside the avatar menu when logged in', () => {

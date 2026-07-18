@@ -120,7 +120,10 @@ class TestClusterStatusTable:
 
     def test_cluster_status_columns(self, tmp_db):
         cols = _columns(tmp_db, 'cluster_status')
-        required = {'user_id', 'cluster_id', 'clicked_at', 'last_seen_version'}
+        required = {
+            'user_id', 'cluster_id', 'clicked_at', 'last_seen_version',
+            'feedback_note',
+        }
         missing = required - cols
         assert not missing
 

@@ -157,14 +157,6 @@ def _remote_prewarm_plan() -> dict[str, bool]:
     }
 
 
-def _cache_prewarm_interval_sec() -> int:
-    try:
-        value = int(os.environ.get('INFO2ACTION_CACHE_PREWARM_INTERVAL_SEC', '600'))
-    except ValueError:
-        value = 600
-    return max(30, value)
-
-
 def _dynamic_fetch_tick_seconds() -> float:
     try:
         value = float(os.environ.get('INFO2ACTION_DYNAMIC_FETCH_TICK_SECONDS', '60'))
@@ -379,31 +371,21 @@ async def lifespan(app: FastAPI):
     else:
         print('   Dynamic micro fetch scheduler: disabled')
 
-    # BF-0515-mv-pgcron + BF-0515-prewarm-renew: prewarm critical caches in
-    # background so first user after backend restart hits warm cache (~47ms)
-    # instead of cold path (~3.7s). Re-prewarm defaults to every 600 seconds
-    # to keep steady-state I/O lower on small Supabase projects.
-    #
-    # Daemon thread does not block startup; in-flight requests during the
-    # very first prewarm window (~10s post-restart) may pay cold cost.
-    prewarm_stop_event = None
+    # perf-v27 P3: 周期性 prewarm 循环已删——稳态刷新/预热统一由
+    # fetch.py::_schedule_post_fetch_read_model_refresh 在每轮抓取结束后
+    # 触发一次(≈15min 节奏,与读模型新鲜度承诺对齐,目标架构定稿 §0-10)。
+    # 这里只保留启动单次预热:重启后首个用户命中暖缓存(~47ms)而非
+    # 冷路径(~3.7s)。Daemon 线程不阻塞启动。
     if is_scheduler_leader and remote_db.remote_authority_enabled() and env_enabled('INFO2ACTION_CACHE_PREWARM', default=True):
         import threading as _threading
-        prewarm_stop_event = _threading.Event()
-        prewarm_interval_sec = _cache_prewarm_interval_sec()
-        def _prewarm_loop():
-            iteration = 0
-            while not prewarm_stop_event.is_set():
-                iteration += 1
-                _run_remote_cache_prewarm_iteration(iteration)
-                # Wait interval (interruptible). First sleep after iteration 1.
-                if prewarm_stop_event.wait(prewarm_interval_sec):
-                    break
 
-        _threading.Thread(target=_prewarm_loop, daemon=True, name='prewarm-renew-loop').start()
+        def _startup_prewarm_once():
+            _run_remote_cache_prewarm_iteration(1)
+
+        _threading.Thread(target=_startup_prewarm_once, daemon=True, name='prewarm-startup-once').start()
         plan = _remote_prewarm_plan()
         print(
-            f"   Cache prewarm: scheduled (every {prewarm_interval_sec}s; "
+            f"   Cache prewarm: startup-once (steady-state renewal rides post-fetch; "
             f"platforms={'on' if plan['platforms'] else 'off'}, "
             f"events={'on' if plan['events'] else 'off'}, "
             f"posters={'on' if plan['posters'] else 'off'})"
@@ -441,8 +423,6 @@ async def lifespan(app: FastAPI):
                 print(f"   Fetch shutdown: marked interrupted active runs {interrupted_runs}", flush=True)
         except Exception as exc:
             print(f"   Fetch shutdown recovery skipped: {exc}", flush=True)
-        if prewarm_stop_event:
-            prewarm_stop_event.set()
 
 
 # ── App ─────────────────────────────────────────────────────
@@ -472,8 +452,15 @@ from slowapi.errors import RateLimitExceeded
 
 
 def _limiter_default_limits() -> list[str]:
-    """RATELIMIT_DEFAULT 允许运维调全局默认限额而不发版。"""
-    return [(os.environ.get('RATELIMIT_DEFAULT') or '100/minute').strip()]
+    """RATELIMIT_DEFAULT 允许运维调全局默认限额而不发版。
+
+    默认 600/minute(10 rps/IP)是"防洪水"底线而非功能性限流:真实用户(哪怕图多的
+    首屏突发 + 状态轮询)都远够不到,而失控的重试循环 / 朴素爬虫会被挡下。刻意放宽
+    以避免运营商级 NAT(多用户共享出口 IP)下的误伤。要收紧到 per-route 严格限额,
+    单独给昂贵端点(search/submit-url/export/generate)加 @limiter.limit 并配
+    RATELIMIT_STORAGE_URL 走 Redis(多 worker 共享计数)。见 docs 加固 backlog。
+    """
+    return [(os.environ.get('RATELIMIT_DEFAULT') or '600/minute').strip()]
 
 
 # P1-5(C 端放量):限流计数默认在进程内存——多 worker/多机后各进程独立
@@ -490,6 +477,23 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # AUTH_TOKEN middleware
 from middleware.auth import AuthTokenMiddleware
 app.add_middleware(AuthTokenMiddleware)
+
+# 稳定性加固(2026-07-10): 请求体大小上限 + 全局限流。
+# Starlette 中间件按"后加者最外层、最先执行"包裹,所以这两个必须加在
+# AuthTokenMiddleware 之后,才能在鉴权(每请求一次 threadpool JWT 校验)之前
+# 先卸流——洪水/超大 body 在碰到鉴权和路由 DB 之前就被挡下。
+#
+# body 上限:挡 JSON body 炸弹 / 深嵌套 RecursionError / 内存 DoS。
+from middleware.body_limit import MaxBodySizeMiddleware
+app.add_middleware(MaxBodySizeMiddleware)
+
+# SlowAPIMiddleware:让上面 Limiter 的 default_limits 真正生效。此前从未加这个
+# 中间件,default_limits 完全是死配置——除 auth.py 6 条显式 @limiter.limit 外,
+# feed/events/search/media/submit/actions 等热路径零限流,单个客户端重试循环即可
+# 打穿 8 连接的 Supabase 池。RATELIMIT_ENABLED=false 时 slowapi 把 limiter 置
+# disabled,本中间件随之空转(测试/紧急关闭用)。作为最外层最先执行。
+from slowapi.middleware import SlowAPIMiddleware
+app.add_middleware(SlowAPIMiddleware)
 
 # ── API routes ──────────────────────────────────────────────
 app.include_router(feed.router)

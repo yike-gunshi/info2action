@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS item_feedback (
   item_title TEXT,
   item_author TEXT,
   item_url TEXT,
-  action TEXT NOT NULL,          -- positive / irrelevant / low_quality
+  action TEXT NOT NULL,          -- positive / irrelevant / low_quality / should_feature / should_drop
   reason TEXT,                   -- 用户自然语言描述
   topic_at_time TEXT,            -- 当时被归到哪个 topic
   created_at TEXT DEFAULT (datetime('now'))
@@ -71,6 +71,22 @@ def record_item_feedback(conn, item_id, action, platform=None, title=None,
     conn.commit()
 
 
+def set_item_feedback(conn, item_id, action, *, active, platform=None, title=None,
+                      author=None, url=None, reason=None, topic=None):
+    """Set one semantic item feedback state without accumulating duplicates."""
+    conn.execute(
+        "DELETE FROM item_feedback WHERE item_id=? AND action=?",
+        (item_id, action),
+    )
+    if active:
+        conn.execute("""
+            INSERT INTO item_feedback
+                (item_id, platform, item_title, item_author, item_url, action, reason, topic_at_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (item_id, platform, title, author, url, action, reason, topic))
+    conn.commit()
+
+
 def record_system_feedback(conn, category, description, context=None):
     """记录一条系统级反馈。"""
     ctx = json.dumps(context, ensure_ascii=False) if context else None
@@ -109,7 +125,7 @@ def get_all_preferences(conn):
 def get_feedback_summary(conn):
     """获取反馈统计摘要。"""
     stats = {}
-    for action in ('positive', 'irrelevant', 'low_quality'):
+    for action in ('positive', 'irrelevant', 'low_quality', 'should_feature', 'should_drop'):
         row = conn.execute(
             "SELECT COUNT(*) as cnt FROM item_feedback WHERE action=?", (action,)
         ).fetchone()

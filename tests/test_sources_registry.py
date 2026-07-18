@@ -2,6 +2,7 @@
 
 不依赖网络/凭证/live fetch，全部用临时 SQLite。
 """
+from contextlib import contextmanager
 import os
 import sys
 import tempfile
@@ -129,6 +130,125 @@ def test_seed_preserves_admin_status(tmp_db):
     ).fetchone()[0]
     assert after == "paused"
     conn.close()
+
+
+def test_seed_dispatches_to_remote_without_opening_local(monkeypatch):
+    import db
+    import remote_db
+    import seed_sources_registry as seed
+
+    calls = []
+
+    class FakeConn:
+        def commit(self):
+            pass
+
+    @contextmanager
+    def fake_connect():
+        yield FakeConn()
+
+    monkeypatch.setattr(
+        seed,
+        "_collect_seeds",
+        lambda: [
+            {
+                "platform": "rss",
+                "source_key": "https://example.test/feed.xml",
+                "display_name": "Example",
+                "status": "active",
+                "config_json": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(remote_db, "fetch_write_to_remote", lambda: True)
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(
+        remote_db,
+        "upsert_source_registry_remote",
+        lambda conn, **kwargs: calls.append(kwargs) or "inserted",
+        raising=False,
+    )
+    monkeypatch.setattr(db, "get_conn", lambda: pytest.fail("opened local SQLite"))
+
+    summary = seed.seed()
+
+    assert summary["rss"] == {"inserted": 1, "updated": 0}
+    assert calls == [
+        {
+            "platform": "rss",
+            "source_key": "https://example.test/feed.xml",
+            "display_name": "Example",
+            "status": "active",
+            "config_json": None,
+            "origin": "seed_import",
+            "now": calls[0]["now"],
+        }
+    ]
+
+
+def test_remote_registry_upsert_is_parameterized_and_preserves_admin_fields(monkeypatch):
+    import remote_db
+
+    executed = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            executed.append((normalized, params))
+            if normalized.startswith("INSERT"):
+                return Result({"id": 8} if params[1] == "new-source" else None)
+            return Result()
+
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+    conn = FakeConn()
+    now = "2026-07-10T00:00:00Z"
+
+    assert remote_db.upsert_source_registry_remote(
+        conn,
+        platform="rss",
+        source_key="existing",
+        display_name="Existing New Name",
+        status="active",
+        config_json=None,
+        origin="seed_import",
+        now=now,
+    ) == "updated"
+    assert remote_db.upsert_source_registry_remote(
+        conn,
+        platform="rss",
+        source_key="new-source",
+        display_name="New Source",
+        status="not_fetched",
+        config_json='{"batch": 1}',
+        origin="seed_import",
+        now=now,
+    ) == "inserted"
+
+    update_sql, update_params = next(entry for entry in executed if entry[0].startswith("UPDATE"))
+    insert_entries = [entry for entry in executed if entry[0].startswith("INSERT")]
+    insert_sql, insert_params = next(entry for entry in insert_entries if entry[1][1] == "new-source")
+    assert not any(sql.startswith("SELECT") for sql, _params in executed)
+    assert len(insert_entries) == 2
+    assert all("ON CONFLICT (platform, source_key) DO NOTHING" in sql for sql, _params in insert_entries)
+    assert all("RETURNING id" in sql for sql, _params in insert_entries)
+    assert "UPDATE remote_poc.sources" in update_sql
+    assert "status" not in update_sql.lower()
+    assert "origin" not in update_sql.lower()
+    assert "Existing New Name" not in update_sql
+    assert update_params == ("Existing New Name", None, now, "rss", "existing")
+    assert "INSERT INTO remote_poc.sources" in insert_sql
+    assert "New Source" not in insert_sql
+    assert insert_params == (
+        "rss", "new-source", "New Source", "not_fetched",
+        '{"batch": 1}', "seed_import", now, now,
+    )
 
 
 # ---- ingest attribution + status filter (Wave 2a) ----

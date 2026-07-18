@@ -34,7 +34,7 @@ _fetch_active_runs = {}
 _remote_last_fetch_cache = {'ts': 0.0, 'data': None}
 _dynamic_micro_last_started = {}
 _REMOTE_LAST_FETCH_TTL_SEC = 5
-_DEFAULT_DYNAMIC_MICRO_FETCH_SOURCES = 'twitter:following:5,twitter:for_you:5'
+_DEFAULT_DYNAMIC_MICRO_FETCH_SOURCES = 'twitter:registry:5'
 _fetch_process_started_at = datetime.now(timezone.utc)
 _fetch_process_owner = f"{socket.gethostname()}:{os.getpid()}:{int(_fetch_process_started_at.timestamp())}"
 
@@ -161,7 +161,7 @@ def _micro_enrich_workers() -> int:
 
 def _dynamic_micro_fetch_sources():
     raw = os.environ.get('INFO2ACTION_DYNAMIC_FETCH_SOURCES', _DEFAULT_DYNAMIC_MICRO_FETCH_SOURCES)
-    specs = []
+    specs = {}
     for entry in raw.split(','):
         text = entry.strip()
         if not text or ':' not in text:
@@ -172,18 +172,23 @@ def _dynamic_micro_fetch_sources():
         platform, source = source_part.split(':', 1)
         platform = platform.strip()
         source = source.strip()
+        if platform == 'twitter':
+            source = 'registry'
         try:
             interval_minutes = float(interval_raw)
         except ValueError:
             continue
         if not platform or not source or interval_minutes <= 0:
             continue
-        specs.append({
+        key = (platform, source)
+        spec = {
             'platform': platform,
             'source': source,
             'interval_minutes': interval_minutes,
-        })
-    return specs
+        }
+        if key not in specs or interval_minutes < specs[key]['interval_minutes']:
+            specs[key] = spec
+    return list(specs.values())
 
 
 def _utc_now():
@@ -366,8 +371,15 @@ def _scheduler_finish_gap_skip_reason(source: str) -> str | None:
 
 
 def has_local_active_fetch_runs() -> bool:
+    # 稳定性加固(2026-07-10 BF-0710-fetch-guards): 也把 legacy quick-fetch 的
+    # `_fetch_running` 纳入判据。quick-fetch(/api/fetch/quick 的 category/topic/
+    # recommend/platform 分支)只置 _fetch_running=True,不进 _fetch_active_runs、
+    # 也不建远端 run;而 start_global_fetch/调度器的 should_start 只看
+    # _fetch_active_runs+远端 → 定时全局 run 会在 quick-fetch 跑着时并发启动,双写
+    # 同一批 data/sources 并双压 Supabase Micro。把 _fetch_running 纳入本地判据后,
+    # 全局/调度侧也能看见 quick-fetch(反向:quick-fetch 早已 check _fetch_running)。
     with _fetch_lock:
-        return bool(_fetch_active_runs)
+        return bool(_fetch_active_runs) or _fetch_running
 
 
 def has_active_fetch_runs() -> bool:
@@ -418,8 +430,14 @@ def recover_stale_remote_fetch_runs() -> list[int]:
         "remote fetch run heartbeat expired before scheduler/start guard; "
         "marked interrupted so scheduling can resume"
     )
+    # 稳定性加固(2026-07-10 BF-0710-fetch-guards): 运行时(同进程周期性)孤儿回收用
+    # 更宽的 runtime-stale grace,而不是基础 grace。基础 grace 是给重启恢复的(进程
+    # 边界=确定性死亡);运行时无法区分"活着但心跳被 DB 承压卡住"和"真死",太激进
+    # 会把仍在跑的 run 误标 error→守卫放行第二条 pipeline→压力更大。这里与
+    # has_recent_running_fetch_remote 的判活窗口对齐(同一 runtime grace),两者互为
+    # 反面、无空档。
     heartbeat_stale_before = now - timedelta(
-        seconds=remote_db.fetch_run_heartbeat_grace_seconds()
+        seconds=remote_db.fetch_run_runtime_stale_grace_seconds()
     )
     return remote_db.mark_orphaned_fetch_runs_remote(
         started_before=now,
@@ -585,6 +603,62 @@ def _python_executable():
     return sys.executable or 'python3'
 
 
+def _active_x_source_count_current_backend():
+    if remote_db.fetch_write_to_remote():
+        return len(remote_db.list_active_sources_remote('x_user'))
+    conn = db.get_conn()
+    try:
+        return len(db.list_active_sources(conn, 'x_user'))
+    finally:
+        conn.close()
+
+
+def _source_fetch_timeout_sec():
+    """Budget enough time for every configured X source and its retry waves."""
+    override = os.environ.get('INFO2ACTION_SOURCE_FETCH_TIMEOUT_SEC')
+    if override:
+        try:
+            return max(60, int(override))
+        except ValueError:
+            pass
+
+    cfg = load_json(os.path.join(BASE, 'config', 'config.json')) or {}
+    twitter = cfg.get('twitter') if isinstance(cfg.get('twitter'), dict) else {}
+    try:
+        workers = max(1, min(8, int(twitter.get('user_posts_workers', 4))))
+    except (TypeError, ValueError):
+        workers = 4
+    try:
+        retry_rounds = max(0, min(3, int(twitter.get('user_posts_retry_rounds', 2))))
+    except (TypeError, ValueError):
+        retry_rounds = 2
+    try:
+        source_count = _active_x_source_count_current_backend()
+    except Exception as exc:
+        source_count = 200
+        print(f"[fetch] X source count unavailable; timeout budget assumes {source_count}: {exc}")
+
+    batches = max(1, (source_count + workers - 1) // workers)
+    x_budget = batches * (retry_rounds + 1) * 65
+    cooldown_budget = retry_rounds * 30
+    other_platform_budget = 900
+    return max(1800, x_budget + cooldown_budget + other_platform_budget)
+
+
+def _run_registry_x_fetch(*, output_root=None, env=None):
+    command_env = env if env is not None else _clean_env()
+    if output_root is not None:
+        command_env['INFO2ACTION_DATA_DIR'] = output_root
+    subprocess.run(
+        [_python_executable(), os.path.join(BASE, 'src', 'fetch_x_users.py')],
+        cwd=BASE,
+        timeout=_source_fetch_timeout_sec(),
+        stderr=subprocess.DEVNULL,
+        env=command_env,
+        check=True,
+    )
+
+
 def _inject_python_runtime(env):
     python_bin = _python_executable()
     env['PYTHON_BIN'] = python_bin
@@ -615,6 +689,23 @@ def _count_inserted_run_items(run_id):
             "SELECT COUNT(*) AS count FROM fetch_run_items WHERE run_id = ? AND was_inserted = 1",
             (run_id,),
         ).fetchone()
+        return int(row['count'] if row else 0)
+    finally:
+        conn.close()
+
+
+def _count_items_current_backend():
+    if remote_db.fetch_write_to_remote():
+        schema = remote_db.remote_schema()
+        with remote_db.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM {schema}.items"
+            ).fetchone()
+        return int(row['count'] if row else 0)
+
+    conn = db.get_conn()
+    try:
+        row = conn.execute("SELECT COUNT(*) AS count FROM items").fetchone()
         return int(row['count'] if row else 0)
     finally:
         conn.close()
@@ -778,18 +869,20 @@ def _schedule_post_fetch_read_model_refresh(
 
         def _bg_prewarm():
             try:
-                refreshed = False
+                # perf-v27 P4(review 修复):pill 计数快照必须先于 prewarm——
+                # prewarm_platforms 会把 sections 结果连同表头计数写进 900s 结果
+                # 缓存,若快照后算,缓存里的计数滞后一个抓取周期(15min)。
+                try:
+                    counts_result = remote_db.refresh_info_pill_counts()
+                    print(f"[mv] pill counts refresh after fetch_run: {counts_result}", flush=True)
+                except Exception as _counts_exc:
+                    print(f"[mv] pill counts refresh exc: {_counts_exc!r}", flush=True)
                 if platform_prewarm_enabled:
                     result = remote_db.prewarm_platforms(
-                        refresh_mv=_env_enabled('INFO2ACTION_REFRESH_PLATFORM_MV_AFTER_FETCH', default=False),
                         refresh_read_model=read_model_refresh_enabled,
                         refresh_read_model_min_interval_sec=read_model_refresh_min_interval_sec,
                         refresh_highlights_read_model=highlights_read_model_refresh_enabled,
                         refresh_highlights_read_model_min_interval_sec=highlights_read_model_refresh_min_interval_sec,
-                    )
-                    refreshed = (
-                        bool(read_model_refresh_enabled)
-                        or bool(highlights_read_model_refresh_enabled)
                     )
                     print(f"[mv] prewarm after fetch_run: {result}", flush=True)
                 else:
@@ -797,16 +890,18 @@ def _schedule_post_fetch_read_model_refresh(
                         result = remote_db.refresh_info_read_model_if_stale(
                             min_interval_sec=read_model_refresh_min_interval_sec
                         )
-                        refreshed = True
                         print(f"[mv] read model refresh after fetch_run: {result}", flush=True)
                     if highlights_read_model_refresh_enabled:
                         result = remote_db.refresh_highlights_read_model_if_stale(
                             min_interval_sec=highlights_read_model_refresh_min_interval_sec
                         )
-                        refreshed = True
                         print(f"[mv] highlights read model refresh after fetch_run: {result}", flush=True)
-                if refreshed:
-                    _clear_feed_caches_safely()
+                # prewarm_platforms() 已在刷新读模型后重新预热 feed result cache；
+                # 全局 run 与 micro run 收尾的 finally 块已有
+                # if feed_content_changed: _clear_feed_caches_safely() 守卫，
+                # 在内容真变化时会正确失效缓存和远端 snapshot。这里若在
+                # prewarm 之后再清理，会把刚热好的缓存清空，让每轮抓取后
+                # feed 走冷路径。
             except Exception as _e:
                 print(f"[mv] prewarm exc: {_e!r}", flush=True)
 
@@ -1170,6 +1265,77 @@ def _load_event_cluster_stats(path):
     return data if isinstance(data, dict) else None
 
 
+def _load_x_source_attempts(run_id):
+    path = os.path.join(_run_data_dir(run_id), 'x_user_attempts.json')
+    try:
+        with open(path, 'r') as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    planned_sources = data.get('planned_sources')
+    results = data.get('results')
+    if not isinstance(planned_sources, list) or not isinstance(results, list):
+        return None
+
+    normalized_results = []
+    terminal_source_ids = set()
+    attempted_source_ids = set()
+    succeeded = 0
+    failed = 0
+    no_new = 0
+    for raw in results:
+        if not isinstance(raw, dict):
+            continue
+        result = dict(raw)
+        source_id = result.get('source_id')
+        try:
+            attempts = int(result.get('attempts') or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        if source_id is not None and attempts > 0:
+            attempted_source_ids.add(source_id)
+        outcome = result.get('outcome')
+        if outcome not in {'success', 'no_new', 'failed'}:
+            outcome = 'interrupted'
+            result['outcome'] = outcome
+        else:
+            if source_id is not None:
+                terminal_source_ids.add(source_id)
+            if outcome in {'success', 'no_new'}:
+                succeeded += 1
+            if outcome == 'no_new':
+                no_new += 1
+            if outcome == 'failed':
+                failed += 1
+        normalized_results.append(result)
+
+    planned_source_ids = [
+        source.get('source_id')
+        for source in planned_sources
+        if isinstance(source, dict) and source.get('source_id') is not None
+    ]
+    missed_source_ids = [
+        source_id for source_id in planned_source_ids
+        if source_id not in terminal_source_ids
+    ]
+    normalized = dict(data)
+    normalized.update({
+        'planned_source_ids': planned_source_ids,
+        'planned': len(planned_sources),
+        'attempted': len(attempted_source_ids),
+        'succeeded': succeeded,
+        'no_new': no_new,
+        'failed': failed,
+        'missed': len(missed_source_ids),
+        'missed_source_ids': missed_source_ids,
+        'results': normalized_results,
+    })
+    return normalized
+
+
 def _event_cluster_published_count(stats):
     if not isinstance(stats, dict):
         return 0
@@ -1442,17 +1608,9 @@ def _run_recommend_fetch():
             'current_stage': 0, 'total_new': 0
         }
         cfg = load_json(os.path.join(BASE, 'config', 'config.json')) or {}
-        tw_fyu = str(cfg.get('twitter', {}).get('for_you_count', 50))
-        tw_fol = str(cfg.get('twitter', {}).get('following_count', 50))
-        tw_dir = os.path.join(BASE, 'data', 'sources', 'twitter')
         xhs_dir = os.path.join(BASE, 'data', 'sources', 'xiaohongshu')
 
-        subprocess.run([CLI['twitter'], 'feed', '-t', 'for-you', '-n', tw_fyu, '-o',
-            os.path.join(tw_dir, '2-for-you-feed.json')],
-            stderr=subprocess.DEVNULL, timeout=90, env=_clean_env())
-        subprocess.run([CLI['twitter'], 'feed', '-t', 'following', '-n', tw_fol, '-o',
-            os.path.join(tw_dir, '1-following-feed.json')],
-            stderr=subprocess.DEVNULL, timeout=90, env=_clean_env())
+        _run_registry_x_fetch()
         xhs_enabled = _is_platform_enabled('xiaohongshu')
         if xhs_enabled:
             _run_to_file([CLI['xhs'], 'feed', '--json'],
@@ -1460,7 +1618,6 @@ def _run_recommend_fetch():
 
         # BF-0418-NEW 子项 B：按 topics.json 分关键词抓取，产 search-{safe}.json（无 -latest 后缀）
         # 向下兼容 DB 里 source='search:XXX' 的 pill（ingest.py:156 会把 _ 还原为空格）
-        since_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         topics_cfg_path = os.path.join(BASE, 'config', 'topics.json')
         search_kws = []
         try:
@@ -1474,13 +1631,6 @@ def _run_recommend_fetch():
             search_kws = cfg.get('global', {}).get('search_keywords', [])[:4]
         for kw in search_kws:
             safe = kw.replace(' ', '_')
-            try:
-                subprocess.run([CLI['twitter'], 'search', kw, '-t', 'latest',
-                    '--since', since_date, '-n', '30', '-o',
-                    os.path.join(tw_dir, f'search-{safe}.json')],
-                    stderr=subprocess.DEVNULL, timeout=60, env=_clean_env())
-            except Exception:
-                pass
             if xhs_enabled:
                 try:
                     _run_to_file([CLI['xhs'], 'search', kw, '--sort', 'latest', '--json'],
@@ -1491,14 +1641,10 @@ def _run_recommend_fetch():
         _fetch_progress['stages'][0]['status'] = 'done'
         _fetch_progress['stages'][1]['status'] = 'running'
         _fetch_progress['current_stage'] = 1
-        conn_pre = db.get_conn()
-        count_before = conn_pre.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        conn_pre.close()
+        count_before = _count_items_current_backend()
         subprocess.run([_python_executable(), os.path.join(BASE, 'src', 'ingest.py')],
             cwd=BASE, timeout=120, stderr=subprocess.DEVNULL)
-        conn_post = db.get_conn()
-        count_after = conn_post.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        conn_post.close()
+        count_after = _count_items_current_backend()
         new_count = max(0, count_after - count_before)
         _fetch_progress['stages'][1]['status'] = 'done'
         _fetch_progress['stages'][1]['new_count'] = new_count
@@ -1542,24 +1688,15 @@ def _run_topic_fetch(topic_name):
             print(f"No search queries for topic: {topic_name}")
             return
 
-        cfg = load_json(os.path.join(BASE, 'config', 'config.json')) or {}
-        tw_fyu = str(cfg.get('twitter', {}).get('for_you_count', 50))
-        tw_fol = str(cfg.get('twitter', {}).get('following_count', 50))
         xhs_enabled = _is_platform_enabled('xiaohongshu')
         try:
-            subprocess.run([CLI['twitter'], 'feed', '-t', 'for-you', '-n', tw_fyu, '-o',
-                os.path.join(BASE, 'data', 'sources', 'twitter', '2-for-you-feed.json')],
-                stderr=subprocess.DEVNULL, timeout=90, env=_clean_env())
-            subprocess.run([CLI['twitter'], 'feed', '-t', 'following', '-n', tw_fol, '-o',
-                os.path.join(BASE, 'data', 'sources', 'twitter', '1-following-feed.json')],
-                stderr=subprocess.DEVNULL, timeout=90, env=_clean_env())
+            _run_registry_x_fetch()
             if xhs_enabled:
                 _run_to_file([CLI['xhs'], 'feed', '--json'],
                     os.path.join(BASE, 'data', 'sources', 'xiaohongshu', '1-recommend-feed.json'))
         except Exception:
             pass
 
-        since_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         for q in queries:
             safe = q.replace(' ', '_')
             if xhs_enabled:
@@ -1568,25 +1705,14 @@ def _run_topic_fetch(topic_name):
                         os.path.join(BASE, 'data', 'sources', 'xiaohongshu', f'search-{safe}.json'))
                 except Exception as e:
                     print(f"XHS search '{q}' error: {e}")
-            try:
-                subprocess.run([CLI['twitter'], 'search', q, '-t', 'latest',
-                    '--since', since_date, '-n', '30', '-o',
-                    os.path.join(BASE, 'data', 'sources', 'twitter', f'search-{safe}.json')],
-                    stderr=subprocess.DEVNULL, timeout=60, env=_clean_env())
-            except Exception as e:
-                print(f"Twitter search '{q}' error: {e}")
 
         _fetch_progress['stages'][0]['status'] = 'done'
         _fetch_progress['stages'][1]['status'] = 'running'
         _fetch_progress['current_stage'] = 1
-        conn_pre = db.get_conn()
-        count_before = conn_pre.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        conn_pre.close()
+        count_before = _count_items_current_backend()
         subprocess.run([_python_executable(), os.path.join(BASE, 'src', 'ingest.py')],
             cwd=BASE, timeout=120, stderr=subprocess.DEVNULL)
-        conn_post = db.get_conn()
-        count_after = conn_post.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        conn_post.close()
+        count_after = _count_items_current_backend()
         new_count = max(0, count_after - count_before)
         _fetch_progress['stages'][1]['status'] = 'done'
         _fetch_progress['stages'][1]['new_count'] = new_count
@@ -1607,20 +1733,7 @@ def _run_platform_all(platform, *, output_root=None, env=None):
     command_env = env if env is not None else _clean_env()
     cfg = load_json(os.path.join(BASE, 'config', 'config.json')) or {}
     if platform == 'twitter':
-        n_fy = str(cfg.get('twitter', {}).get('for_you_count', 50))
-        n_fl = str(cfg.get('twitter', {}).get('following_count', 50))
-        subprocess.run([CLI['twitter'], 'feed', '-t', 'for-you', '-n', n_fy, '-o',
-            _output_data_path(output_root, 'sources', 'twitter', '2-for-you-feed.json')],
-            stderr=subprocess.DEVNULL, timeout=90, env=command_env)
-        subprocess.run([CLI['twitter'], 'feed', '-t', 'following', '-n', n_fl, '-o',
-            _output_data_path(output_root, 'sources', 'twitter', '1-following-feed.json')],
-            stderr=subprocess.DEVNULL, timeout=90, env=command_env)
-        kws = cfg.get('global', {}).get('search_keywords', []) + cfg.get('twitter', {}).get('search', {}).get('extra_keywords', [])
-        for kw in dict.fromkeys(kws):
-            subprocess.run([CLI['twitter'], 'search', kw, '-t', 'latest',
-                '-n', '30', '--exclude', 'retweets', '--filter', '--json', '-o',
-                _output_data_path(output_root, 'sources', 'twitter', f'search-{kw.replace(" ", "_")}.json')],
-                stderr=subprocess.DEVNULL, timeout=60, env=command_env)
+        _run_registry_x_fetch(output_root=output_root, env=command_env)
     elif platform == 'xiaohongshu':
         if not _is_platform_enabled('xiaohongshu'):
             print("[fetch] xiaohongshu is disabled in config, skipping")
@@ -1651,6 +1764,9 @@ def _run_source_fetch_step(platform, source, *, output_root=None, env=None):
     if source is None or source == '':
         _run_platform_all(platform, output_root=output_root, env=command_env)
         return True
+    if platform == 'twitter':
+        _run_registry_x_fetch(output_root=output_root, env=command_env)
+        return True
     if platform == 'xiaohongshu' and not _is_platform_enabled('xiaohongshu'):
         print("[fetch] xiaohongshu is disabled in config, skipping")
         return True
@@ -1665,20 +1781,6 @@ def _run_source_fetch_step(platform, source, *, output_root=None, env=None):
         _run_to_file([CLI['xhs'], 'feed', '--json'],
             _output_data_path(output_root, 'sources', 'xiaohongshu', '1-recommend-feed.json'),
             env=command_env)
-        return True
-    if platform == 'twitter' and source == 'for_you':
-        cfg = load_json(os.path.join(BASE, 'config', 'config.json')) or {}
-        n = str(cfg.get('twitter', {}).get('for_you_count', 50))
-        subprocess.run([CLI['twitter'], 'feed', '-t', 'for-you', '-n', n, '-o',
-            _output_data_path(output_root, 'sources', 'twitter', '2-for-you-feed.json')],
-            stderr=subprocess.DEVNULL, timeout=90, env=command_env)
-        return True
-    if platform == 'twitter' and source == 'following':
-        cfg = load_json(os.path.join(BASE, 'config', 'config.json')) or {}
-        n = str(cfg.get('twitter', {}).get('following_count', 50))
-        subprocess.run([CLI['twitter'], 'feed', '-t', 'following', '-n', n, '-o',
-            _output_data_path(output_root, 'sources', 'twitter', '1-following-feed.json')],
-            stderr=subprocess.DEVNULL, timeout=90, env=command_env)
         return True
     if platform == 'bilibili' and source == 'hot':
         _run_to_file([CLI['bili'], 'hot', '--json'],
@@ -1721,14 +1823,10 @@ def _run_quick_fetch(platform, source):
         _fetch_progress['stages'][0]['status'] = 'done'
         _fetch_progress['stages'][1]['status'] = 'running'
         _fetch_progress['current_stage'] = 1
-        conn_pre = db.get_conn()
-        count_before = conn_pre.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        conn_pre.close()
+        count_before = _count_items_current_backend()
         subprocess.run([_python_executable(), os.path.join(BASE, 'src', 'ingest.py')],
             cwd=BASE, timeout=120, stderr=subprocess.DEVNULL)
-        conn_post = db.get_conn()
-        count_after = conn_post.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        conn_post.close()
+        count_after = _count_items_current_backend()
         new_count = max(0, count_after - count_before)
         _fetch_progress['stages'][1]['status'] = 'done'
         _fetch_progress['stages'][1]['new_count'] = new_count
@@ -1806,7 +1904,7 @@ def _run_fetch(run_id=None, source='api'):
             try:
                 _run_killpg(  # PL-7
                     ['bash', os.path.join(BASE, 'ops', 'fetch_all.sh'), '--raw-only', '--run-id', str(run_id)],
-                    cwd=BASE, timeout=1800,
+                    cwd=BASE, timeout=_source_fetch_timeout_sec(),
                     stdout=log_f,
                     stderr=subprocess.STDOUT,
                     env=run_env,
@@ -1814,7 +1912,7 @@ def _run_fetch(run_id=None, source='api'):
                 )
             except subprocess.TimeoutExpired:
                 fetch_all_timed_out = True
-                print("[fetch] fetch_all.sh timed out after 1800s, continuing with ingest")
+                print("[fetch] fetch_all.sh timed out before source coverage completed, continuing with ingest")
             except subprocess.CalledProcessError as e:
                 fetch_all_failed = True
                 print(f"[fetch] fetch_all.sh failed with exit code {e.returncode}, continuing with ingest")
@@ -2020,6 +2118,9 @@ def _run_fetch(run_id=None, source='api'):
             run_stats['_new_items_count'] = progress.get('total_new')
             started_at_iso = (active or {}).get('started_at') or progress.get('started_at')
         run_stats['_platform_new_counts'] = _per_platform_new_counts_current_backend(started_at_iso)
+        x_source_attempts = _load_x_source_attempts(run_id)
+        if x_source_attempts is not None:
+            run_stats['_x_source_attempts'] = x_source_attempts
         feed_content_changed = bool(
             (run_stats.get('_new_items_count') or 0) > 0
             or partial_published_clusters > 0
@@ -2030,7 +2131,11 @@ def _run_fetch(run_id=None, source='api'):
     except Exception as e:
         for stage_id in list(stage_started.keys()):
             _stage_finish(stage_id)
-        _finish_fetch_run_current_backend(run_id, {'_stage_durations_sec': stage_durations}, str(e))
+        failed_stats = {'_stage_durations_sec': stage_durations}
+        x_source_attempts = _load_x_source_attempts(run_id)
+        if x_source_attempts is not None:
+            failed_stats['_x_source_attempts'] = x_source_attempts
+        _finish_fetch_run_current_backend(run_id, failed_stats, str(e))
         _notify(f'抓取失败: {str(e)[:80]}')
         for plat in ('twitter', 'xiaohongshu', 'bilibili'):
             _update_health_status(plat, 'error', f'全量抓取失败: {str(e)[:80]}')
@@ -2250,6 +2355,9 @@ def _run_source_micro_fetch(run_id, platform, source, run_source=None):
         run_stats['_result_status'] = result_status
         run_stats['_new_items_count'] = new_count
         run_stats['_platform_new_counts'] = _per_platform_new_counts_current_backend(started_at_iso)
+        x_source_attempts = _load_x_source_attempts(run_id)
+        if x_source_attempts is not None:
+            run_stats['_x_source_attempts'] = x_source_attempts
         if event_cluster_stats:
             run_stats['event_cluster'] = event_cluster_stats
         if published_clusters:
@@ -2258,13 +2366,17 @@ def _run_source_micro_fetch(run_id, platform, source, run_source=None):
     except Exception as exc:
         for stage_id in list(stage_started.keys()):
             _stage_finish(stage_id)
+        failed_stats = {
+            '_pipeline_mode': 'micro',
+            '_micro_source': {'platform': platform, 'source': source or 'all'},
+            '_stage_durations_sec': stage_durations,
+        }
+        x_source_attempts = _load_x_source_attempts(run_id)
+        if x_source_attempts is not None:
+            failed_stats['_x_source_attempts'] = x_source_attempts
         _finish_fetch_run_current_backend(
             run_id,
-            {
-                '_pipeline_mode': 'micro',
-                '_micro_source': {'platform': platform, 'source': source or 'all'},
-                '_stage_durations_sec': stage_durations,
-            },
+            failed_stats,
             str(exc),
         )
         with _fetch_lock:
@@ -2718,32 +2830,13 @@ async def post_fetch_quick(request: Request):
                     'current_stage': 0, 'total_new': 0
                 }
                 sq = cat.get('search_queries', {})
-                tw_queries = sq.get('twitter', [])
                 xhs_queries = sq.get('xiaohongshu', [])
                 xhs_enabled = _is_platform_enabled('xiaohongshu')
-                since_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
                 errors = []
                 try:
-                    cfg = load_json(os.path.join(BASE, 'config', 'config.json')) or {}
-                    subprocess.run([CLI['twitter'], 'feed', '-t', 'for-you', '-n',
-                        str(cfg.get('twitter', {}).get('for_you_count', 50)), '-o',
-                        os.path.join(BASE, 'data', 'sources', 'twitter', '2-for-you-feed.json')],
-                        stderr=subprocess.DEVNULL, timeout=90, env=_clean_env())
-                    subprocess.run([CLI['twitter'], 'feed', '-t', 'following', '-n',
-                        str(cfg.get('twitter', {}).get('following_count', 50)), '-o',
-                        os.path.join(BASE, 'data', 'sources', 'twitter', '1-following-feed.json')],
-                        stderr=subprocess.DEVNULL, timeout=90, env=_clean_env())
+                    _run_registry_x_fetch()
                 except Exception as e:
-                    errors.append(f"Twitter feed: {e}")
-                for q in tw_queries[:3]:
-                    safe = q.replace(' ', '_')[:50]
-                    try:
-                        subprocess.run([CLI['twitter'], 'search', q, '-t', 'latest',
-                            '--since', since_date, '-n', '30', '-o',
-                            os.path.join(BASE, 'data', 'sources', 'twitter', f'search-{safe}.json')],
-                            stderr=subprocess.DEVNULL, timeout=60, env=_clean_env())
-                    except Exception as e:
-                        errors.append(f"Twitter search: {e}")
+                    errors.append(f"X registry fetch: {e}")
                 if xhs_enabled:
                     for q in xhs_queries[:3]:
                         safe = q.replace(' ', '_')[:50]
@@ -2760,14 +2853,10 @@ async def post_fetch_quick(request: Request):
                 _fetch_progress['stages'][0]['status'] = 'done'
                 _fetch_progress['stages'][1]['status'] = 'running'
                 _fetch_progress['current_stage'] = 1
-                conn_pre = db.get_conn()
-                count_before = conn_pre.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-                conn_pre.close()
+                count_before = _count_items_current_backend()
                 subprocess.run([_python_executable(), os.path.join(BASE, 'src', 'ingest.py')],
                     cwd=BASE, timeout=120, stderr=subprocess.DEVNULL)
-                conn_post = db.get_conn()
-                count_after = conn_post.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-                conn_post.close()
+                count_after = _count_items_current_backend()
                 new_count = max(0, count_after - count_before)
                 _fetch_progress['stages'][1]['status'] = 'done'
                 _fetch_progress['stages'][1]['new_count'] = new_count

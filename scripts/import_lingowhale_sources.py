@@ -14,6 +14,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE, "src"))
 
 import db  # noqa: E402
+import remote_db  # noqa: E402
 
 _LINGOWHALE_CONFIG = json.dumps({"backend": "lingowhale"}, ensure_ascii=False)
 
@@ -47,25 +48,29 @@ def iter_lingowhale_channels(groups):
     yield from walk(groups)
 
 
-def import_lingowhale_sources(conn=None, groups_path=None, base=BASE):
-    """Idempotently import Lingowhale channels. Returns {inserted, updated, seen}."""
-    groups_path = groups_path or os.path.join(base, "data", "lingowhale", "groups.json")
-    groups = _load_json(groups_path)
-    own_conn = conn is None
-    if own_conn:
-        conn = db.get_conn()
-
+def _import_into(conn, groups, *, remote):
     summary = {"inserted": 0, "updated": 0, "seen": 0}
-    try:
-        for channel in iter_lingowhale_channels(groups):
-            summary["seen"] += 1
-            channel_id = channel["channel_id"]
-            display_name = channel["name"]
+    for channel in iter_lingowhale_channels(groups):
+        summary["seen"] += 1
+        channel_id = channel["channel_id"]
+        display_name = channel["name"]
+        now = _now()
+        if remote:
+            action = remote_db.upsert_source_registry_remote(
+                conn,
+                platform="wechat_mp",
+                source_key=channel_id,
+                display_name=display_name,
+                status="active",
+                config_json=_LINGOWHALE_CONFIG,
+                origin="lingowhale_import",
+                now=now,
+            )
+        else:
             row = conn.execute(
                 "SELECT id FROM sources WHERE platform = 'wechat_mp' AND source_key = ?",
                 (channel_id,),
             ).fetchone()
-            now = _now()
             if row:
                 conn.execute(
                     """UPDATE sources
@@ -73,7 +78,7 @@ def import_lingowhale_sources(conn=None, groups_path=None, base=BASE):
                         WHERE id = ?""",
                     (display_name, _LINGOWHALE_CONFIG, now, row["id"]),
                 )
-                summary["updated"] += 1
+                action = "updated"
             else:
                 conn.execute(
                     """INSERT INTO sources(platform, source_key, display_name, status,
@@ -81,12 +86,27 @@ def import_lingowhale_sources(conn=None, groups_path=None, base=BASE):
                        VALUES('wechat_mp', ?, ?, 'active', ?, 'lingowhale_import', ?, ?)""",
                     (channel_id, display_name, _LINGOWHALE_CONFIG, now, now),
                 )
-                summary["inserted"] += 1
-        conn.commit()
-        return summary
+                action = "inserted"
+        summary[action] += 1
+    conn.commit()
+    return summary
+
+
+def import_lingowhale_sources(conn=None, groups_path=None, base=BASE):
+    """Idempotently import Lingowhale channels. Returns {inserted, updated, seen}."""
+    groups_path = groups_path or os.path.join(base, "data", "lingowhale", "groups.json")
+    groups = _load_json(groups_path)
+    if conn is not None:
+        return _import_into(conn, groups, remote=False)
+    if remote_db.fetch_write_to_remote():
+        with remote_db.connect() as remote_conn:
+            return _import_into(remote_conn, groups, remote=True)
+
+    local_conn = db.get_conn()
+    try:
+        return _import_into(local_conn, groups, remote=False)
     finally:
-        if own_conn:
-            conn.close()
+        local_conn.close()
 
 
 def main():

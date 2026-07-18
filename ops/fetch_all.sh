@@ -40,29 +40,12 @@ for arg in "$@"; do
 done
 
 # ============================================================
-# 1. TWITTER（v16.0: keyword search 全下线，只留 following / for-you / bookmarks）
+# 1. X（sources 注册表全量账号）
 # ============================================================
 echo "📱 [1/5] Twitter..."
 mkdir -p "$SOURCE_DIR/twitter"
 
-# Following feed
-echo "  Following feed..."
-twitter feed -t following -n $("$PYTHON_BIN" -c "import json; print(json.load(open('$CONFIG'))['twitter']['following_count'])") \
-  --json -o "$SOURCE_DIR/twitter/1-following-feed.json" >/dev/null 2>&1
-echo "  ✅ Following"
-
-# For-You feed
-echo "  For-You feed..."
-twitter feed -t for-you -n $("$PYTHON_BIN" -c "import json; print(json.load(open('$CONFIG'))['twitter']['for_you_count'])") \
-  --json -o "$SOURCE_DIR/twitter/2-for-you-feed.json" >/dev/null 2>&1
-echo "  ✅ For-You"
-
-# Bookmarks
-echo "  Bookmarks..."
-twitter bookmarks -n 20 --json -o "$SOURCE_DIR/twitter/4-bookmarks.json" >/dev/null 2>&1 || true
-echo "  ✅ Bookmarks"
-
-# X user registry sources
+# X 内容只读 sources 注册表，每轮由脚本遍历全部可抓取账号。
 "$PYTHON_BIN" "$BASE/src/fetch_x_users.py" 2>&1 || true
 
 echo ""

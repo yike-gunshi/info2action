@@ -2,6 +2,8 @@ from contextlib import contextmanager
 import os
 import sys
 
+import pytest
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE, "src"))
 
@@ -110,7 +112,36 @@ def test_load_source_index_remote_builds_platform_maps(monkeypatch):
     )
 
 
-def test_list_active_sources_remote_normalizes_rows(monkeypatch):
+def test_list_active_sources_local_includes_broken_for_recovery():
+    executed = []
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            executed.append((_squash(sql), params))
+            return _Rows(
+                [
+                    {
+                        "id": 6,
+                        "source_key": "https://broken.test/feed.xml",
+                        "display_name": "Broken feed",
+                        "config_json": None,
+                    }
+                ]
+            )
+
+    rows = db.list_active_sources(FakeConn(), "rss")
+
+    assert rows[0]["id"] == 6
+    assert executed == [
+        (
+            "SELECT id, source_key, display_name, config_json FROM sources "
+            "WHERE platform = ? AND status IN ('active', 'broken') ORDER BY id",
+            ("rss",),
+        )
+    ]
+
+
+def test_list_active_sources_remote_includes_broken_for_recovery(monkeypatch):
     executed = []
 
     class FakeConn:
@@ -146,9 +177,59 @@ def test_list_active_sources_remote_normalizes_rows(monkeypatch):
     ]
     assert executed[0] == (
         "SELECT id, source_key, display_name, config_json FROM remote_poc.sources "
-        "WHERE platform=%s AND status='active' ORDER BY id",
+        "WHERE platform=%s AND status IN ('active', 'broken', 'not_fetched') ORDER BY id",
         ("x_user",),
     )
+
+
+def test_list_active_sources_local_includes_not_fetched_only_for_x():
+    executed = []
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            executed.append((_squash(sql), params))
+            return _Rows([])
+
+    db.list_active_sources(FakeConn(), "x_user")
+    db.list_active_sources(FakeConn(), "rss")
+
+    assert "status IN ('active', 'broken', 'not_fetched')" in executed[0][0]
+    assert "status IN ('active', 'broken')" in executed[1][0]
+
+
+def test_list_active_sources_remote_can_fail_closed(monkeypatch):
+    class FakeConn:
+        def execute(self, sql, params=None):
+            raise RuntimeError("remote unavailable")
+
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+
+    assert remote_db.list_active_sources_remote("wechat_mp", FakeConn()) == []
+    with pytest.raises(RuntimeError, match="remote unavailable"):
+        remote_db.list_active_sources_remote("wechat_mp", FakeConn(), fail_open=False)
+
+
+def test_latest_x_user_watermark_remote_uses_source_id(monkeypatch):
+    executed = []
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            executed.append((_squash(sql), params))
+            return _One({"id": "tw_101"})
+
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+
+    watermark = remote_db.latest_x_user_watermark_remote(7, pg_conn=FakeConn())
+
+    assert watermark == "tw_101"
+    assert executed == [
+        (
+            "SELECT id FROM remote_poc.items WHERE source_id = %s "
+            "AND platform = 'twitter' AND published_at IS NOT NULL "
+            "ORDER BY published_at DESC NULLS LAST LIMIT 1",
+            (7,),
+        )
+    ]
 
 
 def test_record_source_fetch_result_remote_ok_resets_broken_source(monkeypatch):
@@ -205,6 +286,23 @@ def test_record_source_fetch_result_remote_failure_breaks_after_threshold(monkey
     assert params[2] == "x" * 500
     assert params[3].endswith("Z")
     assert params[4] == 11
+
+
+def test_record_source_fetch_result_remote_promotes_not_fetched(monkeypatch):
+    executed = []
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            executed.append((_squash(sql), params))
+            if sql.lstrip().startswith("SELECT"):
+                return _One({"status": "not_fetched", "consecutive_failures": 0})
+            return _Rows([])
+
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+
+    remote_db.record_source_fetch_result_remote(12, ok=True, pg_conn=FakeConn())
+
+    assert executed[-1][1][0] == "active"
 
 
 def test_source_index_for_dispatches_to_current_backend(monkeypatch):

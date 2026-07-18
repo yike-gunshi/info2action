@@ -10,6 +10,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE, "src"))
 
 import db  # noqa: E402
+import remote_db  # noqa: E402
 
 _SNAPSHOT_RE = re.compile(r"^sources-(\d{8})\.json$")
 
@@ -20,6 +21,9 @@ def _snapshot_stamp():
 
 def _source_dict(row):
     data = dict(row)
+    for key, value in list(data.items()):
+        if isinstance(value, datetime):
+            data[key] = value.isoformat()
     raw = data.get("config_json")
     if raw:
         try:
@@ -48,12 +52,19 @@ def snapshot_sources(base=BASE):
     backup_dir = os.path.join(base, "data", "backups")
     os.makedirs(backup_dir, exist_ok=True)
 
-    conn = db.get_conn()
-    try:
-        rows = conn.execute("SELECT * FROM sources ORDER BY id").fetchall()
-        data = [_source_dict(row) for row in rows]
-    finally:
-        conn.close()
+    if remote_db.fetch_write_to_remote():
+        with remote_db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM {remote_db.remote_schema()}.sources ORDER BY id"
+            ).fetchall()
+            data = [_source_dict(row) for row in rows]
+    else:
+        conn = db.get_conn()
+        try:
+            rows = conn.execute("SELECT * FROM sources ORDER BY id").fetchall()
+            data = [_source_dict(row) for row in rows]
+        finally:
+            conn.close()
 
     path = os.path.join(backup_dir, f"sources-{_snapshot_stamp()}.json")
     with open(path, "w", encoding="utf-8") as f:

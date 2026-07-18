@@ -10,6 +10,7 @@ vi.mock('../../lib/api', () => ({
   setClusterStar: vi.fn(),
   fetchClusterActions: vi.fn(),
   generateClusterAction: vi.fn(() => ({ abort: vi.fn() })),
+  setClusterFeedback: vi.fn(),
 }))
 
 import {
@@ -20,6 +21,7 @@ import {
   setClusterStar,
   fetchClusterActions,
   generateClusterAction,
+  setClusterFeedback,
 } from '../../lib/api'
 
 function makeDetail(overrides: Partial<ClusterDetail> = {}): ClusterDetail {
@@ -75,10 +77,16 @@ beforeEach(() => {
   vi.mocked(setClusterStar).mockReset()
   vi.mocked(fetchClusterActions).mockReset()
   vi.mocked(generateClusterAction).mockReset()
+  vi.mocked(setClusterFeedback).mockReset()
   vi.mocked(clickCluster).mockResolvedValue({ ok: true, last_seen_version: 0 })
   vi.mocked(setClusterStar).mockResolvedValue({ ok: true, starred_at: '2026-05-25T09:00:00Z' })
   vi.mocked(fetchClusterBundle).mockResolvedValue(emptyBundle())
   vi.mocked(generateClusterAction).mockReturnValue({ abort: vi.fn() } as unknown as AbortController)
+  vi.mocked(setClusterFeedback).mockResolvedValue({
+    ok: true,
+    feedback_kind: null,
+    feedback_note: null,
+  })
 })
 
 afterEach(() => {
@@ -204,6 +212,34 @@ describe('clusterDetailStore.toggleClusterStar', () => {
     vi.mocked(setClusterStar).mockRejectedValue(new Error('network'))
     await expect(useClusterDetailStore.getState().toggleClusterStar(42)).rejects.toThrow('network')
     expect(useClusterDetailStore.getState().cluster?.viewer_status?.starred_at ?? null).toBeNull()
+  })
+})
+
+describe('clusterDetailStore.submitClusterFeedback', () => {
+  it('服务端返回 null note 时清除乐观更新留下的 note', async () => {
+    useClusterDetailStore.setState({
+      modalState: 'open',
+      modalClusterId: 42,
+      cluster: makeDetail({
+        viewer_status: {
+          clicked_at: null,
+          starred_at: null,
+          last_seen_version: 1,
+          feedback_kind: 'irrelevant',
+          feedback_note: '旧说明',
+        },
+      }),
+    })
+    vi.mocked(setClusterFeedback).mockResolvedValue({
+      ok: true,
+      feedback_kind: 'low_quality',
+      feedback_note: null,
+    })
+
+    await useClusterDetailStore.getState().submitClusterFeedback(42, 'low_quality', '新说明')
+
+    expect(useClusterDetailStore.getState().cluster?.viewer_status?.feedback_kind).toBe('low_quality')
+    expect(useClusterDetailStore.getState().cluster?.viewer_status?.feedback_note).toBeNull()
   })
 })
 

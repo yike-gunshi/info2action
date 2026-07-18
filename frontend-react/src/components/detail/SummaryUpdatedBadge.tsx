@@ -4,6 +4,7 @@
  * 设计规范: docs/DESIGN.md 模块 13.5
  */
 import React, { useEffect, useState } from 'react'
+import { Sparkles } from 'lucide-react'
 
 interface Props {
   onExpired: () => void
@@ -33,14 +34,16 @@ export function SummaryUpdatedBadge({ onExpired }: Props): React.ReactElement | 
     <div
       role="status"
       aria-live="polite"
-      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs bg-primary/10 text-primary border border-primary/20 mb-2"
+      // v24.0 §21.6: emoji ✨ → lucide Sparkles;靛蓝 pill → brand-soft 纸面徽章(4px 圆角)
+      className="mb-2 inline-flex items-center gap-1.5 rounded-[4px] border border-[var(--brand-border)] bg-[var(--brand-soft)] px-2.5 py-1 text-xs text-[var(--brand)]"
       style={{
         opacity,
         transform: `translateY(${translateY})`,
         transition: 'opacity 200ms ease-out, transform 200ms ease-out',
       }}
     >
-      ✨ 摘要已基于视频转写更新
+      <Sparkles className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      摘要已基于视频转写更新
     </div>
   )
 }

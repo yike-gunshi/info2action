@@ -85,7 +85,7 @@ export function LibraryEmptyState({
 }) {
   return (
     <div className="px-4 py-16 text-center">
-      <div className="mx-auto mb-8 max-w-[1200px] text-left">
+      <div className="mx-auto mb-8 max-w-[1168px] text-left">
         {header}
       </div>
       <div className="mx-auto mb-4 flex h-10 w-10 items-center justify-center rounded-[4px] border border-border bg-card text-muted-foreground">

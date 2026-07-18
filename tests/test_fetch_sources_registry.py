@@ -300,6 +300,279 @@ def test_fetch_source_lists_fallback_to_config_when_registry_raises(monkeypatch)
     ) == ["config/repo"]
 
 
+def test_lingowhale_registry_channel_ids_use_local_sources(tmp_db, monkeypatch):
+    import db
+    import fetch_lingowhale
+    import remote_db
+
+    monkeypatch.setattr(remote_db, "fetch_write_to_remote", lambda: False)
+    conn = db.get_conn()
+    try:
+        _insert_source(conn, "wechat_mp", "lw-explicit", config={"backend": "lingowhale"})
+        _insert_source(conn, "wechat_mp", "lw-legacy")
+        _insert_source(conn, "wechat_mp", "https://wechat.test/rss.xml", config={"backend": "rss"})
+        _insert_source(conn, "wechat_mp", "lw-paused", status="paused", config={"backend": "lingowhale"})
+    finally:
+        conn.close()
+
+    assert fetch_lingowhale._registry_lingowhale_channel_ids() == [
+        "lw-explicit",
+        "lw-legacy",
+    ]
+
+
+def test_lingowhale_registry_channel_ids_use_remote_sources(monkeypatch):
+    import db
+    import fetch_lingowhale
+    import remote_db
+
+    monkeypatch.setattr(remote_db, "fetch_write_to_remote", lambda: True)
+    monkeypatch.setattr(
+        remote_db,
+        "list_active_sources_remote",
+        lambda platform, *, fail_open=True: [
+            {"id": 1, "source_key": "lw-remote", "config_json": {"backend": "lingowhale"}},
+            {"id": 2, "source_key": "lw-legacy-remote", "config_json": {}},
+            {"id": 3, "source_key": "https://wechat.test/rss.xml", "config_json": {"backend": "rss"}},
+        ],
+    )
+    monkeypatch.setattr(db, "get_conn", lambda: pytest.fail("opened local db"))
+
+    assert fetch_lingowhale._registry_lingowhale_channel_ids() == [
+        "lw-remote",
+        "lw-legacy-remote",
+    ]
+
+
+def test_fetch_subscription_feed_includes_registry_lingowhale_channels(monkeypatch):
+    import fetch_lingowhale as lw
+
+    calls = []
+    groups_info = [
+        {"name": "每日查看", "channels": [{"channel_id": "from-group", "name": "分组号"}]},
+    ]
+
+    def fake_fetch(endpoint, channel_ids, label, timeout=30, since_ts=None):
+        calls.append((endpoint, tuple(channel_ids), label))
+        return ([], 1, "done")
+
+    monkeypatch.setattr(lw, "_priority_channel_ids", lambda: [])
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {
+        "from-registry": 10,
+        "from-group": 11,
+    })
+    monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_fetch)
+    monkeypatch.setattr(lw, "_record_lingowhale_result", lambda source_id, *, ok, error=None: None)
+    monkeypatch.setattr(lw.time, "sleep", lambda seconds: None)
+
+    lw.fetch_subscription_feed(groups_info)
+
+    current_channel_calls = [
+        channel_ids
+        for endpoint, channel_ids, label in calls
+        if endpoint == lw.FEED_ENDPOINTS[0]
+    ]
+    assert current_channel_calls == [("from-registry",), ("from-group",)]
+
+
+def test_fetch_subscription_feed_registry_only_uses_registry_channels(monkeypatch):
+    import fetch_lingowhale as lw
+
+    calls = []
+    groups_info = [
+        {"name": "每日查看", "channels": [{"channel_id": "from-group", "name": "分组号"}]},
+    ]
+
+    def fake_fetch(endpoint, channel_ids, label, timeout=30, since_ts=None):
+        calls.append((endpoint, tuple(channel_ids), label))
+        return ([{"entry_id": f"{channel_ids[0]}-1", "pub_time": 1}], 1, "done")
+
+    monkeypatch.delenv("INFO2ACTION_LINGOWHALE_REGISTRY_ONLY", raising=False)
+    monkeypatch.setattr(
+        lw,
+        "_priority_channel_ids",
+        lambda: ["outside-registry", "from-registry-b"],
+    )
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {
+        "from-registry-a": 10,
+        "from-registry-b": 11,
+    })
+    monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_fetch)
+    monkeypatch.setattr(lw, "_record_lingowhale_result", lambda source_id, *, ok, error=None: None)
+    monkeypatch.setattr(lw.time, "sleep", lambda seconds: None)
+
+    lw.fetch_subscription_feed(groups_info)
+
+    assert [
+        channel_ids
+        for endpoint, channel_ids, label in calls
+        if endpoint == lw.FEED_ENDPOINTS[0]
+    ] == [("from-registry-b",), ("from-registry-a",)]
+    assert (lw.FEED_ENDPOINTS[1], ("all",), "legacy all") not in calls
+
+
+def test_fetch_subscription_feed_empty_registry_stays_registry_only(monkeypatch):
+    import fetch_lingowhale as lw
+
+    calls = []
+    groups_info = [
+        {"name": "每日查看", "channels": [{"channel_id": "from-group", "name": "分组号"}]},
+    ]
+
+    def fake_fetch(endpoint, channel_ids, label, timeout=30, since_ts=None):
+        calls.append((endpoint, tuple(channel_ids), label))
+        return ([], 1, "done")
+
+    monkeypatch.delenv("INFO2ACTION_LINGOWHALE_REGISTRY_ONLY", raising=False)
+    monkeypatch.setattr(lw, "_priority_channel_ids", lambda: [])
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {})
+    monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_fetch)
+    monkeypatch.setattr(lw.time, "sleep", lambda seconds: None)
+
+    result = lw.fetch_subscription_feed(groups_info)
+
+    assert result == []
+    assert calls == []
+
+
+def test_fetch_subscription_feed_registry_error_fails_closed(monkeypatch):
+    import fetch_lingowhale as lw
+    import remote_db
+
+    fail_open_values = []
+
+    def fail_registry(platform, *, fail_open=True):
+        fail_open_values.append(fail_open)
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.delenv("INFO2ACTION_LINGOWHALE_REGISTRY_ONLY", raising=False)
+    monkeypatch.setattr(remote_db, "fetch_write_to_remote", lambda: True)
+    monkeypatch.setattr(remote_db, "list_active_sources_remote", fail_registry)
+    monkeypatch.setattr(
+        lw,
+        "_fetch_subscription_feed_from_endpoint",
+        lambda *args, **kwargs: pytest.fail("called a feed endpoint after registry failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="registry unavailable"):
+        lw.fetch_subscription_feed(groups_info=None)
+
+    assert fail_open_values == [False]
+
+
+def test_fetch_subscription_feed_ignores_retired_legacy_override(monkeypatch):
+    import fetch_lingowhale as lw
+
+    calls = []
+    groups_info = [
+        {"name": "每日查看", "channels": [{"channel_id": "from-group", "name": "分组号"}]},
+    ]
+
+    def fake_fetch(endpoint, channel_ids, label, timeout=30, since_ts=None):
+        calls.append((endpoint, tuple(channel_ids), label))
+        return ([], 1, "done")
+
+    monkeypatch.setenv("INFO2ACTION_LINGOWHALE_REGISTRY_ONLY", "0")
+    monkeypatch.setattr(lw, "_priority_channel_ids", lambda: [])
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {"from-registry": 10})
+    monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_fetch)
+    monkeypatch.setattr(lw, "_record_lingowhale_result", lambda source_id, *, ok, error=None: None)
+    monkeypatch.setattr(lw.time, "sleep", lambda seconds: None)
+
+    lw.fetch_subscription_feed(groups_info)
+
+    assert calls == [(lw.FEED_ENDPOINTS[0], ("from-registry",), "channel 1/1")]
+
+
+def test_fetch_subscription_feed_records_registry_channel_success(monkeypatch):
+    import fetch_lingowhale as lw
+
+    records = []
+    groups_info = [
+        {
+            "name": "每日查看",
+            "channels": [
+                {"channel_id": "mapped-channel", "name": "已登记"},
+                {"channel_id": "unmapped-channel", "name": "未登记"},
+            ],
+        },
+    ]
+
+    def fake_fetch(endpoint, channel_ids, label, timeout=30, since_ts=None):
+        channel_id = channel_ids[0]
+        if channel_id == "all":
+            return ([], 1, "legacy")
+        return ([{"entry_id": f"{channel_id}-1", "pub_time": 1}], 1, "done")
+
+    def fake_record(source_id, *, ok, error=None):
+        records.append((source_id, ok, error))
+
+    monkeypatch.setattr(lw, "_priority_channel_ids", lambda: [])
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {"mapped-channel": 42}, raising=False)
+    monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_fetch)
+    monkeypatch.setattr(lw, "_record_lingowhale_result", fake_record, raising=False)
+    monkeypatch.setattr(lw.time, "sleep", lambda seconds: None)
+
+    lw.fetch_subscription_feed(groups_info)
+
+    assert records == [(42, True, None)]
+
+
+def test_lingowhale_result_fallback_uses_remote_authority(monkeypatch):
+    import db
+    import fetch_lingowhale as lw
+    import ingest
+    import remote_db
+
+    calls = []
+    monkeypatch.delattr(ingest, "record_source_fetch_result_current_backend")
+    monkeypatch.setattr(remote_db, "fetch_write_to_remote", lambda: True)
+    monkeypatch.setattr(db, "_broken_after_threshold", lambda: 7)
+    monkeypatch.setattr(
+        remote_db,
+        "record_source_fetch_result_remote",
+        lambda source_id, **kwargs: calls.append((source_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        db,
+        "get_conn",
+        lambda: (_ for _ in ()).throw(AssertionError("local sqlite must not be opened")),
+    )
+
+    lw._record_lingowhale_result(42, ok=False, error="remote failure")
+
+    assert calls == [
+        (42, {"ok": False, "error": "remote failure", "broken_after": 7})
+    ]
+
+
+def test_fetch_subscription_feed_skips_result_record_when_registry_map_empty(monkeypatch):
+    import fetch_lingowhale as lw
+
+    records = []
+    groups_info = [
+        {"name": "每日查看", "channels": [{"channel_id": "from-group", "name": "分组号"}]},
+    ]
+
+    def fake_fetch(endpoint, channel_ids, label, timeout=30, since_ts=None):
+        return ([], 1, "done")
+
+    monkeypatch.setattr(lw, "_priority_channel_ids", lambda: [])
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {}, raising=False)
+    monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_fetch)
+    monkeypatch.setattr(
+        lw,
+        "_record_lingowhale_result",
+        lambda source_id, *, ok, error=None: records.append((source_id, ok, error)),
+        raising=False,
+    )
+    monkeypatch.setattr(lw.time, "sleep", lambda seconds: None)
+
+    lw.fetch_subscription_feed(groups_info)
+
+    assert records == []
+
+
 def test_registry_sources_uses_remote_when_fetch_write_enabled(monkeypatch):
     import db
     import fetch_feeds
@@ -474,8 +747,65 @@ def test_fetch_reddit_http_error_records_failure(tmp_db, tmp_path, monkeypatch):
     try:
         row = _source_row(conn, source_id)
         assert row["consecutive_failures"] == 2
-        assert row["last_error"] == "HTTP 403"
+        assert row["last_error"] == "JSON HTTP 403; RSS HTTP 403"
         assert row["last_success_at"] is None
+    finally:
+        conn.close()
+
+
+def test_fetch_reddit_json_403_falls_back_to_rss_success(tmp_db, tmp_path, monkeypatch):
+    import db
+    import fetch_feeds
+
+    monkeypatch.setenv("INFO2ACTION_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(fetch_feeds, "CONFIG", {"reddit": {"count": 1}})
+    monkeypatch.setattr(fetch_feeds.time, "sleep", lambda seconds: None)
+    _patch_local_fetch_backend(monkeypatch)
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if url.endswith("/.rss"):
+            return _FakeResponse(status_code=200, content=b"<rss />")
+        return _FakeResponse(status_code=403, json_data={})
+
+    _patch_requests_get(monkeypatch, fake_get)
+    monkeypatch.setitem(
+        sys.modules,
+        "feedparser",
+        SimpleNamespace(
+            parse=lambda content: SimpleNamespace(entries=[{
+                "id": "t3_abc",
+                "title": "RSS fallback post",
+                "link": "https://www.reddit.com/r/OpenAI/comments/abc/post/",
+                "author": "rss-user",
+                "summary": "Fallback body",
+                "published": "2026-07-06T00:00:00Z",
+            }]),
+        ),
+    )
+
+    conn = db.get_conn()
+    source_id = _insert_source(conn, "reddit", "OpenAI")
+    _set_source_failures(conn, source_id, 3)
+    conn.close()
+
+    fetch_feeds.fetch_reddit()
+
+    assert calls == [
+        "https://www.reddit.com/r/OpenAI/hot.json?limit=1",
+        "https://www.reddit.com/r/OpenAI/.rss",
+    ]
+    posts = json.loads((tmp_path / "sources" / "reddit" / "OpenAI.json").read_text())
+    assert posts[0]["id"] == "abc"
+    assert posts[0]["title"] == "RSS fallback post"
+
+    conn = db.get_conn()
+    try:
+        row = _source_row(conn, source_id)
+        assert row["consecutive_failures"] == 0
+        assert row["last_success_at"]
+        assert row["last_error"] is None
     finally:
         conn.close()
 

@@ -7,6 +7,7 @@ import argparse
 import email.utils
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -30,6 +31,7 @@ sys.path.insert(0, BASE_DIR)
 import ai_provider_guard
 import ai_bolding
 import db
+import highlight_score_v26
 import highlight_verdict
 import remote_db
 import generate_summaries
@@ -50,6 +52,8 @@ RUN_ITEMS_SCOPE_CHOICES = (RUN_ITEMS_SCOPE_TAGGED, RUN_ITEMS_SCOPE_INSERTED)
 # 这里在 LLM 输入阶段再压一次,留出 buffer 给 title/description/metadata,
 # 总输入 ≈ readme_chars + 5000 buffer < ai_summary.max_tokens(100000)。
 GITHUB_README_ENRICH_MAX_CHARS = 80_000
+GITHUB_README_V26_MAX_CHARS = 8_000
+HIGHLIGHT_V26_PASS2_DAILY_CAP_DEFAULT = 500
 
 logger = logging.getLogger(__name__)
 _SSL_CTX = ssl.create_default_context()
@@ -236,6 +240,23 @@ class MiniMaxRateLimitGate:
 
 
 _MINIMAX_RATE_GATE = MiniMaxRateLimitGate()
+_HIGHLIGHT_V26_PASS2_LOCK = threading.Lock()
+_HIGHLIGHT_V26_PASS2_USAGE = {"day": None, "count": 0}
+
+
+def _claim_highlight_v26_pass2_slot() -> bool:
+    day = datetime.now(timezone.utc).date().isoformat()
+    daily_cap = _positive_int_env(
+        "INFO2ACTION_HIGHLIGHT_V26_PASS2_DAILY_CAP",
+        HIGHLIGHT_V26_PASS2_DAILY_CAP_DEFAULT,
+    )
+    with _HIGHLIGHT_V26_PASS2_LOCK:
+        if _HIGHLIGHT_V26_PASS2_USAGE.get("day") != day:
+            _HIGHLIGHT_V26_PASS2_USAGE.update(day=day, count=0)
+        if _HIGHLIGHT_V26_PASS2_USAGE["count"] >= daily_cap:
+            return False
+        _HIGHLIGHT_V26_PASS2_USAGE["count"] += 1
+        return True
 
 
 def _parse_retry_after_seconds(exc: urllib.error.HTTPError) -> float | None:
@@ -817,6 +838,38 @@ def build_item_content(item: dict, *, content_char_limit: int = 12000) -> str:
     return base
 
 
+def build_item_content_v26(item: dict) -> str:
+    """Build the v26 scoring input with quoted tweets and GitHub README."""
+    detail_raw = item.get("detail_json")
+    try:
+        detail = json.loads(detail_raw) if isinstance(detail_raw, str) else detail_raw
+    except (TypeError, ValueError):
+        detail = {}
+    if not isinstance(detail, dict):
+        detail = {}
+
+    base_item = item
+    if "readme" in detail:
+        base_item = dict(item)
+        base_detail = dict(detail)
+        base_detail.pop("readme", None)
+        base_item["detail_json"] = base_detail
+
+    sections = [build_item_content(base_item)]
+    quoted_tweet = detail.get("quotedTweet")
+    if isinstance(quoted_tweet, dict):
+        quoted_text = quoted_tweet.get("text")
+        if isinstance(quoted_text, str) and quoted_text.strip():
+            sections.append(f"quoted: {quoted_text.strip()}")
+
+    if (item.get("platform") or "").lower() == "github":
+        readme = detail.get("readme")
+        if isinstance(readme, str) and readme.strip():
+            sections.append(f"readme: {readme[:GITHUB_README_V26_MAX_CHARS]}")
+
+    return "\n\n".join(sections)
+
+
 def _minimal_item_content(item: dict) -> str:
     meta = {
         "platform": item.get("platform") or "",
@@ -1045,6 +1098,24 @@ def write_highlight_verdict_current(item_id: str, result: dict) -> None:
         )
 
 
+def write_highlight_score_v26_current(
+    item_id: str,
+    result: dict,
+    threshold: float,
+) -> None:
+    """Write the v26 score to Supabase when remote enrichment is enabled."""
+    if remote_db.enrich_to_remote():
+        _with_remote_db_transient_retry(
+            "write_highlight_score_v26_remote",
+            lambda: remote_db.write_highlight_score_v26_remote(
+                None,
+                item_id,
+                result,
+                threshold=threshold,
+            ),
+        )
+
+
 def record_highlight_verdict_failure_current(
     item_id: str,
     error: str,
@@ -1088,6 +1159,146 @@ def enrich_highlight_verdict_for_item(
         if not dry_run:
             record_highlight_verdict_failure_current(item["id"], str(exc)[:500])
         return None
+
+
+def enrich_highlight_score_v26_for_item(
+    item: dict,
+    api_key: str,
+    api_base: str,
+    model: str,
+    *,
+    threshold: float,
+    dry_run: bool,
+    rate_gate: MiniMaxRateLimitGate | None = None,
+) -> dict | None:
+    try:
+        system_prompt = load_prompt(highlight_score_v26.PROMPT_FILE)
+        if not system_prompt:
+            raise ValueError(f"missing prompt: {highlight_score_v26.PROMPT_FILE}")
+        item_content = build_item_content_v26(item)
+        raw = call_minimax(
+            api_key,
+            api_base,
+            model,
+            system_prompt,
+            item_content,
+            max_tokens=2048,
+            rate_gate=rate_gate,
+            temperature=0.0,
+        )
+        result = highlight_score_v26.normalize_score_result(raw)
+        if result.get("error"):
+            raise ValueError(result["error"])
+        score10 = highlight_score_v26.compute_score10(result)
+        result["runs"] = [score10]
+
+        if (
+            score10 is not None
+            and abs(score10 - threshold) <= 1.0
+            and _claim_highlight_v26_pass2_slot()
+        ):
+            try:
+                pass2_raw = call_minimax(
+                    api_key,
+                    api_base,
+                    model,
+                    system_prompt,
+                    item_content,
+                    max_tokens=2048,
+                    rate_gate=rate_gate,
+                    temperature=0.0,
+                )
+                pass2_result = highlight_score_v26.normalize_score_result(pass2_raw)
+                if pass2_result.get("error"):
+                    raise ValueError(pass2_result["error"])
+                pass2_score10 = highlight_score_v26.compute_score10(pass2_result)
+                if pass2_score10 is None:
+                    raise ValueError("score10_missing")
+                if pass2_score10 < score10:
+                    result = pass2_result
+                result["runs"] = [score10, pass2_score10]
+                score10 = round((score10 + pass2_score10) / 2, 2)
+                logger.info(
+                    "highlight_v26_pass2 item_id=%s s1=%s s2=%s",
+                    item.get("id"),
+                    result["runs"][0],
+                    result["runs"][1],
+                )
+            except Exception as exc:
+                result["pass2_error"] = str(exc)[:500]
+
+        result["score10"] = score10
+        result["is_flag_bearer"] = highlight_score_v26.is_flag_bearer(
+            result,
+            score10,
+            threshold,
+        )
+        if not dry_run:
+            write_highlight_score_v26_current(item["id"], result, threshold)
+        return result
+    except Exception as exc:
+        if not dry_run:
+            record_highlight_verdict_failure_current(item["id"], str(exc)[:500])
+        return None
+
+
+def resolve_highlight_scorer_config() -> tuple[str, float | None]:
+    project_env = load_project_env(BASE_DIR)
+    scorer = (
+        os.environ.get("INFO2ACTION_HIGHLIGHT_SCORER")
+        or project_env.get("INFO2ACTION_HIGHLIGHT_SCORER")
+        or "v38"
+    ).strip().lower()
+    if scorer == "v38":
+        return scorer, None
+    if scorer != "v26":
+        raise ValueError(
+            "INFO2ACTION_HIGHLIGHT_SCORER must be 'v38' or 'v26'"
+        )
+
+    raw_threshold = (
+        os.environ.get("INFO2ACTION_HIGHLIGHT_V26_THRESHOLD")
+        or project_env.get("INFO2ACTION_HIGHLIGHT_V26_THRESHOLD")
+    )
+    try:
+        threshold = float(raw_threshold) if raw_threshold and raw_threshold.strip() else None
+    except (TypeError, ValueError):
+        threshold = None
+    if threshold is None or not math.isfinite(threshold):
+        raise ValueError(
+            "INFO2ACTION_HIGHLIGHT_V26_THRESHOLD must be a finite float when v26 is enabled"
+        )
+    return scorer, threshold
+
+
+def enrich_highlight_score_for_item(
+    item: dict,
+    api_key: str,
+    api_base: str,
+    model: str,
+    *,
+    dry_run: bool,
+    rate_gate: MiniMaxRateLimitGate | None = None,
+) -> dict | None:
+    scorer, threshold = resolve_highlight_scorer_config()
+    if scorer == "v26":
+        return enrich_highlight_score_v26_for_item(
+            item,
+            api_key,
+            api_base,
+            model,
+            threshold=threshold,
+            dry_run=dry_run,
+            rate_gate=rate_gate,
+        )
+    return enrich_highlight_verdict_for_item(
+        item,
+        api_key,
+        api_base,
+        model,
+        dry_run=dry_run,
+        rate_gate=rate_gate,
+    )
 
 
 def record_failure(item_id: str, error: str, retry_after=30 * 60, increment=True) -> None:
@@ -1158,7 +1369,7 @@ def enrich_one_item(
         raise ValueError("missing summary")
     if not dry_run:
         write_enrichment_current(item["id"], parsed)
-        enrich_highlight_verdict_for_item(
+        enrich_highlight_score_for_item(
             item,
             api_key,
             api_base,
@@ -1202,7 +1413,7 @@ def enrich_batch_items(
             raise ValueError(f"missing batch enrichment for {item['id']}")
         if not dry_run:
             write_enrichment_current(item["id"], parsed)
-            enrich_highlight_verdict_for_item(
+            enrich_highlight_score_for_item(
                 item,
                 api_key,
                 api_base,
@@ -1310,6 +1521,8 @@ def main() -> int:
                         help="override MiniMax chat shared request gate interval")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    resolve_highlight_scorer_config()
 
     config = load_config()
     classification = load_classification()

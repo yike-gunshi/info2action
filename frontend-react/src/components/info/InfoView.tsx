@@ -104,7 +104,8 @@ export function InfoView() {
         groupBy={groupBy}
         onGroupByChange={handleChange}
       />
-      <div className="min-w-0 pt-3" data-testid="info-view-content">
+      {/* v24 §21.3: 内容宽统一 1168（消掉 1200/1168 双基准） */}
+      <div className="mx-auto w-full min-w-0 max-w-[1168px] pt-3" data-testid="info-view-content">
         {groupBy === 'platform' ? (
           <ChannelsView embedded />
         ) : (

@@ -6,6 +6,7 @@ import type { ClusterDetail, ClusterSource } from '../../../lib/types'
 
 const closeModal = vi.fn()
 const toggleClusterStar = vi.fn()
+const submitClusterFeedback = vi.fn()
 const originalClipboard = navigator.clipboard
 const originalExecCommand = document.execCommand
 
@@ -59,6 +60,7 @@ vi.mock('../../../store/clusterDetailStore', () => ({
       error: null,
       closeModal,
       toggleClusterStar,
+      submitClusterFeedback,
     }),
 }))
 
@@ -197,7 +199,7 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     expect(screen.queryByText('\u8bed\u9cb8')).not.toBeInTheDocument()
   })
 
-  it('右上只保留关闭,底部三栏展示收藏 / 跳转详情 / 分享', () => {
+  it('右上只保留关闭,底部三栏只展示收藏 / 跳转详情 / 分享 (bf-0711 #1: 反馈已下沉正文)', () => {
     render(<ClusterDetailPanel />)
 
     expect(screen.queryByText('原文')).not.toBeInTheDocument()
@@ -217,6 +219,8 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     expect(screen.getByTestId('cluster-footer-star-button')).toHaveTextContent('收藏')
     expect(screen.getByTestId('cluster-footer-detail-button')).toHaveTextContent('跳转详情')
     expect(screen.getByTestId('cluster-footer-share-button')).toHaveTextContent('分享')
+    // bf-0711 #1: 反馈按钮不再在底部主操作栏内
+    expect(actions).not.toContainElement(screen.getByTestId('cluster-feedback-irrelevant'))
 
     fireEvent.click(screen.getByTestId('cluster-footer-detail-button'))
     expect(window.location.hash).toBe('#cluster=42')
@@ -627,5 +631,67 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     })
     expect(closeModal).toHaveBeenCalledTimes(1)
     vi.useRealTimers()
+  })
+})
+
+describe('v25.0 F-D — 弹窗操作条质量反馈(DESIGN.md 22.3)', () => {
+  afterEach(() => {
+    cluster.viewer_status = {
+      clicked_at: null,
+      last_seen_version: null,
+      starred_at: null,
+    }
+    submitClusterFeedback.mockReset()
+    vi.mocked(toast.success).mockReset()
+    vi.mocked(toast.error).mockReset()
+    cleanup()
+  })
+
+  it('默认渲染两个反馈按钮,未选中态', () => {
+    render(<ClusterDetailPanel />)
+    const irrelevant = screen.getByTestId('cluster-feedback-irrelevant')
+    const lowQuality = screen.getByTestId('cluster-feedback-low-quality')
+    expect(irrelevant).toHaveTextContent('不感兴趣')
+    expect(irrelevant).toHaveAttribute('aria-pressed', 'false')
+    expect(lowQuality).toHaveTextContent('质量差')
+    expect(lowQuality).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('点击「质量差」→ 调 store 提交并 toast 确认', async () => {
+    submitClusterFeedback.mockResolvedValue({ ok: true, feedback_kind: 'low_quality' })
+    render(<ClusterDetailPanel />)
+    fireEvent.click(screen.getByTestId('cluster-feedback-low-quality'))
+    await waitFor(() => {
+      expect(submitClusterFeedback).toHaveBeenCalledWith(42, 'low_quality')
+      expect(toast.success).toHaveBeenCalledWith('已收到反馈')
+    })
+  })
+
+  it('已反馈态: ✓ 前缀 + brand 墨水 + aria-pressed;再点同项 toast 撤销文案', async () => {
+    cluster.viewer_status = {
+      clicked_at: null,
+      last_seen_version: null,
+      starred_at: null,
+      feedback_kind: 'irrelevant',
+    }
+    submitClusterFeedback.mockResolvedValue({ ok: true, feedback_kind: null })
+    render(<ClusterDetailPanel />)
+    const btn = screen.getByTestId('cluster-feedback-irrelevant')
+    expect(btn).toHaveTextContent('✓ 不感兴趣')
+    expect(btn).toHaveAttribute('aria-pressed', 'true')
+    expect(btn.className).toContain('text-[var(--brand)]')
+    fireEvent.click(btn)
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith('已撤销反馈')
+    })
+  })
+
+  it('请求失败 → toast 报错(store 侧负责回滚)', async () => {
+    submitClusterFeedback.mockRejectedValue(new Error('boom'))
+    render(<ClusterDetailPanel />)
+    fireEvent.click(screen.getByTestId('cluster-feedback-irrelevant'))
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith('反馈失败，请重试')
+    })
   })
 })

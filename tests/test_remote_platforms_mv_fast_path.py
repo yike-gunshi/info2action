@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
 import sys
 import types
@@ -591,7 +592,12 @@ class _InfoReadModelIncrementalConn(_InfoReadModelBuildConn):
                 "version_id": self.active_version,
                 "generated_at": "2026-05-24T01:00:00+00:00",
                 "max_fetched_at": self.active_max,
-                "meta_json": {"sort_policy": remote_db.INFO_READ_MODEL_SORT_POLICY},
+                "meta_json": {"sort_policy": remote_db.INFO_READ_MODEL_SORT_POLICY, "scope_profile": remote_db.INFO_READ_MODEL_SCOPE_PROFILE},
+            })
+        if "AS min_start" in normalized:  # BF-0710-1 时间窗探针:窗口盖到 now → 单轮追平
+            return _FakeOneResult({
+                "min_start": datetime(2026, 5, 24, 1, 30, tzinfo=timezone.utc),
+                "now_ts": datetime(2026, 5, 24, 3, 0, tzinfo=timezone.utc),
             })
         if "SELECT count(*) AS n, max(fetched_at) AS max_fetched_at FROM pg_temp.info_read_model_delta" in normalized:
             return _FakeOneResult({"n": 2, "max_fetched_at": self.delta_max})
@@ -681,7 +687,7 @@ class _InfoReadModelPrewarmConn(_InfoReadModelConn):
                 "version_id": self.version,
                 "generated_at": self.generated_at,
                 "max_fetched_at": self.max_fetched_at,
-                "meta_json": {"sort_policy": remote_db.INFO_READ_MODEL_SORT_POLICY},
+                "meta_json": {"sort_policy": remote_db.INFO_READ_MODEL_SORT_POLICY, "scope_profile": remote_db.INFO_READ_MODEL_SCOPE_PROFILE},
             })
         if "hot_scopes AS" in normalized:
             return _FakeResult([
@@ -876,7 +882,6 @@ def test_query_feed_platforms_live_path_uses_full_counts_not_sample_rows(monkeyp
         yield conn
 
     monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "_platforms_mv_available", lambda _conn, _schema: True)
     monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
     monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
 
@@ -965,74 +970,6 @@ def test_query_feed_platforms_uses_info_read_model_when_enabled(monkeypatch):
     remote_db.clear_feed_cache_keys()
 
 
-def test_query_feed_platforms_search_uses_info_read_model(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoSearchReadModelConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_platforms(
-        per_platform=50,
-        search="claude",
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["read_model"] == "info_search_v1"
-    assert conn.sqls[0] == "SET LOCAL statement_timeout = '8000ms'"
-    assert result["sections"]["twitter"][0]["id"] == "tw_search_1"
-    assert result["platform_counts"] == {"twitter": 2}
-    assert result["source_counts"] == {"twitter": {"following": 2}}
-    assert result["category_counts"] == {"twitter": {"ai": 2}}
-    card_sql = next(sql for sql in conn.sqls if "PARTITION BY mc.platform" in sql and "search_like" in sql)
-    assert "matched_cards AS MATERIALIZED" in card_sql
-    assert "ci.search_text ILIKE %(search_like)s" in card_sql
-    assert "info_scope_items" not in card_sql
-    assert "ORDER BY mc.sort_at DESC NULLS LAST" in card_sql
-    assert "pr.card_json" in card_sql
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_platforms_search_does_not_fall_back_to_live_items_when_read_model_times_out(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoSearchReadModelTimeoutConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_platforms(
-        per_platform=50,
-        search="claude",
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["degraded"] is True
-    assert result["degraded_reason"] == "info_search_read_model_unavailable"
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
 def test_query_feed_platforms_logged_in_merges_private_manual_overlay(monkeypatch):
     remote_db.clear_feed_cache_keys()
     conn = _InfoReadModelManualOverlayConn()
@@ -1062,214 +999,6 @@ def test_query_feed_platforms_logged_in_merges_private_manual_overlay(monkeypatc
     assert result["category_counts"]["manual"]["products"] == 1
     assert result["sections"]["manual"][0]["id"] == "manual_private"
     assert any("i.platform = 'manual'" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_platforms_live_overlay_prepends_recent_items(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoReadModelLiveOverlayConn([
-        _row(
-            "tw_live_new",
-            source="following",
-            category="ai",
-            fetched_at="2026-05-24T02:00:00+00:00",
-            published_at="2026-05-24T02:00:00+00:00",
-        )
-    ])
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-    monkeypatch.setenv(remote_db.INFO_READ_MODEL_LIVE_OVERLAY_ENV, "1")
-    monkeypatch.setenv(remote_db.INFO_READ_MODEL_LIVE_OVERLAY_LIMIT_ENV, "10")
-
-    result = remote_db.query_feed_platforms(
-        per_platform=50,
-        search=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["sections"]["twitter"][0]["id"] == "tw_live_new"
-    assert result["sections"]["twitter"][1]["id"] == "tw_rm_1"
-    assert result["platform_counts"]["twitter"] == 121
-    assert result["source_counts"]["twitter"]["following"] == 81
-    assert result["category_counts"]["twitter"]["ai"] == 91
-    assert result["overview_max_fetched_at"] == "2026-05-24T02:00:00Z"
-    assert result["live_overlay"] is True
-    assert result["live_overlay_count"] == 1
-    assert result["live_overlay_enabled"] is True
-    assert result["live_overlay_after"] == "2026-05-22T07:55:00Z"
-    assert result["live_overlay_limit"] == 10
-    assert result["live_overlay_per_scope_limit"] == 10
-    assert result["live_overlay_timeout_ms"] == 1500
-    assert result["live_overlay_attempted"] is True
-    assert result["live_overlay_latest_fetched_at"] == "2026-05-24T02:00:00Z"
-    assert conn.commits >= 1
-    assert "SET LOCAL idle_in_transaction_session_timeout = '5000ms'" in conn.sqls
-    assert result["platform_next_cursors"]["twitter"] == {
-        "version_id": conn.version,
-        "scope_key": "platform=twitter|dimension=all|value=",
-        "rank_after": 1,
-        "exclude_ids": ["tw_live_new", "tw_rm_1"],
-    }
-
-    overlay_sql = next(sql for sql in conn.sqls if "FROM remote_poc.items i" in sql)
-    assert "i.fetched_at > %(overlay_after)s::timestamptz" in overlay_sql
-    assert "WITH recent AS MATERIALIZED" in overlay_sql
-    assert "PARTITION BY recent.platform" in overlay_sql
-    assert "ORDER BY COALESCE(i.published_at, i.fetched_at) DESC" in overlay_sql
-    assert "LIMIT %(overlay_limit)s" in overlay_sql
-    assert "overlay_rn <= %(overlay_per_scope_limit)s" in overlay_sql
-    assert not any("GROUP BY" in sql for sql in conn.sqls if "FROM remote_poc.items i" in sql)
-
-    sql_count_after_first_call = len(conn.sqls)
-    cached_probe = remote_db.query_feed_platforms(
-        per_platform=50,
-        search=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert cached_probe["live_overlay_enabled"] is True
-    assert cached_probe["sections"]["twitter"][0]["id"] == "tw_live_new"
-    assert len(conn.sqls) == sql_count_after_first_call
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_info_live_overlay_section_cursor_excludes_visible_ids():
-    base_items = [
-        _row(
-            f"prod_rm_{idx}",
-            category="products",
-            ai_categories=["products"],
-            fetched_at=f"2026-05-23T00:{idx:02d}:00+00:00",
-        )
-        for idx in range(1, 51)
-    ]
-    base_items[47]["id"] = "prod_late_dup"
-    overlay_items = [
-        _row(
-            f"prod_live_{idx}",
-            category="products",
-            ai_categories=["products"],
-            fetched_at=f"2026-05-24T02:{idx:02d}:00+00:00",
-        )
-        for idx in range(1, 6)
-    ]
-    overlay_items.append(
-        _row(
-            "prod_late_dup",
-            category="products",
-            ai_categories=["products"],
-            fetched_at="2026-05-24T03:00:00+00:00",
-        )
-    )
-    result = {
-        "sections": {"products": base_items},
-        "cat_counts": {"products": 80},
-        "sample_limit": 50,
-        "section_next_cursors": {
-            "products": {
-                "version_id": "version-1",
-                "scope_key": "platform=_all|dimension=section_category|value=products",
-                "rank_after": 50,
-            }
-        },
-    }
-
-    merged = remote_db._merge_info_live_overlay_sections(result, overlay_items)
-
-    cursor = merged["section_next_cursors"]["products"]
-    assert cursor["rank_after"] == 45
-    assert "prod_late_dup" in cursor["exclude_ids"]
-    assert "prod_live_1" in cursor["exclude_ids"]
-    assert len(merged["sections"]["products"]) == 50
-
-
-def test_info_live_overlay_merge_sorts_by_original_article_time():
-    base_items = [
-        _row(
-            "published_newer",
-            category="products",
-            ai_categories=["products"],
-            fetched_at="2026-05-23T00:00:00+00:00",
-            published_at="2026-05-24T01:00:00+00:00",
-        )
-    ]
-    overlay_items = [
-        _row(
-            "fetched_newer_but_published_older",
-            category="products",
-            ai_categories=["products"],
-            fetched_at="2026-05-24T03:00:00+00:00",
-            published_at="2026-05-20T00:00:00+00:00",
-        )
-    ]
-    result = {
-        "sections": {"products": base_items},
-        "cat_counts": {"products": 2},
-        "sample_limit": 50,
-        "section_next_cursors": {},
-    }
-
-    merged = remote_db._merge_info_live_overlay_sections(result, overlay_items)
-
-    assert [item["id"] for item in merged["sections"]["products"]] == [
-        "published_newer",
-        "fetched_newer_but_published_older",
-    ]
-
-
-def test_query_feed_by_category_cursor_excludes_live_overlay_duplicates(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoReadModelConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_by_category(
-        category="products",
-        offset=50,
-        limit=50,
-        cursor={
-            "version_id": conn.version,
-            "scope_key": "platform=_all|dimension=section_category|value=products",
-            "rank_after": 45,
-            "exclude_ids": ["prod_late_dup"],
-        },
-        keyword=None,
-        search=None,
-        subcategory=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    page_sql = next(sql for sql in conn.sqls if "WITH active_version AS" in sql and "page_rows AS" in sql)
-    page_params = next(params for params in conn.params if (params or {}).get("exclude_ids") == ["prod_late_dup"])
-    assert "NOT (si.item_id = ANY(%(exclude_ids)s))" in page_sql
-    assert "LIMIT %(limit)s" in page_sql
-    assert page_params["offset"] == 45
-    assert result["next_cursor"]["exclude_ids"] == ["prod_late_dup"]
 
     remote_db.clear_feed_cache_keys()
 
@@ -1337,192 +1066,6 @@ def test_query_feed_sections_uses_info_read_model_when_enabled(monkeypatch):
     assert [item["id"] for item in page["items"]] == ["prod_recent", "prod_older"]
     assert page["read_model"] == "info_platforms_v1"
     assert page["next_offset"] is None
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_sections_live_overlay_prepends_recent_items(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoReadModelLiveOverlayConn([
-        _row(
-            "prod_recent",
-            category="products",
-            ai_categories=["products"],
-            fetched_at="2026-05-24T02:10:00+00:00",
-            published_at="2026-05-24T02:10:00+00:00",
-        )
-    ])
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-    monkeypatch.setenv(remote_db.INFO_READ_MODEL_LIVE_OVERLAY_ENV, "1")
-    monkeypatch.setenv(remote_db.INFO_READ_MODEL_LIVE_OVERLAY_LIMIT_ENV, "10")
-
-    result = remote_db.query_feed_sections(
-        per_category=50,
-        search=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert [item["id"] for item in result["sections"]["products"][:3]] == [
-        "prod_recent",
-        "prod_older",
-    ]
-    assert result["sections"]["products"][0]["fetched_at"] == "2026-05-24T02:10:00Z"
-    assert result["cat_counts"]["products"] == 2
-    assert result["total"] == 2
-    assert result["overview_max_fetched_at"] == "2026-05-24T02:10:00Z"
-    assert result["live_overlay"] is True
-    assert result["live_overlay_count"] == 1
-    assert result["live_overlay_enabled"] is True
-    assert result["live_overlay_after"] == "2026-05-22T07:55:00Z"
-    assert result["live_overlay_limit"] == 10
-    assert result["live_overlay_per_scope_limit"] == 10
-    assert result["live_overlay_timeout_ms"] == 1500
-    assert result["live_overlay_attempted"] is True
-    assert result["live_overlay_latest_fetched_at"] == "2026-05-24T02:10:00Z"
-    assert conn.commits >= 1
-    assert "SET LOCAL idle_in_transaction_session_timeout = '5000ms'" in conn.sqls
-
-    overlay_sql = next(sql for sql in conn.sqls if "FROM remote_poc.items i" in sql)
-    assert "i.fetched_at > %(overlay_after)s::timestamptz" in overlay_sql
-    assert "WITH recent AS MATERIALIZED" in overlay_sql
-    assert "PARTITION BY recent.section_category" in overlay_sql
-    assert "ORDER BY COALESCE(i.published_at, i.fetched_at) DESC" in overlay_sql
-    assert "LIMIT %(overlay_limit)s" in overlay_sql
-    assert "overlay_rn <= %(overlay_per_scope_limit)s" in overlay_sql
-    assert not any("GROUP BY" in sql for sql in conn.sqls if "FROM remote_poc.items i" in sql)
-
-    sql_count_after_first_call = len(conn.sqls)
-    cached_probe = remote_db.query_feed_sections(
-        per_category=50,
-        search=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert cached_probe["live_overlay_enabled"] is True
-    assert cached_probe["sections"]["products"][0]["id"] == "prod_recent"
-    assert len(conn.sqls) == sql_count_after_first_call
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_sections_search_uses_info_read_model(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoSearchReadModelConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_sections(
-        per_category=50,
-        search="claude",
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["read_model"] == "info_search_v1"
-    assert conn.sqls[0] == "SET LOCAL statement_timeout = '8000ms'"
-    assert result["sections"]["products"][0]["id"] == "prod_search_1"
-    assert result["cat_counts"] == {"products": 2}
-    assert result["total"] == 2
-    search_sql = next(sql for sql in conn.sqls if "PARTITION BY mc.category" in sql and "search_like" in sql)
-    assert "matched_cards AS MATERIALIZED" in search_sql
-    assert "ci.search_text ILIKE %(search_like)s" in search_sql
-    assert "info_scope_items" not in search_sql
-    assert "ORDER BY mc.sort_at DESC NULLS LAST" in search_sql
-    assert "pr.card_json" in search_sql
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_sections_search_does_not_fall_back_to_live_items_when_read_model_times_out(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoSearchReadModelTimeoutConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_sections(
-        per_category=50,
-        search="claude",
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["degraded"] is True
-    assert result["degraded_reason"] == "info_search_read_model_unavailable"
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_sections_search_degraded_result_is_not_cached(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    timeout_conn = _InfoSearchReadModelTimeoutConn()
-    ok_conn = _InfoSearchReadModelConn()
-    current = {"conn": timeout_conn}
-
-    @contextmanager
-    def fake_connect():
-        yield current["conn"]
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    degraded = remote_db.query_feed_sections(
-        per_category=50,
-        search="claude",
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-    assert degraded["degraded"] is True
-
-    current["conn"] = ok_conn
-    recovered = remote_db.query_feed_sections(
-        per_category=50,
-        search="claude",
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert recovered["read_model"] == "info_search_v1"
-    assert recovered["sections"]["products"][0]["id"] == "prod_search_1"
 
     remote_db.clear_feed_cache_keys()
 
@@ -1648,134 +1191,6 @@ def test_query_feed_by_category_logged_in_pages_private_manual_as_union(monkeypa
     assert second_page["offset"] == 1
     assert second_page["next_cursor"] is None
     assert any("i.platform = 'manual'" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_by_category_uses_section_read_model_for_more(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoReadModelConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_by_category(
-        category="products",
-        offset=50,
-        limit=50,
-        keyword=None,
-        search=None,
-        subcategory=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["read_model"] == "info_platforms_v1"
-    assert result["scope_dimension"] == "section_category"
-    assert result["total"] == 80
-    assert result["offset"] == 50
-    assert [item["id"] for item in result["items"]] == ["prod_rm_51"]
-    assert result["next_cursor"] == {
-        "version_id": conn.version,
-        "scope_key": "platform=_all|dimension=section_category|value=products",
-        "rank_after": 51,
-    }
-    assert any("sc.dimension = %(scope_dimension)s" in sql for sql in conn.sqls)
-    assert not any("si.rank > %(offset)s" in sql for sql in conn.sqls)
-    assert not any("si.rank <= %(end_rank)s" in sql for sql in conn.sqls)
-    assert any("ORDER BY si.sort_at DESC NULLS LAST" in sql for sql in conn.sqls)
-    assert any("ORDER BY pr.sort_at DESC NULLS LAST" in sql for sql in conn.sqls)
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_by_category_search_uses_section_read_model(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoSearchReadModelConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_by_category(
-        category="products",
-        offset=0,
-        limit=50,
-        keyword=None,
-        search="claude",
-        subcategory=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["read_model"] == "info_search_v1"
-    assert result["scope_dimension"] == "section_category"
-    assert result["total"] == 2
-    assert result["items"][0]["id"] == "prod_search_page"
-    page_sql = next(sql for sql in conn.sqls if "summary.scope_count" in sql and "search_like" in sql)
-    pre_final_sql = page_sql.split(")\n                     SELECT av.version_id")[0]
-    assert "ci.search_text ILIKE %(search_like)s" in page_sql
-    assert "ci.card_json" not in pre_final_sql
-    assert "ORDER BY si.sort_at DESC NULLS LAST" in page_sql
-    assert "page_ci.card_json" in page_sql
-    assert any("scope_key = %(scope_key)s" in sql for sql in conn.sqls)
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_by_category_read_model_cursor_pins_version_and_rank(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoReadModelConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_by_category(
-        category="products",
-        offset=0,
-        limit=50,
-        cursor={
-            "version_id": "cursor-version-1",
-            "scope_key": "platform=_all|dimension=section_category|value=products",
-            "rank_after": 51,
-        },
-        keyword=None,
-        search=None,
-        subcategory=None,
-        user_id=None,
-        public_only=True,
-        manual_owner_user_id=None,
-        min_github_stars=50,
-    )
-
-    assert result["offset"] == 51
-    assert [item["id"] for item in result["items"]] == ["prod_rm_52"]
-    page_params = next(params for params in conn.params if (params or {}).get("cursor_version_id") == "cursor-version-1")
-    assert page_params["offset"] == 51
-    assert page_params["end_rank"] == 101
 
     remote_db.clear_feed_cache_keys()
 
@@ -1916,10 +1331,12 @@ def test_query_feed_by_category_missing_read_model_scope_falls_back_live(monkeyp
 
 def test_query_feed_by_category_reuses_canonical_section_cache_for_aliases(monkeypatch):
     remote_db.clear_feed_cache_keys()
+    # perf-v27 P4: 只有首页(offset=0)会被模型服务与缓存;别名规范化的缓存
+    # 复用契约在首页依然成立。
     cache_key = remote_db._info_read_model_section_category_page_cache_key(
         schema="remote_poc",
         category="efficiency_tools",
-        offset=50,
+        offset=0,
         limit=50,
     )
     remote_db._cache_set_copy(
@@ -1928,10 +1345,10 @@ def test_query_feed_by_category_reuses_canonical_section_cache_for_aliases(monke
             "items": [_row("tool_cached", category="efficiency_tools")],
             "category": "efficiency_tools",
             "total": 6093,
-            "offset": 50,
+            "offset": 0,
             "limit": 50,
             "has_more": True,
-            "next_offset": 100,
+            "next_offset": 50,
             "data_backend": "supabase_poc",
             "read_model": "info_platforms_v1",
             "scope_dimension": "section_category",
@@ -1951,7 +1368,7 @@ def test_query_feed_by_category_reuses_canonical_section_cache_for_aliases(monke
 
     result = remote_db.query_feed_by_category(
         category="efficiency_tools",
-        offset=50,
+        offset=0,
         limit=50,
         public_only=True,
         min_github_stars=50,
@@ -1992,47 +1409,6 @@ def test_query_feed_by_platform_group_source_uses_compound_read_model(monkeypatc
     assert result["scope_key"] == "platform=lingowhale|dimension=group_source|value=AI周刊::AI产品-公众号"
     assert result["items"][0]["id"] == "tw_rm_51"
     assert any("group_source" in (params or {}).get("scope_key", "") for params in conn.params)
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-
-    remote_db.clear_feed_cache_keys()
-
-
-def test_query_feed_by_platform_search_uses_scope_read_model(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    conn = _InfoSearchReadModelConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
-    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
-
-    result = remote_db.query_feed_by_platform(
-        platform="twitter",
-        offset=0,
-        limit=50,
-        source="following",
-        search="claude",
-        exclude_ids=["tw_search_1"],
-        public_only=True,
-        min_github_stars=50,
-    )
-
-    assert result["read_model"] == "info_search_v1"
-    assert result["scope_dimension"] == "source"
-    assert result["scope_key"] == "platform=twitter|dimension=source|value=following"
-    assert result["total"] == 2
-    assert result["items"][0]["id"] == "tw_search_page"
-    page_sql = next(sql for sql in conn.sqls if "summary.scope_count" in sql and "platform=twitter" not in sql)
-    pre_final_sql = page_sql.split(")\n                     SELECT av.version_id")[0]
-    assert "ci.search_text ILIKE %(search_like)s" in page_sql
-    assert "ci.card_json" not in pre_final_sql
-    assert "ORDER BY si.sort_at DESC NULLS LAST" in page_sql
-    assert "page_ci.card_json" in page_sql
-    assert "AND NOT (si.item_id = ANY(%(exclude_ids)s))" in page_sql
     assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
 
     remote_db.clear_feed_cache_keys()
@@ -2251,8 +1627,9 @@ def test_prewarm_info_read_model_pages_populates_hot_scope_cache(monkeypatch):
     assert result["ok"] is True
     assert result["pages"] == 2
     assert result["items"] == 4
+    # perf-v27 P4: 白名单只剩 section_category(其余维度不物化不预热)
     assert any(
-        "PARTITION BY CASE" in sql and "WHEN dimension IN ('section_category', 'section_subcategory')" in sql
+        "dimension = 'section_category'" in sql and "ranked_scopes" in sql
         for sql in conn.sqls
     )
 
@@ -2321,8 +1698,9 @@ def test_refresh_info_read_model_builds_version_and_swaps_active(monkeypatch):
     assert "INSERT INTO remote_poc.info_scope_items" in joined_sql
     assert "SELECT i.*, COALESCE" not in joined_sql
     assert "'_all'::text AS platform, 'section_category'::text AS dimension" in joined_sql
-    assert "'_all'::text AS platform, 'section_subcategory'::text AS dimension" in joined_sql
-    assert "'group_source'::text AS dimension" in joined_sql
+    # ENG-0710 降维瘦身:section_subcategory / group_source 不再物化(改走 live)
+    assert "'section_subcategory'::text AS dimension" not in joined_sql
+    assert "'group_source'::text AS dimension" not in joined_sql
     assert "sort_at AS rank_at" in joined_sql
     assert "WHEN dimension IN ('section_category', 'section_subcategory') THEN fetched_at" not in joined_sql
     assert "rank_at DESC NULLS LAST" in joined_sql
@@ -2480,7 +1858,6 @@ def test_info_read_model_freshness_remote_reports_active_and_latest(monkeypatch)
     monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
     monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(remote_db, "_info_read_model_incremental_enabled", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(remote_db, "_info_live_overlay_enabled", lambda *_args, **_kwargs: False)
 
     result = remote_db.info_read_model_freshness_remote(min_github_stars=50)
 
@@ -2488,7 +1865,6 @@ def test_info_read_model_freshness_remote_reports_active_and_latest(monkeypatch)
     assert result["read_model"] == "info_platforms_v1"
     assert result["data_backend"] == "supabase_poc"
     assert result["incremental_enabled"] is True
-    assert result["live_overlay_enabled"] is False
     assert result["active_generated_at"] == "2026-05-24T00:00:00Z"
     assert result["active_max_fetched_at"] == "2026-05-24T01:00:00Z"
     assert result["latest_max_fetched_at"] == "2026-05-24T02:00:00Z"
@@ -2702,16 +2078,15 @@ def test_prewarm_platforms_can_refresh_info_read_model_before_query(monkeypatch)
     )
 
     result = remote_db.prewarm_platforms(
-        refresh_mv=False,
         refresh_read_model=True,
         refresh_read_model_min_interval_sec=0,
     )
 
     assert refresh_calls == [{"min_interval_sec": 0}]
-    assert section_query_calls and section_query_calls[0]["per_category"] == 50
+    assert section_query_calls and section_query_calls[0]["per_category"] == 20
     assert section_query_calls[0]["public_only"] is True
-    assert query_calls and query_calls[0]["per_platform"] == 50
-    assert page_prewarm_calls == [{"max_scopes": 2}]
+    assert query_calls and query_calls[0]["per_platform"] == 20
+    assert page_prewarm_calls == [{"max_scopes": 2, "page_limit": 20, "pages_per_scope": 1}]
     assert result["read_model_refresh_ok"] is True
     assert result["sections_query_ok"] is True
     assert result["read_model_page_prewarm_ok"] is True
@@ -2740,15 +2115,14 @@ def test_prewarm_platforms_can_refresh_highlights_read_model_before_query(monkey
     )
 
     result = remote_db.prewarm_platforms(
-        refresh_mv=False,
         refresh_read_model=False,
         refresh_highlights_read_model=True,
         refresh_highlights_read_model_min_interval_sec=0,
     )
 
     assert refresh_calls == [{"min_interval_sec": 0}]
-    assert section_query_calls and section_query_calls[0]["per_category"] == 50
-    assert query_calls and query_calls[0]["per_platform"] == 50
+    assert section_query_calls and section_query_calls[0]["per_category"] == 20
+    assert query_calls and query_calls[0]["per_platform"] == 20
     assert result["highlights_read_model_refresh_ok"] is True
     assert result["highlights_read_model_scope_items"] == 654
 
@@ -2834,7 +2208,6 @@ def test_query_feed_platforms_warms_platform_more_count_cache(monkeypatch):
         yield conns.pop(0)
 
     monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "_platforms_mv_available", lambda _conn, _schema: True)
     monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
     monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
 
@@ -3033,124 +2406,27 @@ def test_query_feed_item_timeout_uses_stale_local_cache(monkeypatch):
     remote_db.clear_feed_cache_keys()
 
 
-def test_refresh_platforms_mv_skips_blocking_fallback_by_default(monkeypatch):
-    conn = _FakeRefreshConn(fail_concurrent=True)
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-    monkeypatch.setenv(remote_db.ALLOW_BLOCKING_MV_REFRESH_ENV, "0")
-
-    result = remote_db.refresh_platforms_mv()
-
-    assert result["ok"] is False
-    assert result["blocking_skipped"] is True
-    assert conn.autocommit is False
-    assert conn.rollbacks == 1
-    assert conn.sqls == [
-        "REFRESH MATERIALIZED VIEW CONCURRENTLY remote_poc.mv_items_top_per_platform"
-    ]
-
-
-def test_refresh_platforms_mv_uses_concurrent_autocommit(monkeypatch):
-    conn = _FakeRefreshConn()
-
-    @contextmanager
-    def fake_connect():
-        yield conn
-
-    monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
-
-    result = remote_db.refresh_platforms_mv()
-
-    assert result["ok"] is True
-    assert result["mode"] == "concurrent"
-    assert conn.autocommit is False
-    assert conn.sqls == [
-        "REFRESH MATERIALIZED VIEW CONCURRENTLY remote_poc.mv_items_top_per_platform",
-        "SELECT count(*) AS n FROM remote_poc.mv_items_top_per_platform",
-    ]
-
-
-def test_prewarm_platforms_default_skips_mv_and_uses_platform_query_params(monkeypatch):
+def test_prewarm_platforms_uses_platform_query_params(monkeypatch):
     remote_db.clear_feed_cache_keys()
     calls = []
-
-    def fake_refresh():
-        calls.append("refresh")
-        raise AssertionError("periodic prewarm must not refresh the platforms MV")
 
     def fake_query(**kwargs):
         calls.append(("query", kwargs))
         return {"sections": {}, "platform_counts": {}, "source_counts": {}}
 
-    monkeypatch.setattr(remote_db, "refresh_platforms_mv", fake_refresh)
     monkeypatch.setattr(remote_db, "query_feed_platforms", fake_query)
 
     result = remote_db.prewarm_platforms()
 
-    assert result["mv_refresh_skipped"] is True
     assert result["query_ok"] is True
     assert calls == [("query", {
-        "per_platform": 50,
+        "per_platform": 20,
         "search": None,
         "user_id": None,
         "public_only": True,
         "manual_owner_user_id": None,
         "min_github_stars": 50,
     })]
-
-
-def test_prewarm_platforms_can_refresh_mv_when_explicitly_requested(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    calls = []
-
-    def fake_refresh():
-        calls.append("refresh")
-        return {"ok": True}
-
-    def fake_query(**kwargs):
-        calls.append("query")
-        return {"sections": {}, "platform_counts": {}, "source_counts": {}}
-
-    monkeypatch.setattr(remote_db, "refresh_platforms_mv", fake_refresh)
-    monkeypatch.setattr(remote_db, "query_feed_platforms", fake_query)
-    monkeypatch.setenv(remote_db.ALLOW_PLATFORM_MV_REFRESH_ENV, "1")
-
-    result = remote_db.prewarm_platforms(refresh_mv=True)
-
-    assert result["mv_refresh_ok"] is True
-    assert result["query_ok"] is True
-    assert calls == ["refresh", "query"]
-
-
-def test_prewarm_platforms_requires_mv_refresh_allow_flag(monkeypatch):
-    remote_db.clear_feed_cache_keys()
-    calls = []
-
-    def forbidden_refresh():
-        calls.append("refresh")
-        raise AssertionError("explicit prewarm MV refresh requires allow flag")
-
-    def fake_query(**kwargs):
-        calls.append("query")
-        return {"sections": {}, "platform_counts": {}, "source_counts": {}}
-
-    monkeypatch.setattr(remote_db, "refresh_platforms_mv", forbidden_refresh)
-    monkeypatch.setattr(remote_db, "query_feed_platforms", fake_query)
-    monkeypatch.delenv(remote_db.ALLOW_PLATFORM_MV_REFRESH_ENV, raising=False)
-
-    result = remote_db.prewarm_platforms(refresh_mv=True)
-
-    assert result["mv_refresh_ok"] is False
-    assert result["mv_refresh_skipped"] is True
-    assert result["mv_refresh_skipped_reason"] == "platform_mv_refresh_not_allowed"
-    assert result["query_ok"] is True
-    assert calls == ["query"]
 
 
 def test_get_stats_public_anonymous_uses_platforms_fast_path(monkeypatch):
@@ -3438,30 +2714,6 @@ def test_clear_feed_cache_keys_removes_feed_local_read_cache_files(monkeypatch, 
     assert auth_cache.exists()
 
 
-def test_prewarm_platforms_does_not_refresh_mv_by_default(monkeypatch):
-    def forbidden_refresh():
-        raise AssertionError("prewarm must not refresh materialized view by default")
-
-    calls = []
-    monkeypatch.setattr(remote_db, "refresh_platforms_mv", forbidden_refresh)
-    monkeypatch.setattr(remote_db, "query_feed_platforms", lambda **kwargs: calls.append(kwargs) or {})
-
-    result = remote_db.prewarm_platforms()
-
-    assert result["mv_refresh_skipped"] is True
-    assert result["query_ok"] is True
-    assert calls == [
-        {
-            "per_platform": 50,
-            "search": None,
-            "user_id": None,
-            "public_only": True,
-            "manual_owner_user_id": None,
-            "min_github_stars": 50,
-        }
-    ]
-
-
 def test_local_read_cache_ignores_degraded_snapshots(monkeypatch, tmp_path):
     monkeypatch.setattr(remote_db, "_read_local_read_cache", _ORIGINAL_READ_LOCAL_READ_CACHE)
     monkeypatch.setattr(remote_db, "_LOCAL_READ_CACHE_DIR", tmp_path)
@@ -3573,6 +2825,10 @@ def test_pool_defaults_use_short_timeouts(monkeypatch):
         def __init__(self, **kwargs):
             calls.update(kwargs)
 
+        @staticmethod
+        def check_connection(conn):
+            """BF-0708-1: 池现在传 check=ConnectionPool.check_connection 做借出前 pre-ping。"""
+
     monkeypatch.setattr(remote_db, "_POOL", None)
     monkeypatch.setattr(remote_db, "_POOL_DSN", None)
     monkeypatch.setattr(remote_db, "_runtime_env", lambda: {})
@@ -3629,7 +2885,11 @@ def test_has_recent_running_fetch_remote_checks_recent_running_rows(monkeypatch)
     monkeypatch.setattr(remote_db, "connect", fake_connect)
     monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
     monkeypatch.setattr(remote_db, "fetch_run_heartbeat_grace_seconds", lambda: 600)
+    # BF-0710-fetch-guards: 判活的心跳窗口改用 runtime-stale grace(不是基础 grace)。
+    monkeypatch.setattr(remote_db, "fetch_run_runtime_stale_grace_seconds", lambda: 600)
 
+    # 显式传 max_age_minutes 时仍拼 started_at 龄窗口(默认不传则无窗口,
+    # 见 test_fetch_double_pipeline_guard.test_running_guard_default_has_no_age_window)。
     assert remote_db.has_recent_running_fetch_remote(max_age_minutes=45) is True
     assert "status = 'running'" in conn.sqls[-1]
     assert "started_at >= now()" in conn.sqls[-1]
@@ -3657,7 +2917,6 @@ def test_query_feed_sections_live_path_uses_full_counts_not_sample_rows(monkeypa
         yield conn
 
     monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "_platforms_mv_available", lambda _conn, _schema: True)
     monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
     monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
 
@@ -3769,7 +3028,6 @@ def test_query_feed_sections_reuses_cached_result(monkeypatch):
         yield conn
 
     monkeypatch.setattr(remote_db, "connect", fake_connect)
-    monkeypatch.setattr(remote_db, "_platforms_mv_available", lambda _conn, _schema: True)
     monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
     monkeypatch.setattr(remote_db, "feed_read_backend", lambda: "supabase_poc")
 
@@ -4125,3 +3383,40 @@ def test_remote_feed_live_circuit_short_circuits_after_timeout(monkeypatch):
     assert calls["n"] == 1
 
     remote_db.clear_feed_cache_keys()
+
+
+# ══════════ perf-v27 P4: 首屏预算读模型的新契约哨兵 ══════════
+
+
+def test_search_read_model_gate_is_permanently_off():
+    """搜索统一走 live(items trgm,覆盖 90 天保留期)。读模型 card_items 只剩
+    7 天热窗口,继续在卡片上搜会把搜索覆盖静默砍到 7 天。若要重新打开此
+    gate,必须先解决搜索覆盖面问题(见目标架构定稿 §0-7)。"""
+    assert remote_db._can_use_info_search_read_model(
+        search="openai", user_id=None, public_only=True, min_github_stars=50,
+    ) is False
+
+
+def test_by_category_read_model_rejects_cursor_and_offset_pages(monkeypatch):
+    """读模型只服务第一页;offset>0 或带 cursor 一律 None 落 live(冷翻页)。"""
+    monkeypatch.setattr(remote_db, "_info_read_model_enabled", lambda *_a, **_k: True)
+
+    def fail_connect():
+        raise AssertionError("续页不应触达读模型")
+
+    monkeypatch.setattr(remote_db, "connect", fail_connect)
+    common = dict(
+        schema="remote_poc", category="coding", keyword=None, search=None,
+        subcategory=None, limit=20, user_id=None, public_only=True,
+        manual_owner_user_id=None, min_github_stars=50,
+    )
+    assert remote_db._query_feed_by_category_read_model(offset=20, cursor=None, **common) is None
+    assert remote_db._query_feed_by_category_read_model(
+        offset=0,
+        cursor={
+            "version_id": "00000000-0000-0000-0000-000000000001",
+            "scope_key": "platform=_all|dimension=section_category|value=coding",
+            "rank_after": 20,
+        },
+        **common,
+    ) is None

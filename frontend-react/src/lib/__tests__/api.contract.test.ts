@@ -34,6 +34,7 @@ function mockFetchSequence(responses: Response[]) {
 beforeEach(() => {
   useAuthStore.setState({ user: null, isLoading: false, isChecked: true })
   window.location.hash = ''
+  localStorage.clear() // BF-0708-2: 隔离 auth_has_session 标记,防跨用例泄漏
   vi.restoreAllMocks()
 })
 
@@ -55,6 +56,8 @@ describe('api contract hardening', () => {
   })
 
   it('authMe refreshes a valid refresh session during startup check', async () => {
+    // BF-0708-2: 该场景对应"曾登录的浏览器刷新页面",登录时已写入标记
+    localStorage.setItem('auth_has_session', '1')
     const expectedUser = { id: 'u1', username: 'alice', email: 'alice@test.local', role: 'user' }
     const { calls } = mockFetchSequence([
       jsonResponse(401, { error: 'expired access token', can_refresh: false }),
@@ -71,6 +74,8 @@ describe('api contract hardening', () => {
   })
 
   it('authMe attempts refresh on startup 401 and treats refresh failure as anonymous', async () => {
+    // BF-0708-2: 标记在但 refresh cookie 已失效 —— 仍会尝试一次 refresh 再降级匿名
+    localStorage.setItem('auth_has_session', '1')
     const { calls } = mockFetchSequence([
       jsonResponse(401, { error: '未登录', can_refresh: false }),
       jsonResponse(401, { error: '登录已过期' }),

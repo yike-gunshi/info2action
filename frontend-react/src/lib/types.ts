@@ -283,6 +283,10 @@ export interface ClusterEvent {
   id: number
   ai_title: string
   ai_summary?: string | null
+  /** v27.0：精选卡片正文位的「为什么值得读」；缺失时前端回退 ai_summary。 */
+  why_read?: string | null
+  /** v27.0：后端归一化后的卡片展示分；null/缺失时按日隐藏整列。 */
+  display_score?: number | null
   doc_count: number
   /** v15.1 PRD §5.17：unique_source_count >= 2 是新可见门槛；
    *  BF-0428-1: 也是 EventCard 来源徽章 + cluster 弹窗 header 的显示来源（必填） */
@@ -302,13 +306,33 @@ export interface ClusterEvent {
   /** v15.1：null = 当前用户从未"看过"该 cluster（cluster_status 无记录），
    *  前端 mount 比对时 null → 不显示更新角标（R7.2 边界） */
   last_seen_version?: number | null
+  /** v25.0 F-B：后端双因子精选分（0-100 尺度）；null/缺失 = 无分（fallback S2 启发式） */
+  highlight_score?: number | null
+  /** v25.0：cluster 级 verdict 标签（featured/positive_borderline/...） */
+  cluster_verdict?: string | null
+  /** v25.0：deciding item 的价值路径，「为什么精选」标签数据源 */
+  value_path?: 'substantive' | 'major_event' | 'lead_value' | 'none' | null
+  /** v25.0：簇内 featured item 数（verdict_counts 提取） */
+  featured_count?: number | null
 }
 
 export interface ClusterViewerStatus {
   clicked_at?: string | null
   starred_at?: string | null
   last_seen_version?: number | null
+  /** v25.0 F-D：当前用户对该 cluster 的质量反馈（null=无/已撤销） */
+  feedback_kind?: ClusterFeedbackKind | null
+  /** v27.1 T-H2：当前反馈的可选文本说明（null=未填写/已撤销） */
+  feedback_note?: string | null
 }
+
+/** v25.0 F-D：cluster 质量反馈类型 */
+export type ClusterFeedbackKind = 'positive' | 'irrelevant' | 'low_quality' | 'should_feature'
+
+/** v29 admin 全景表：item 标注与簇展示 override 各自的有限值域。 */
+export type AdminHighlightItemFeedbackKind = 'should_feature' | 'should_drop'
+export type AdminHighlightOverrideAction = 'force_show' | 'force_hide' | 'clear'
+export type AdminHighlightManualDisplay = Exclude<AdminHighlightOverrideAction, 'clear'> | null
 
 /** 事件聚合 feed 响应 (GET /api/feed/events) */
 export interface FeedEventsResponse {
@@ -336,6 +360,7 @@ export interface ClusterDetail {
   id: number
   ai_title: string
   ai_summary: string | null
+  why_read?: string | null
   /** BF-0428-5: cluster key_points 与单 doc 同 schema —— 嵌套对象数组 +
    *  string fallback。支持 [{title, points: []}, ...] 结构,渲染时按
    *  小标题分组(加粗) + sub-points 紫点列表,与 DetailPanel 视觉一致。 */

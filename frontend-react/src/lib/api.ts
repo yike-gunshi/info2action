@@ -16,45 +16,100 @@ import type {
   FeedEventsCursor,
   ActionBoardDirection,
   ActionDirectionSummary,
+  ClusterFeedbackKind,
+  AdminHighlightItemFeedbackKind,
+  AdminHighlightOverrideAction,
+  AdminHighlightManualDisplay,
 } from './types'
 import type { AuthUser } from '../store/authStore'
 
 const BASE = '' // same origin, proxied by Vite in dev
 
-/** Attempt token refresh once, then give up */
-let refreshPromise: Promise<boolean> | null = null
+/**
+ * refresh 的三态结果(BF-0708-1)。
+ *
+ * 必须区分"登录真的失效"和"服务端暂时挂了" —— 旧代码用 `r.ok` 把两者
+ * 混为一谈,DB 瞬断导致的 500 会把在线用户直接踢回登录页。
+ */
+type RefreshOutcome = 'ok' | 'expired' | 'unavailable'
 
-async function tryRefresh(): Promise<boolean> {
+/**
+ * BF-0708-2:"曾登录"非敏感标记。
+ *
+ * refresh_token cookie 是 HttpOnly + path=/api/auth/refresh,JS 读不到,无法直接
+ * 判断"有没有 refresh cookie"。authMe() 在 App 挂载时 authStore.user 必为 null,
+ * 也不能拿它当守卫(会杀掉"刷新页面靠 cookie 恢复登录"的唯一通道)。
+ * 所以用这个标记:登录/续期成功写入,登出或会话确定失效(refresh 明确 4xx)时清除;
+ * refresh 遇 5xx/断网(unavailable)不清 —— 服务端瞬断不能抹掉"曾登录"事实(BF-0708-1)。
+ * 值恒为 '1',不含任何凭据;localStorage 不可用(隐私模式)时静默降级为修复前行为。
+ */
+const HAS_SESSION_KEY = 'auth_has_session'
+
+function markHasSession() {
+  try { localStorage.setItem(HAS_SESSION_KEY, '1') } catch { /* 隐私模式,静默 */ }
+}
+
+function clearHasSession() {
+  try { localStorage.removeItem(HAS_SESSION_KEY) } catch { /* 隐私模式,静默 */ }
+}
+
+function hasSessionMarker(): boolean {
+  try { return localStorage.getItem(HAS_SESSION_KEY) === '1' } catch { return false }
+}
+
+/** Attempt token refresh once, then give up */
+let refreshPromise: Promise<RefreshOutcome> | null = null
+
+async function tryRefresh(): Promise<RefreshOutcome> {
   if (refreshPromise) return refreshPromise
   refreshPromise = fetch(`${BASE}/api/auth/refresh`, {
     method: 'POST',
     credentials: 'same-origin',
   })
-    .then((r) => r.ok)
+    .then((r): RefreshOutcome => {
+      if (r.ok) return 'ok'
+      // BF-0708-1: 5xx 是服务端故障(如 Supabase 连接被回收),登录态本身仍有效
+      if (r.status >= 500) return 'unavailable'
+      return 'expired'
+    })
+    // 网络不可达同理:不能因为断网就把用户登出
+    .catch((): RefreshOutcome => 'unavailable')
     .finally(() => { refreshPromise = null })
   return refreshPromise
 }
 
 /**
- * 处理 401 响应的共享语义(BF-0420-15 + BF-0420-19 共根治)。
+ * 处理 401 响应的共享语义(BF-0420-15 + BF-0420-19 共根治;BF-0708-1 增补 5xx)。
  *
  * 返回:
- *   - 'retry'   → 刷 token 成功,caller 应重试原请求
- *   - 'expired' → 用户本来登录但 refresh 失败,已清 authStore + 跳转登录页
- *   - 'anon'    → 本就匿名,不跳转,caller 自行给"请先登录"提示
+ *   - 'retry'       → 刷 token 成功,caller 应重试原请求
+ *   - 'expired'     → 用户本来登录但 refresh 判定失效,已清 authStore + 跳转登录页
+ *   - 'unavailable' → refresh 因服务端故障失败,保留登录态,caller 提示稍后重试
+ *   - 'anon'        → 本就匿名,不跳转,caller 自行给"请先登录"提示
  */
-async function handleUnauthorized(): Promise<'retry' | 'expired' | 'anon'> {
+async function handleUnauthorized(): Promise<'retry' | 'expired' | 'anon' | 'unavailable'> {
   const { useAuthStore } = await import('../store/authStore')
   const currentUser = useAuthStore.getState().user
   if (!currentUser) return 'anon'
 
-  const refreshed = await tryRefresh()
-  if (refreshed) return 'retry'
+  const outcome = await tryRefresh()
+  if (outcome === 'ok') return 'retry'
+  // BF-0708-1: 服务端故障不得登出,否则一次 DB 抖动就清空所有在线用户
+  if (outcome === 'unavailable') return 'unavailable'
 
   // BF-0420-19: refresh 失败时必须清 authStore,否则 UI 残留"已登录"头衔但 API 全挂
   useAuthStore.getState().setUser(null)
+  clearHasSession()
   window.location.hash = 'login'
   return 'expired'
+}
+
+const SERVICE_UNAVAILABLE_MSG = '服务暂时不可用,请稍后重试'
+
+function serviceUnavailableError(): Error & { status?: number } {
+  const e = new Error(SERVICE_UNAVAILABLE_MSG) as Error & { status?: number }
+  e.status = 503
+  return e
 }
 
 async function apiErrorFromResponse(res: Response): Promise<Error & { status?: number }> {
@@ -94,12 +149,16 @@ async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
       if (retry.status === 401) {
         const { useAuthStore } = await import('../store/authStore')
         useAuthStore.getState().setUser(null)
+        clearHasSession()
         window.location.hash = 'login'
         throw new Error('Session expired')
       }
       throw await apiErrorFromResponse(retry)
     } else if (verdict === 'expired') {
       throw new Error('Session expired')
+    } else if (verdict === 'unavailable') {
+      // BF-0708-1: DB/服务瞬断 —— 保持登录态,让用户重试而不是重新登录
+      throw serviceUnavailableError()
     }
     // verdict === 'anon' → 继续走下方 !res.ok 分支,返"请先登录"
   }
@@ -192,6 +251,7 @@ export async function authLogin(login: string, password: string): Promise<AuthUs
   if (!res.ok) {
     throw new Error(body.error || body.detail || `Login failed: ${res.status}`)
   }
+  markHasSession() // BF-0708-2
   return body.user
 }
 
@@ -208,18 +268,31 @@ export async function authRegister(data: {
 }
 
 export async function authLogout(): Promise<void> {
-  await apiFetch('/api/auth/logout', { method: 'POST' })
+  try {
+    await apiFetch('/api/auth/logout', { method: 'POST' })
+  } finally {
+    // BF-0708-2: 无论请求成败都清标记 —— 用户意图即登出
+    clearHasSession()
+  }
 }
 
 export async function authMe(): Promise<AuthUser> {
   const readMe = () => fetch(`${BASE}/api/auth/me`, { credentials: 'same-origin' })
   let res = await readMe()
-  if (res.status === 401) {
-    const refreshed = await tryRefresh()
-    if (refreshed) res = await readMe()
+  if (res.status === 401 && hasSessionMarker()) {
+    // BF-0708-2: 匿名访客没有"曾登录"标记,不再空转 refresh(必 401 的白打请求)。
+    // 标记在 → 走 BF-0708-1 三态续期,保住"刷新页面靠 cookie 恢复登录"通道。
+    // 不能写 `if (outcome)` —— 'expired' / 'unavailable' 都是 truthy 字符串。
+    const outcome = await tryRefresh()
+    if (outcome === 'ok') res = await readMe()
+    // refresh 明确 4xx = 会话真失效 → 清标记,后续页面加载不再空转;
+    // 'unavailable'(5xx/断网)不清,瞬断恢复后仍可自动续期(BF-0708-1 语义)
+    else if (outcome === 'expired') clearHasSession()
   }
   if (!res.ok) throw new Error('Not authenticated')
-  return res.json()
+  const user: AuthUser = await res.json()
+  markHasSession() // BF-0708-2: 会话已确认,标记丢失时自愈
+  return user
 }
 
 export async function authRefresh(): Promise<{ ok: boolean }> {
@@ -227,10 +300,12 @@ export async function authRefresh(): Promise<{ ok: boolean }> {
 }
 
 export async function authVerifyEmail(email: string, code: string): Promise<{ ok: boolean; user: AuthUser }> {
-  return apiFetch('/api/auth/verify-email', {
+  const res = await apiFetch<{ ok: boolean; user: AuthUser }>('/api/auth/verify-email', {
     method: 'POST',
     body: JSON.stringify({ email, code }),
   })
+  markHasSession() // BF-0708-2: 后端验证邮箱即自动登录种 cookie(src/routes/auth.py)
+  return res
 }
 
 export async function authResendCode(email: string): Promise<{ ok: boolean }> {
@@ -528,10 +603,26 @@ export async function getEmbeddingUsage(params?: {
 
 export type AdminSourceStatus = 'active' | 'paused' | 'pending' | 'broken' | 'not_fetched' | 'deleted' | string
 
+export type AdminSourceAttemptOutcome = 'success' | 'no_new' | 'failed' | 'missed' | 'interrupted' | 'retrying'
+
+export interface AdminSourceAttempt {
+  run_id: number
+  source_id?: number
+  handle?: string
+  outcome: AdminSourceAttemptOutcome
+  attempts?: number
+  duration_ms?: number
+  new_count?: number
+  error_code?: string | null
+  error?: string | null
+  finished_at?: string | null
+}
+
 export interface AdminSourceHealth {
   last_fetched_at: string | null
   inserted_7d: number | null
   consecutive_failures: number | null
+  latest_attempt?: AdminSourceAttempt | null
 }
 
 export interface AdminSource {
@@ -556,6 +647,54 @@ export interface AdminSourceGroup {
 export interface AdminSourcesResponse {
   groups: AdminSourceGroup[]
   total: number
+  latest_x_run?: AdminXRunSummary | null
+  x_list?: AdminXListStatus | null
+}
+
+export interface AdminXRunSummary {
+  run_id: number
+  started_at: string | null
+  finished_at: string | null
+  planned: number
+  attempted: number
+  succeeded: number
+  no_new: number
+  failed: number
+  missed: number
+  mode?: string
+  list_id?: string | null
+  unmatched_posts?: number
+}
+
+export interface AdminXListStatus {
+  configured: boolean
+  mode: 'list'
+  list_id: string | null
+  list_url: string | null
+  registry_count: number
+  synced_count: number
+  pending_count: number
+  synced_handles: string[]
+  pending_handles: string[]
+  last_synced_at: string | null
+  last_error: string | null
+  failed?: Array<{ handle: string; error: string }>
+  unassigned_handles?: string[]
+  lists?: AdminXListGroupStatus[]
+}
+
+export interface AdminXListGroupStatus {
+  key: string
+  name: string
+  list_id: string
+  list_url: string
+  registry_count: number
+  synced_count: number
+  pending_count: number
+  synced_handles: string[]
+  pending_handles: string[]
+  last_synced_at: string | null
+  last_error: string | null
 }
 
 export interface AdminSourcePreviewItem {
@@ -605,8 +744,6 @@ export interface AdminSourceReconcileResponse {
 export type AdminSourceAlgoParams = {
   hackernews_count: number | null
   github_trending_count: number | null
-  twitter_following_count: number | null
-  twitter_for_you_count: number | null
   bilibili_hot_count: number | null
   bilibili_rank_count: number | null
   bilibili_videos_per_up: number | null
@@ -614,6 +751,41 @@ export type AdminSourceAlgoParams = {
 
 export async function getAdminSources(): Promise<AdminSourcesResponse> {
   return apiFetch('/api/admin/sources')
+}
+
+export async function syncAdminXList(full = false): Promise<AdminXListStatus> {
+  return apiFetch('/api/admin/sources/x-list/sync', {
+    method: 'POST',
+    body: JSON.stringify({ full }),
+  })
+}
+
+export interface AdminWechatSearchChannel {
+  channel_id: string
+  name: string
+  description: string | null
+  avatar_url: string | null
+  has_subscribed: boolean
+  last_7d_count: number
+  subscriber_count: number
+  is_official: boolean
+  already_in_registry: boolean
+}
+
+export async function searchWechatSources(q: string, limit = 20): Promise<{ channels: AdminWechatSearchChannel[] }> {
+  const qs = new URLSearchParams({ q, limit: String(limit) })
+  return apiFetch(`/api/admin/sources/search-wechat?${qs}`)
+}
+
+export interface AdminSyncResult {
+  imported: number
+  existing: number
+  total: number
+  note?: string | null
+}
+
+export async function syncLingowhaleSources(): Promise<AdminSyncResult> {
+  return apiFetch('/api/admin/sources/sync-lingowhale', { method: 'POST', body: '{}' })
 }
 
 export async function validateAdminSource(data: {
@@ -727,6 +899,154 @@ export type AdminConsoleSummary =
 
 export async function getAdminConsoleSummary(): Promise<AdminConsoleSummary> {
   return apiFetch('/api/admin/console/summary')
+}
+
+export type AdminHighlightsDays = 1 | 3 | 7
+export type AdminHighlightsStationKey = 'ingested' | 'scored' | 'clustered' | 'summarized' | 'displayed'
+export type AdminHighlightsDiffKey = 'scoring' | 'summary' | 'display'
+export type AdminHighlightsFunnelView = 'panorama' | 'anomaly'
+export type AdminHighlightsDisplay = 'all' | 'shown' | 'hidden'
+export type AdminHighlightsStage =
+  | 'pending'
+  | 'displayed'
+  | 'blocked_scoring'
+  | 'blocked_summary'
+  | 'blocked_display'
+export type AdminHighlightsManualDisplay = AdminHighlightManualDisplay
+export type AdminHighlightsItemFeedbackKind = AdminHighlightItemFeedbackKind
+export type AdminHighlightsFeedbackKind = ClusterFeedbackKind | 'should_drop'
+
+export type AdminHighlightsDims = {
+  authority: number | null
+  substance: number | null
+  novelty: number | null
+  timeliness: number | null
+  audience_fit: number | null
+}
+
+export type AdminHighlightsRowFeedback = {
+  kind: AdminHighlightsFeedbackKind | null
+  note: string | null
+}
+
+export type AdminHighlightsFunnelResponse = {
+  stations: Array<{ key: AdminHighlightsStationKey; count: number }>
+  diffs: Array<{ key: AdminHighlightsDiffKey; count: number }>
+  anomalies_count: number
+  gate_disabled: boolean
+}
+
+export type AdminHighlightsItemRow = {
+  id: string
+  ingested_at: string | null
+  title: string | null
+  url: string | null
+  cluster_id: number | null
+  cluster_title: string | null
+  score10: number | null
+  dims: AdminHighlightsDims
+  veto: string | null
+  uncertainty: string | null
+  reason: string | null
+  feedback: AdminHighlightsRowFeedback
+  stuck_at?: string | null
+  error_summary?: string | null
+}
+
+export type AdminHighlightsClusterMember = {
+  id: string
+  title: string | null
+  url: string | null
+  platform: string | null
+  source: string | null
+  author_name: string | null
+  fetched_at: string | null
+  verdict: string | null
+  score10: number | null
+  dims: AdminHighlightsDims
+  veto: string | null
+  uncertainty: string | null
+  reason: string | null
+  feedback: AdminHighlightsRowFeedback
+}
+
+export type AdminHighlightsClusterRow = {
+  id: number
+  latest_at: string | null
+  title: string | null
+  dominant_category: string
+  max_flag_score10: number | null
+  score_inputs: {
+    max_q?: number | null
+    avg_q?: number | null
+    scored_include_count?: number | null
+    unique_source_count?: number | null
+    [key: string]: unknown
+  }
+  deciding_item: {
+    id: string
+    title: string | null
+    dims: AdminHighlightsDims
+    reason: string | null
+  }
+  stage: AdminHighlightsStage
+  blocked_reason: string | null
+  displayed: boolean
+  manual_display: AdminHighlightsManualDisplay
+  feedback: AdminHighlightsRowFeedback
+  members: AdminHighlightsClusterMember[]
+}
+
+export type AdminHighlightsFunnelRowsResponse =
+  | {
+      granularity: 'item'
+      items: AdminHighlightsItemRow[]
+      total: number
+      page: number
+      gate_disabled: boolean
+      display_threshold: number | null
+    }
+  | {
+      granularity: 'cluster'
+      items: AdminHighlightsClusterRow[]
+      total: number
+      page: number
+      gate_disabled: boolean
+      display_threshold: number | null
+    }
+
+export async function getAdminHighlightsFunnel(params: {
+  days: AdminHighlightsDays
+  q?: string
+  tag?: string
+}): Promise<AdminHighlightsFunnelResponse> {
+  const qs = new URLSearchParams({ days: String(params.days) })
+  if (params.q) qs.set('q', params.q)
+  if (params.tag) qs.set('tag', params.tag)
+  return apiFetch(`/api/admin/highlights/funnel?${qs}`)
+}
+
+export async function getAdminHighlightsFunnelRows(params: {
+  view: 'panorama' | 'anomaly'
+  days: AdminHighlightsDays
+  q?: string
+  tag?: string
+  display?: AdminHighlightsDisplay
+  stage?: AdminHighlightsStage | ''
+  page?: number
+  limit?: number
+}): Promise<AdminHighlightsFunnelRowsResponse> {
+  const qs = new URLSearchParams({
+    view: params.view,
+    days: String(params.days),
+  })
+  if (params.q) qs.set('q', params.q)
+  if (params.tag) qs.set('tag', params.tag)
+  if (params.display && params.display !== 'all') qs.set('display', params.display)
+  if (params.stage) qs.set('stage', params.stage)
+  qs.set('page', String(params.page ?? 1))
+  qs.set('limit', String(params.limit ?? 50))
+  return apiFetch(`/api/admin/highlights/funnel/rows?${qs}`)
 }
 
 // ── Feed ──
@@ -1055,6 +1375,9 @@ export function generateActionFromItem(
           const e = new Error('Session expired')
           ;(e as Error & { status?: number }).status = 401
           throw e
+        } else if (verdict === 'unavailable') {
+          // BF-0708-1: 服务端故障,不是没登录
+          throw serviceUnavailableError()
         } else {
           // 匿名用户:友好提示,不跳转(不是所有人都想登录才能看首页)
           const e = new Error('请先登录再生成行动点(顶栏右上角)')
@@ -1266,10 +1589,32 @@ export async function fetchHealth(): Promise<HealthStatus> {
 
 // ── Feedback ──
 
-export async function submitFeedback(itemId: string, type: 'positive' | 'irrelevant' | 'low_quality', text?: string): Promise<void> {
-  await apiFetch('/api/feedback', {
+export async function submitFeedback(
+  itemId: string,
+  type: 'positive' | 'irrelevant' | 'low_quality' | 'should_feature' | 'should_drop',
+  text?: string,
+): Promise<{ ok: boolean; active?: boolean }> {
+  return apiFetch('/api/feedback', {
     method: 'POST',
     body: JSON.stringify({ item_id: String(itemId), type, text }),
+  })
+}
+
+export async function setAdminHighlightOverride(
+  id: number,
+  action: AdminHighlightOverrideAction,
+  note?: string,
+): Promise<{
+  ok: boolean
+  manual_display: AdminHighlightsManualDisplay
+  manual_display_at: string | null
+  feedback_kind: ClusterFeedbackKind | null
+  feedback_note: string | null
+}> {
+  return apiFetch(`/api/admin/highlights/clusters/${id}/override`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, note }),
   })
 }
 
@@ -1353,6 +1698,19 @@ export async function setClusterStar(id: number): Promise<{ ok: boolean; starred
   return apiFetch(`/api/clusters/${id}/star`, { method: 'POST' })
 }
 
+/** v25.0 POST /api/clusters/:id/feedback — cluster 质量反馈，同 kind 再提交=撤销。 */
+export async function setClusterFeedback(
+  id: number,
+  kind: ClusterFeedbackKind,
+  note?: string,
+): Promise<{ ok: boolean; feedback_kind: ClusterFeedbackKind | null; feedback_note?: string | null }> {
+  return apiFetch(`/api/clusters/${id}/feedback`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind, note }),
+  })
+}
+
 /** v15.1 POST /api/clusters/:id/seen — 标记当前 live_version 为 last_seen_version。
  *  与 /click 区别：/seen 不更新 clicked_at，仅清更新角标。
  *  调用方应把失败 swallow 掉，不影响渲染（feature-spec R7.1）。 */
@@ -1414,6 +1772,9 @@ export function generateClusterAction(
           const e = new Error('Session expired')
           ;(e as Error & { status?: number }).status = 401
           throw e
+        } else if (verdict === 'unavailable') {
+          // BF-0708-1: 服务端故障,不是没登录
+          throw serviceUnavailableError()
         } else {
           const e = new Error('请先登录再生成行动点（顶栏右上角）')
           ;(e as Error & { status?: number }).status = 401

@@ -124,15 +124,16 @@ function GridImage({ src, single = false }: { src: string; single?: boolean }): 
   const [err, setErr] = useState(false)
   if (err) {
     return (
-      <div className="flex items-center justify-center bg-muted text-muted-foreground/40 w-full aspect-video rounded-[14px]">
+      <div className="flex items-center justify-center bg-muted text-muted-foreground/40 w-full aspect-video rounded-[4px]">
         <ImageOff className="w-6 h-6" />
       </div>
     )
   }
   // BF-0420-21 rev2: 单图(弹窗内)限高 450px + object-contain,避免竖向长图撑爆弹窗
   // (v1 用 70vh 在大屏浏览器仍显示 700+px 太大,改绝对值 450px 保证信息密度)
-  const singleCls = 'w-full max-h-[450px] object-contain rounded-[14px]'
-  const gridCls = 'w-full rounded-[14px] object-cover'
+  // v24.0 §21.5-⑥: rounded-[14px] 离系统 → 4px 对齐 v19 圆角谱系
+  const singleCls = 'w-full max-h-[450px] object-contain rounded-[4px]'
+  const gridCls = 'w-full rounded-[4px] object-cover'
   return (
     <img
       src={src}
@@ -178,8 +179,10 @@ export function ItemLeftPanel({
   const displayContent = expanded || !needsTruncation
     ? content
     : content.slice(0, TRUNCATE_LEN)
+  // v24.0 §21.5-①: 硬编码亮色墨(#3F3A34/#171512)是暗色模式真 bug —— 改走 modal-text
+  // 语义 token(亮色值等同原硬编码,暗色自动切米白墨),阅读四元组不变。
   const bodyTextClass = surface === 'plain'
-    ? 'space-y-3 font-event-title text-[16px] leading-[1.82] tracking-[0] text-[#3F3A34] [&_strong]:font-bold [&_strong]:text-[#171512]'
+    ? 'space-y-3 font-event-title text-[16px] leading-[1.82] tracking-[0] text-[var(--modal-text-soft)] [&_strong]:font-bold [&_strong]:text-[var(--modal-text)]'
     : 'space-y-2 text-[16px] leading-[1.7] text-foreground'
 
   const timeSource = item.published_at || item.fetched_at

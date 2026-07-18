@@ -23,7 +23,7 @@ def _index_names(conn, table):
     ).fetchall()}
 
 
-def test_legacy_cluster_status_migrates_starred_at_before_indexes(tmp_path, monkeypatch):
+def test_legacy_cluster_status_migrates_feedback_columns_before_indexes(tmp_path, monkeypatch):
     db_path = tmp_path / "legacy_feed.db"
     legacy = sqlite3.connect(db_path)
     legacy.executescript(
@@ -43,6 +43,9 @@ def test_legacy_cluster_status_migrates_starred_at_before_indexes(tmp_path, monk
     conn = db.get_conn()
     try:
         assert "starred_at" in _column_names(conn, "cluster_status")
+        assert "feedback_kind" in _column_names(conn, "cluster_status")
+        assert "feedback_at" in _column_names(conn, "cluster_status")
+        assert "feedback_note" in _column_names(conn, "cluster_status")
         indexes = _index_names(conn, "cluster_status")
         assert "idx_cluster_status_user_clicked" in indexes
         assert "idx_cluster_status_user_starred" in indexes

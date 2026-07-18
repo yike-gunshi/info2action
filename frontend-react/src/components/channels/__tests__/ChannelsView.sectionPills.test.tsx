@@ -13,8 +13,18 @@ vi.mock('../../../lib/api', () => ({
   fetchLingowhaleGroups: vi.fn(),
 }))
 
+// v24 §21.3: SectionFront 用 IO 做行级懒渲染，测试里让 section 立即可见
 class IntersectionObserverMock {
-  observe() {}
+  private callback: IntersectionObserverCallback
+
+  constructor(callback: IntersectionObserverCallback) {
+    this.callback = callback
+  }
+
+  observe(target: Element) {
+    this.callback([{ isIntersecting: true, target } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+  }
+
   disconnect() {}
 }
 
@@ -236,7 +246,7 @@ describe('ChannelsView section-local pills', () => {
     })
   })
 
-  it('展开更多始终请求下一页，成功追加前不虚减剩余数', async () => {
+  it('v24.1 瀑布流回滚：首批 50 条全部渲染；展开更多请求下一页，成功追加前不虚减剩余数', async () => {
     const user = userEvent.setup()
     const firstPage = items('x-initial', 'twitter', 50)
     const secondPage = items('x-next', 'twitter', 50)
@@ -250,11 +260,12 @@ describe('ChannelsView section-local pills', () => {
 
     render(<ChannelsView embedded />)
 
+    // 折叠态 = 前 BATCH(50) 条 masonry；不再是 lead/rail/brief 行分型折叠
     expect(screen.getAllByTestId('info-card')).toHaveLength(50)
-    const expandButton = screen.getByRole('button', { name: /展开更多/ })
-    expect(expandButton).toHaveTextContent('还有 70 条')
+    expect(screen.getByRole('button', { name: /展开更多/ })).toHaveTextContent('还有 70 条')
 
-    await user.click(expandButton)
+    // 点击：真正取下一页
+    await user.click(screen.getByRole('button', { name: /展开更多/ }))
 
     await waitFor(() => {
       expect(mockFetchPlatformMore).toHaveBeenCalledWith(

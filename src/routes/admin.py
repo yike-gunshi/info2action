@@ -1,9 +1,11 @@
 """Admin endpoints: invite code management, user listing."""
+import functools
 import secrets
 import string
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 import db
 import remote_db
@@ -66,7 +68,15 @@ async def create_invite_codes(request: Request):
         codes = []
         for _ in range(count):
             code = _generate_code()
-            remote_db.create_invite_code_remote(code, user['id'], max_uses=max_uses, expires_at=expires_at)
+            await run_in_threadpool(
+                functools.partial(
+                    remote_db.create_invite_code_remote,
+                    code,
+                    user['id'],
+                    max_uses=max_uses,
+                    expires_at=expires_at,
+                )
+            )
             codes.append(code)
         return {'ok': True, 'codes': codes}
 
@@ -89,7 +99,7 @@ async def list_invite_codes(request: Request):
         return err
 
     if remote_db.app_state_to_remote():
-        return {'codes': remote_db.list_invite_codes_remote()}
+        return {'codes': await run_in_threadpool(remote_db.list_invite_codes_remote)}
 
     conn = db.get_conn()
     try:
@@ -106,10 +116,10 @@ async def delete_invite_code(code: str, request: Request):
         return err
 
     if remote_db.app_state_to_remote():
-        existing = remote_db.get_invite_code_remote(code)
+        existing = await run_in_threadpool(remote_db.get_invite_code_remote, code)
         if not existing:
             return JSONResponse({'error': 'Code not found'}, status_code=404)
-        remote_db.delete_invite_code_remote(code)
+        await run_in_threadpool(remote_db.delete_invite_code_remote, code)
         return {'ok': True}
 
     conn = db.get_conn()
@@ -130,7 +140,7 @@ async def list_users(request: Request):
         return err
 
     if remote_db.app_state_to_remote():
-        return {'users': remote_db.list_users_remote()}
+        return {'users': await run_in_threadpool(remote_db.list_users_remote)}
 
     conn = db.get_conn()
     try:
@@ -147,12 +157,15 @@ async def admin_overview(request: Request, include_embedding: bool = False):
         return err
 
     if remote_db.app_state_to_remote():
-        return remote_db.admin_overview_remote(
-            fetch_run_limit=20,
-            fetch_run_offset=0,
-            embedding_hours=24,
-            embedding_limit=50,
-            include_embedding=include_embedding,
+        return await run_in_threadpool(
+            functools.partial(
+                remote_db.admin_overview_remote,
+                fetch_run_limit=20,
+                fetch_run_offset=0,
+                embedding_hours=24,
+                embedding_limit=50,
+                include_embedding=include_embedding,
+            )
         )
 
     conn = db.get_conn()
@@ -189,13 +202,143 @@ async def admin_console_summary(request: Request):
         return {'available': False, 'reason': 'remote_required'}
 
     try:
-        return remote_db.admin_console_summary_remote()
+        return await run_in_threadpool(remote_db.admin_console_summary_remote)
     except Exception as exc:
         return JSONResponse({
             'available': False,
             'reason': 'remote_error',
             'error': str(exc),
         }, status_code=503)
+
+
+@router.get("/api/admin/highlights/funnel")
+async def admin_highlights_funnel(
+    request: Request,
+    days: int = 1,
+    q: str = "",
+    tag: str = "",
+):
+    _, err = _require_admin(request)
+    if err:
+        return err
+
+    if not remote_db.app_state_to_remote():
+        return JSONResponse({
+            'reason': 'remote_required',
+            'stations': [],
+            'diffs': [],
+            'anomalies_count': 0,
+            'gate_disabled': False,
+        }, status_code=501)
+
+    try:
+        return await run_in_threadpool(
+            functools.partial(
+                remote_db.query_admin_highlights_funnel_remote,
+                days=days,
+                q=q,
+                tag=tag,
+            )
+        )
+    except ValueError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({
+            'reason': 'remote_error',
+            'error': str(exc),
+        }, status_code=503)
+
+
+@router.get("/api/admin/highlights/funnel/rows")
+async def admin_highlights_funnel_rows(
+    request: Request,
+    view: str = "panorama",
+    days: int = 1,
+    q: str = "",
+    tag: str = "",
+    display: str = "all",
+    stage: str = "",
+    page: int = 1,
+    limit: int = 50,
+):
+    user, err = _require_admin(request)
+    if err:
+        return err
+
+    safe_page = max(1, int(page or 1))
+    safe_limit = max(1, min(int(limit or 50), 100))
+    if not remote_db.app_state_to_remote():
+        return JSONResponse({
+            'reason': 'remote_required',
+            'granularity': 'item' if view == 'anomaly' else 'cluster',
+            'items': [],
+            'total': 0,
+            'page': safe_page,
+        }, status_code=501)
+
+    try:
+        return await run_in_threadpool(
+            functools.partial(
+                remote_db.query_admin_highlights_funnel_rows_remote,
+                view=view,
+                days=days,
+                q=q,
+                tag=tag,
+                display=display,
+                stage=stage,
+                page=safe_page,
+                limit=safe_limit,
+                user_id=user['id'],
+            )
+        )
+    except ValueError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({
+            'reason': 'remote_error',
+            'error': str(exc),
+        }, status_code=503)
+
+
+@router.post("/api/admin/highlights/clusters/{cluster_id}/override")
+async def admin_highlight_cluster_override(request: Request, cluster_id: int):
+    user, err = _require_admin(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    payload = body if isinstance(body, dict) else {}
+    action = str(payload.get('action') or '').strip()
+    if action not in {'force_show', 'force_hide', 'clear'}:
+        return JSONResponse({'error': 'invalid override action'}, status_code=400)
+    raw_note = payload.get('note')
+    if raw_note is not None and not isinstance(raw_note, str):
+        return JSONResponse({'error': 'override note must be a string'}, status_code=400)
+    note = raw_note.strip() if raw_note is not None else None
+    note = note or None
+    if note is not None and len(note) > 500:
+        return JSONResponse({'error': 'override note exceeds 500 characters'}, status_code=400)
+    if not remote_db.app_state_to_remote():
+        return JSONResponse({'reason': 'remote_required'}, status_code=501)
+    try:
+        result = await run_in_threadpool(
+            functools.partial(
+                remote_db.set_admin_highlight_cluster_override_remote,
+                cluster_id=cluster_id,
+                user_id=user['id'],
+                action=action,
+                note=note,
+            )
+        )
+    except ValueError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({'reason': 'remote_error', 'error': str(exc)}, status_code=503)
+    if result is None:
+        return JSONResponse({'error': 'Cluster not found'}, status_code=404)
+    return result
 
 
 @router.get("/api/admin/remote-db/status")
@@ -212,9 +355,10 @@ async def remote_database_status(request: Request):
             'status_backend': remote_db.status_backend(),
         }
     try:
+        status = await run_in_threadpool(remote_db.status)
         return {
             'remote_enabled': True,
-            **remote_db.status(),
+            **status,
         }
     except remote_db.RemoteDBError as exc:
         return JSONResponse({
@@ -232,7 +376,13 @@ async def list_fetch_runs(request: Request, limit: int = 50, offset: int = 0):
 
     if remote_db.app_state_to_remote():
         return {
-            'runs': remote_db.list_fetch_run_audits_remote(limit=limit, offset=offset),
+            'runs': await run_in_threadpool(
+                functools.partial(
+                    remote_db.list_fetch_run_audits_remote,
+                    limit=limit,
+                    offset=offset,
+                )
+            ),
             'limit': max(1, min(int(limit or 50), 100)),
             'offset': max(0, int(offset or 0)),
         }
@@ -255,7 +405,7 @@ async def get_fetch_run(run_id: int, request: Request):
         return err
 
     if remote_db.app_state_to_remote():
-        run = remote_db.get_fetch_run_audit_remote(run_id)
+        run = await run_in_threadpool(remote_db.get_fetch_run_audit_remote, run_id)
         if not run:
             return JSONResponse({'error': 'Fetch run not found'}, status_code=404)
         return {'run': run}
@@ -284,12 +434,15 @@ async def list_fetch_run_items(
         return err
 
     if remote_db.app_state_to_remote():
-        result = remote_db.query_fetch_run_audit_items_remote(
-            run_id,
-            platform=platform,
-            source=source,
-            limit=limit,
-            offset=offset,
+        result = await run_in_threadpool(
+            functools.partial(
+                remote_db.query_fetch_run_audit_items_remote,
+                run_id,
+                platform=platform,
+                source=source,
+                limit=limit,
+                offset=offset,
+            )
         )
         if result.pop('missing_run', False):
             return JSONResponse({'error': 'Fetch run not found'}, status_code=404)
@@ -334,10 +487,13 @@ async def get_embedding_usage(
         return err
 
     if remote_db.app_state_to_remote():
-        return remote_db.get_embedding_usage_audit_remote(
-            hours=max(0.0, min(float(hours or 24), 24 * 30)),
-            run_id=run_id,
-            limit=limit,
+        return await run_in_threadpool(
+            functools.partial(
+                remote_db.get_embedding_usage_audit_remote,
+                hours=max(0.0, min(float(hours or 24), 24 * 30)),
+                run_id=run_id,
+                limit=limit,
+            )
         )
 
     conn = db.get_conn()

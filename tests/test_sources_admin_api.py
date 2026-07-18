@@ -1,8 +1,10 @@
 """订阅配置 Wave 3: admin-only sources API tests."""
 import json
 import os
+import subprocess
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import bcrypt as _bcrypt
 import pytest
@@ -103,6 +105,12 @@ def _set_x_user_gray_limit(base, limit):
 
 def test_list_sources_groups_non_deleted_sources_and_health(sources_env):
     admin = _login(sources_env["app"], "admin-sources@test.local")
+    fetched_at = datetime.now(timezone.utc) - timedelta(days=1)
+    started_at = fetched_at - timedelta(minutes=5)
+    last_success_at = fetched_at - timedelta(minutes=1)
+    fetched_at_text = fetched_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    started_at_text = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    last_success_at_text = last_success_at.strftime("%Y-%m-%dT%H:%M:%SZ")
     conn = db_mod.get_conn()
     try:
         rss_id = _insert_source(
@@ -116,12 +124,13 @@ def test_list_sources_groups_non_deleted_sources_and_health(sources_env):
         _insert_source(conn, "rss", "https://deleted.test/feed.xml", status="deleted")
         run_id = conn.execute(
             """INSERT INTO fetch_runs(started_at, finished_at, status)
-               VALUES('2026-07-04T00:00:00Z', '2026-07-04T00:05:00Z', 'success')"""
+               VALUES(?, ?, 'success')""",
+            (started_at_text, fetched_at_text),
         ).lastrowid
         conn.execute(
             """INSERT INTO items(id, platform, source, source_id, title, fetched_at)
-               VALUES('item-rss', 'rss', 'feed:example', ?, 'Title', '2026-07-04T00:05:00Z')""",
-            (rss_id,),
+               VALUES('item-rss', 'rss', 'feed:example', ?, 'Title', ?)""",
+            (rss_id, fetched_at_text),
         )
         conn.execute(
             """INSERT INTO fetch_run_items(run_id, item_id, platform, source, was_inserted)
@@ -130,11 +139,11 @@ def test_list_sources_groups_non_deleted_sources_and_health(sources_env):
         )
         conn.execute(
             """UPDATE sources
-               SET consecutive_failures = 2,
-                   last_success_at = '2026-07-04T00:05:00Z',
-                   last_error = 'temporary timeout'
-               WHERE id = ?""",
-            (rss_id,),
+                   SET consecutive_failures = 2,
+                       last_success_at = ?,
+                       last_error = 'temporary timeout'
+                   WHERE id = ?""",
+            (last_success_at_text, rss_id),
         )
         conn.commit()
     finally:
@@ -145,13 +154,119 @@ def test_list_sources_groups_non_deleted_sources_and_health(sources_env):
     groups = {g["platform"]: g["sources"] for g in resp.json()["groups"]}
     assert set(groups) == {"reddit", "rss"}
     rss = groups["rss"][0]
+    reddit = groups["reddit"][0]
     assert rss["source_key"] == "https://example.com/feed.xml"
     assert rss["consecutive_failures"] == 2
-    assert rss["last_success_at"] == "2026-07-04T00:05:00Z"
+    assert rss["last_success_at"] == last_success_at_text
     assert rss["last_error"] == "temporary timeout"
-    assert rss["health"]["last_fetched_at"] == "2026-07-04T00:05:00Z"
+    assert rss["health"]["last_fetched_at"] == fetched_at_text
     assert rss["health"]["inserted_7d"] == 1
     assert rss["health"]["consecutive_failures"] == 2
+    assert reddit["health"]["last_fetched_at"] is None
+    assert reddit["health"]["inserted_7d"] is None
+
+
+def test_list_sources_marks_successful_zero_output_as_fetched(sources_env):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+    conn = db_mod.get_conn()
+    try:
+        source_id = _insert_source(
+            conn,
+            "rss",
+            "https://zero-output.test/feed.xml",
+            display_name="Zero Output",
+            config_json={"slug": "zero-output"},
+        )
+        conn.execute(
+            "UPDATE sources SET last_success_at = ? WHERE id = ?",
+            ("2026-07-10T01:02:03Z", source_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    resp = admin.get("/api/admin/sources")
+
+    assert resp.status_code == 200, resp.text
+    sources = {
+        source["source_key"]: source
+        for group in resp.json()["groups"]
+        for source in group["sources"]
+    }
+    health = sources["https://zero-output.test/feed.xml"]["health"]
+    assert health["last_fetched_at"] == "2026-07-10T01:02:03Z"
+    assert health["inserted_7d"] == 0
+
+
+def test_list_sources_includes_latest_x_run_coverage_and_attempts(sources_env):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+    conn = db_mod.get_conn()
+    try:
+        success_id = _insert_source(conn, "x_user", "success")
+        failed_id = _insert_source(conn, "x_user", "failed")
+        missed_id = _insert_source(conn, "x_user", "missed", status="not_fetched")
+        summary = {
+            "started_at": "2026-07-11T01:00:00+00:00",
+            "finished_at": "2026-07-11T01:10:00+00:00",
+            "planned": 3,
+            "attempted": 2,
+            "succeeded": 1,
+            "no_new": 0,
+            "failed": 1,
+            "missed": 1,
+            "missed_source_ids": [missed_id],
+            "results": [
+                {
+                    "source_id": success_id,
+                    "handle": "success",
+                    "outcome": "success",
+                    "attempts": 1,
+                    "new_count": 2,
+                },
+                {
+                    "source_id": failed_id,
+                    "handle": "failed",
+                    "outcome": "failed",
+                    "attempts": 3,
+                    "error_code": "rate_limited",
+                    "error": "429 rate limit",
+                },
+            ],
+        }
+        conn.execute(
+            """INSERT INTO fetch_runs(started_at, finished_at, status, stats_json)
+               VALUES(?, ?, 'done', ?)""",
+            (
+                summary["started_at"],
+                summary["finished_at"],
+                json.dumps({"_x_source_attempts": summary}),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    body = admin.get("/api/admin/sources").json()
+
+    assert body["latest_x_run"] == {
+        "run_id": 1,
+        "started_at": "2026-07-11T01:00:00+00:00",
+        "finished_at": "2026-07-11T01:10:00+00:00",
+        "planned": 3,
+        "attempted": 2,
+        "succeeded": 1,
+        "no_new": 0,
+        "failed": 1,
+        "missed": 1,
+    }
+    x_sources = {
+        source["source_key"]: source
+        for group in body["groups"] if group["platform"] == "x_user"
+        for source in group["sources"]
+    }
+    assert x_sources["success"]["health"]["latest_attempt"]["outcome"] == "success"
+    assert x_sources["failed"]["health"]["latest_attempt"]["error_code"] == "rate_limited"
+    assert x_sources["missed"]["health"]["latest_attempt"]["outcome"] == "missed"
 
 
 @pytest.mark.parametrize("payload", [
@@ -224,6 +339,120 @@ def test_validate_wechat_mp_channel_id_uses_lingowhale_backend(sources_env, monk
     }
 
 
+def test_validate_x_user_uses_twitter_cli_bare_tweet_list(sources_env, monkeypatch):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+
+    import routes.sources as sources_route
+
+    calls = []
+
+    def fake_run(args, capture_output, text, timeout):
+        calls.append(args)
+        assert capture_output is True
+        assert text is True
+        assert timeout == 30
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps([
+                {
+                    "id": "123",
+                    "text": "Hello from X",
+                    "time": "2026-07-07T10:00:00Z",
+                    "author": {"screenName": "@openai"},
+                }
+            ]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(sources_route.subprocess, "run", fake_run)
+
+    resp = admin.post("/api/admin/sources/validate", json={
+        "platform": "x_user",
+        "source_key": "openai",
+    })
+
+    assert resp.status_code == 200, resp.text
+    assert calls == [["twitter", "--compact", "user-posts", "openai", "-n", "3", "--json"]]
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["display_name"] == "openai"
+    assert body["preview"] == [{
+        "title": "Hello from X",
+        "url": "https://x.com/openai/status/123",
+        "published_at": "2026-07-07T10:00:00Z",
+        "summary": "Hello from X",
+    }]
+
+
+def test_validate_x_user_empty_timeline_returns_empty(sources_env, monkeypatch):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+
+    import routes.sources as sources_route
+
+    def fake_run(args, capture_output, text, timeout):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="[]",
+            stderr="",
+        )
+
+    monkeypatch.setattr(sources_route.subprocess, "run", fake_run)
+
+    resp = admin.post("/api/admin/sources/validate", json={
+        "platform": "x_user",
+        "source_key": "openai",
+    })
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "empty"
+    assert resp.json()["preview"] == []
+
+
+def test_validate_x_user_missing_twitter_cli_returns_deferred(sources_env, monkeypatch):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+
+    import routes.sources as sources_route
+
+    def fake_run(args, capture_output, text, timeout):
+        raise FileNotFoundError("twitter")
+
+    monkeypatch.setattr(sources_route.subprocess, "run", fake_run)
+
+    resp = admin.post("/api/admin/sources/validate", json={
+        "platform": "x_user",
+        "source_key": "openai",
+    })
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "deferred"
+    assert body["reason"] == "X validation requires the local twitter CLI session, which is unavailable in this environment."
+
+
+def test_validate_x_user_timeout_returns_empty_warning(sources_env, monkeypatch):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+
+    import routes.sources as sources_route
+
+    def fake_run(args, capture_output, text, timeout):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(sources_route.subprocess, "run", fake_run)
+
+    resp = admin.post("/api/admin/sources/validate", json={
+        "platform": "x_user",
+        "source_key": "openai",
+    })
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "empty"
+    assert body["preview"] == []
+    assert body["warning"] == "校验超时，可先入库"
+
+
 def test_create_wechat_mp_channel_id_sets_lingowhale_backend(sources_env):
     admin = _login(sources_env["app"], "admin-sources@test.local")
 
@@ -252,6 +481,55 @@ def test_create_wechat_mp_url_sets_rss_backend(sources_env):
     source = resp.json()["source"]
     assert source["source_key"] == "https://wechat.example.com/feed.xml"
     assert source["config_json"]["backend"] == "rss"
+
+
+def test_search_wechat_marks_existing_registry_sources(sources_env, monkeypatch):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+
+    import remote_db
+    import routes.sources as sources_route
+
+    conn = db_mod.get_conn()
+    try:
+        _insert_source(conn, "wechat_mp", "ch-active", display_name="已添加")
+        _insert_source(conn, "wechat_mp", "ch-deleted", status="deleted", display_name="已删除")
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(remote_db, "fetch_write_to_remote", lambda: False)
+    monkeypatch.setattr(sources_route.remote_db, "fetch_write_to_remote", lambda: False)
+    monkeypatch.setattr(
+        sources_route.fetch_lingowhale,
+        "search_channels",
+        lambda q, limit=20: [
+            {"channel_id": "ch-active", "name": "已添加"},
+            {"channel_id": "ch-deleted", "name": "已删除"},
+            {"channel_id": "ch-new", "name": "新号"},
+        ],
+    )
+
+    resp = admin.get("/api/admin/sources/search-wechat?q=赛博&limit=3")
+
+    assert resp.status_code == 200, resp.text
+    channels = resp.json()["channels"]
+    assert [ch["channel_id"] for ch in channels] == ["ch-active", "ch-deleted", "ch-new"]
+    assert [ch["already_in_registry"] for ch in channels] == [True, False, False]
+
+
+def test_search_wechat_upstream_error_returns_502(sources_env, monkeypatch):
+    admin = _login(sources_env["app"], "admin-sources@test.local")
+
+    import routes.sources as sources_route
+
+    def boom(q, limit=20):
+        raise RuntimeError("lingowhale search failed: code=10010 msg=token expired")
+
+    monkeypatch.setattr(sources_route.fetch_lingowhale, "search_channels", boom)
+
+    resp = admin.get("/api/admin/sources/search-wechat?q=赛博")
+
+    assert resp.status_code == 502
+    assert "lingowhale search failed" in resp.json()["error"]
 
 
 def test_create_soft_delete_and_revive_preserves_source_id(sources_env):
@@ -286,7 +564,7 @@ def test_create_soft_delete_and_revive_preserves_source_id(sources_env):
         conn.close()
 
 
-def test_create_x_user_over_gray_limit_is_pending(sources_env):
+def test_create_x_user_ignores_retired_gray_limit(sources_env):
     _set_x_user_gray_limit(sources_env["base"], 2)
     admin = _login(sources_env["app"], "admin-sources@test.local")
     conn = db_mod.get_conn()
@@ -304,13 +582,11 @@ def test_create_x_user_over_gray_limit_is_pending(sources_env):
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["gray_gated"] is True
-    assert body["limit"] == 2
-    assert body["message"] == "已达 X 灰度上限 2，置为 pending，放量后再激活"
-    assert body["source"]["status"] == "pending"
+    assert "gray_gated" not in body
+    assert body["source"]["status"] == "active"
 
 
-def test_patch_x_user_active_over_gray_limit_is_rejected(sources_env):
+def test_patch_x_user_active_ignores_retired_gray_limit(sources_env):
     _set_x_user_gray_limit(sources_env["base"], 2)
     admin = _login(sources_env["app"], "admin-sources@test.local")
     conn = db_mod.get_conn()
@@ -323,16 +599,15 @@ def test_patch_x_user_active_over_gray_limit_is_rejected(sources_env):
 
     resp = admin.patch(f"/api/admin/sources/{source_id}", json={"status": "active"})
 
-    assert resp.status_code == 409, resp.text
+    assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["gray_gated"] is True
-    assert body["limit"] == 2
-    assert body["message"] == "已达 X 灰度上限 2，保持原状态，放量后再激活"
+    assert "gray_gated" not in body
+    assert body["source"]["status"] == "active"
 
     conn = db_mod.get_conn()
     try:
         row = conn.execute("SELECT status FROM sources WHERE id = ?", (source_id,)).fetchone()
-        assert row["status"] == "paused"
+        assert row["status"] == "active"
     finally:
         conn.close()
 
@@ -389,24 +664,22 @@ def test_algo_params_read_write_config_json(sources_env):
     assert before.status_code == 200, before.text
     assert before.json()["params"]["hackernews_count"] == 30
     assert before.json()["params"]["github_trending_count"] == 25
-    assert before.json()["params"]["twitter_for_you_count"] == 50
+    assert "twitter_following_count" not in before.json()["params"]
+    assert "twitter_for_you_count" not in before.json()["params"]
 
     patch = admin.patch("/api/admin/sources/algo-params", json={
         "hackernews_count": 31,
         "github_trending_count": 26,
-        "twitter_for_you_count": 42,
         "bilibili_hot_count": 12,
         "bilibili_rank_count": 13,
     })
     assert patch.status_code == 200, patch.text
     assert patch.json()["params"]["hackernews_count"] == 31
     assert patch.json()["params"]["github_trending_count"] == 26
-    assert patch.json()["params"]["twitter_for_you_count"] == 42
 
     saved = json.loads((sources_env["base"] / "config" / "config.json").read_text(encoding="utf-8"))
     assert saved["hackernews"]["count"] == 31
     assert saved["github_trending"]["count"] == 26
-    assert saved["twitter"]["for_you_count"] == 42
     assert saved["bilibili"]["hot_count"] == 12
     assert saved["bilibili"]["rank_count"] == 13
 

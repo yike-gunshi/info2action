@@ -27,6 +27,7 @@ data/health.json
 data/cli_auth_cache.json
 data/ai_provider_state.json
 data/ai_provider_state.lock
+data/lingowhale_tokens.json
 data/action_streams/
 data/backfill_*_progress.json
 data/dedup_plan.json

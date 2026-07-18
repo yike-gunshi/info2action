@@ -14,7 +14,7 @@ from prompt_loader import load_prompt
 
 
 PROMPT_FILE = "14_item_verdict_v3_1.md"
-PROMPT_VERSION = "item_verdict_v3_7_2_ai_toolchain_scope_2026_06_17"
+PROMPT_VERSION = "item_verdict_v3_8_veto_dimension_2026_07_10"
 
 VALID_VERDICTS = {"featured", "borderline", "drop"}
 VALID_VALUE_PATHS = {"substantive", "major_event", "lead_value", "none"}
@@ -22,6 +22,8 @@ VALID_UNCERTAINTIES = {"none", "thin_detail", "needs_source", "unverified_major_
 VALID_AI_RELEVANCE = {"yes", "no"}
 POSITIVE_BORDERLINE_PATHS = {"substantive", "major_event", "lead_value"}
 VALID_SCORE_KEYS = ("importance", "novelty", "credibility", "substance", "actionability")
+# v3.8: 否决维度独立于质量权衡，命中任一即强制 drop（伤害不对称：错进垃圾 > 漏选）
+VALID_VETOES = {"none", "marketing", "rumor_unverified", "flamewar", "engagement_bait"}
 
 
 def load_system_prompt() -> str:
@@ -73,6 +75,7 @@ def _pending_result(error: str, *, raw_text: str | None = None) -> dict[str, Any
         "highlight_include_in_highlights": False,
         "highlight_reason": "",
         "highlight_scores": {},
+        "highlight_veto": None,
         "highlight_ai_relevant": None,
         "highlight_spam": None,
         "highlight_confidence": None,
@@ -128,8 +131,17 @@ def normalize_verdict_result(raw: str | dict[str, Any]) -> dict[str, Any]:
     if uncertainty not in VALID_UNCERTAINTIES:
         return _pending_result(f"invalid_uncertainty: {uncertainty}", raw_text=raw_text)
 
+    # v3.8 否决维度：合法非 none 值强制 drop（即使 LLM verdict 给了 featured）；
+    # 字段缺失或非法值视为未提供，走原逻辑（向后兼容存量输出）
+    veto_raw = str(obj.get("veto") or "").strip().lower()
+    veto = veto_raw if veto_raw in VALID_VETOES else None
+    if veto is not None and veto != "none":
+        verdict = "drop"
+
     scores_raw = obj.get("scores") if isinstance(obj.get("scores"), dict) else {}
-    scores = {key: _coerce_score(scores_raw.get(key)) for key in VALID_SCORE_KEYS}
+    scores: dict[str, Any] = {key: _coerce_score(scores_raw.get(key)) for key in VALID_SCORE_KEYS}
+    if veto is not None:
+        scores["veto"] = veto  # 寄生 highlight_scores jsonb 落库，复盘查 ->>'veto'
     cluster_verdict = _cluster_verdict(verdict, value_path, uncertainty)
     include = cluster_verdict in {"featured", "positive_borderline"}
     spam = obj.get("spam")
@@ -148,6 +160,7 @@ def normalize_verdict_result(raw: str | dict[str, Any]) -> dict[str, Any]:
         "highlight_include_in_highlights": include,
         "highlight_reason": str(obj.get("reason") or "").strip()[:1000],
         "highlight_scores": scores,
+        "highlight_veto": veto,
         "highlight_ai_relevant": ai_relevant,
         "highlight_spam": spam_value,
         "highlight_confidence": _coerce_confidence(obj.get("confidence")),

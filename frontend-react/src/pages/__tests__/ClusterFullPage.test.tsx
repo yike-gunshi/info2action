@@ -158,6 +158,31 @@ describe('ClusterFullPage', () => {
     expect(cards[1]).toHaveTextContent('较旧来源')
   })
 
+  // v24.0 §21.5: 内页标题区 = kicker(mono 12px) + 28px 衬线 h1 + Scotch rule 双线
+  it('左栏渲染报纸内页标题区(kicker + 衬线大标题 + Scotch rule)', () => {
+    render(<ClusterFullPage clusterId={1326} />)
+
+    const kicker = screen.getByTestId('cluster-full-kicker')
+    expect(kicker.className).toContain('font-mono')
+    expect(kicker.className).toContain('text-[12px]')
+    expect(kicker).toHaveTextContent('2 个来源')
+    expect(kicker).toHaveTextContent('5 条报道')
+
+    const heading = screen.getByRole('heading', { level: 1 })
+    expect(heading).toHaveTextContent('本周 HN 热文')
+    expect(heading.className).toContain('font-event-title')
+    expect(heading.className).toContain('sm:text-[28px]')
+    expect(heading.className).toContain('font-bold')
+
+    const scotch = screen.getByTestId('cluster-full-scotch-rule')
+    expect(scotch.className).toContain('border-t-2')
+    expect(scotch.className).toContain('border-t-foreground')
+    expect(scotch.className).toContain('border-b-border')
+
+    // mini-header 标题降级为普通文本,页面只保留一个 h1
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+  })
+
   it('短来源列表也使用双栏独立滚动和中间分隔线', () => {
     render(<ClusterFullPage clusterId={1326} />)
 

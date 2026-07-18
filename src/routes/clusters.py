@@ -22,7 +22,10 @@ Confirmed-edge experiment visibility:
 """
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import logging
 import os
 import queue
 import threading
@@ -64,6 +67,8 @@ def _log_event(event: str, **fields):
             f.write(line + '\n')
     except Exception:
         pass
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -200,6 +205,73 @@ def _remote_error_response(exc: Exception) -> JSONResponse:
         'detail': str(exc),
         'data_backend': remote_db.event_read_backend(),
     }, status_code=503)
+
+
+# BF-0708-3: last-good snapshot of the events payload, keyed like the public
+# response cache but never expiring. When the read model degrades and the query
+# times out, serving 12-day-old events beats a spinner that never stops.
+_LAST_GOOD_EVENTS: dict[tuple, Any] = {}
+_LAST_GOOD_EVENTS_LOCK = threading.Lock()
+_LAST_GOOD_EVENTS_MAX = 32
+
+
+def _remember_last_good_events(key: tuple, payload: Any) -> None:
+    if key is None or not isinstance(payload, dict):
+        return
+    with _LAST_GOOD_EVENTS_LOCK:
+        if len(_LAST_GOOD_EVENTS) >= _LAST_GOOD_EVENTS_MAX and key not in _LAST_GOOD_EVENTS:
+            _LAST_GOOD_EVENTS.pop(next(iter(_LAST_GOOD_EVENTS)))
+        _LAST_GOOD_EVENTS[key] = copy.deepcopy(payload)
+
+
+def _degraded_events_response(key: tuple | None) -> JSONResponse:
+    """Serve stale data if we have any, otherwise an explicit empty state.
+
+    Always HTTP 200: the request succeeded, the data is just old or missing.
+    A 5xx here would make the frontend render an error instead of the feed.
+    """
+    snapshot = None
+    if key is not None:
+        with _LAST_GOOD_EVENTS_LOCK:
+            snapshot = copy.deepcopy(_LAST_GOOD_EVENTS.get(key))
+
+    if snapshot is not None:
+        snapshot['degraded'] = True
+        snapshot['stale'] = True
+        return JSONResponse(snapshot, status_code=200, headers={'Cache-Control': 'no-store'})
+
+    return JSONResponse(
+        {'events': [], 'total': 0, 'degraded': True, 'stale': False},
+        status_code=200,
+        headers={'Cache-Control': 'no-store'},
+    )
+
+
+def _reset_last_good_events_for_test() -> None:
+    with _LAST_GOOD_EVENTS_LOCK:
+        _LAST_GOOD_EVENTS.clear()
+
+
+# BF-0708-3: request-level budget. statement_timeout only bounds a single SQL
+# statement; the 129s feed request was dozens of individually-fast queries in
+# the live-aggregation fallback. Only a wall-clock budget keeps us under
+# Cloudflare's ~100s cutoff.
+FEED_EVENTS_REQUEST_TIMEOUT_SEC_ENV = 'INFO2ACTION_FEED_EVENTS_REQUEST_TIMEOUT_SEC'
+_FEED_EVENTS_REQUEST_TIMEOUT_DEFAULT_SEC = 30.0
+_FEED_EVENTS_REQUEST_TIMEOUT_CEILING_SEC = 90.0
+
+
+def _feed_events_request_timeout_sec() -> float:
+    raw = (os.environ.get(FEED_EVENTS_REQUEST_TIMEOUT_SEC_ENV) or '').strip()
+    if not raw:
+        return _FEED_EVENTS_REQUEST_TIMEOUT_DEFAULT_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return _FEED_EVENTS_REQUEST_TIMEOUT_DEFAULT_SEC
+    if value <= 0:
+        return _FEED_EVENTS_REQUEST_TIMEOUT_DEFAULT_SEC
+    return min(value, _FEED_EVENTS_REQUEST_TIMEOUT_CEILING_SEC)
 
 
 def _public_cache_scope() -> tuple[str, str]:
@@ -375,6 +447,7 @@ def _row_to_event(
         'id': row['id'],
         'ai_title': row['ai_title'],
         'ai_summary': row['ai_summary'],
+        'why_read': row['why_read'],
         'doc_count': row['doc_count'],
         'unique_source_count': usc,
         'category': metadata.get('category'),
@@ -481,7 +554,7 @@ def _categories_sql_clause(categories: list[str]) -> tuple[str, list[str]]:
 async def feed_events(
     request: Request,
     response: Response,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=500),
     limit: int = Query(20, ge=1, le=100),
     since_version_snapshot: int | None = Query(None, description='client snapshot anchor'),
     fetched_since: str | None = Query(None, description='only clusters touched by docs fetched since this timestamp'),
@@ -522,23 +595,43 @@ async def feed_events(
         response.headers['Cache-Control'] = 'no-store'
     if events_remote:
         try:
-            result = await run_in_threadpool(
-                remote_db.fetch_events,
-                page=page,
-                limit=limit,
-                cursor=read_model_cursor,
-                since_version_snapshot=since_version_snapshot,
-                fetched_since=fetched_since,
-                user_id=uid,
-                public_only=public_only,
-                min_github_stars=min_github_stars,
-                enabled=events_enabled,
-                categories=categories_list,
-                timezone_offset_minutes=tz_offset,
+            # BF-0708-3: wall-clock budget for the whole read. The slow path is
+            # many individually-fast queries, so per-statement timeouts cannot
+            # bound it. The worker thread keeps running after we give up — we
+            # cannot cancel it — but the client gets an answer well before
+            # Cloudflare's ~100s cutoff, which is what prevents the 524.
+            result = await asyncio.wait_for(
+                run_in_threadpool(
+                    remote_db.fetch_events,
+                    page=page,
+                    limit=limit,
+                    cursor=read_model_cursor,
+                    since_version_snapshot=since_version_snapshot,
+                    fetched_since=fetched_since,
+                    user_id=uid,
+                    public_only=public_only,
+                    min_github_stars=min_github_stars,
+                    enabled=events_enabled,
+                    categories=categories_list,
+                    timezone_offset_minutes=tz_offset,
+                ),
+                timeout=_feed_events_request_timeout_sec(),
             )
+            _remember_last_good_events(cache_key, result)
             if cache_key is not None:
                 return set_public_json_response(cache_key, result)
             return result
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                'feed_events: request exceeded %.1fs budget, serving degraded response',
+                _feed_events_request_timeout_sec(),
+            )
+            return _degraded_events_response(cache_key)
+        except remote_db.RemoteDBTimeoutError as exc:
+            # A single statement blew its statement_timeout. The DB is reachable,
+            # this read was just too slow — degrade rather than surface an error.
+            logger.warning('feed_events: read timed out, serving degraded response: %s', exc)
+            return _degraded_events_response(cache_key)
         except remote_db.RemoteDBError as exc:
             return _remote_error_response(exc)
 
@@ -551,7 +644,7 @@ async def feed_events(
         # Confirmed-edge experiment: visibility is decided by the pipeline via
         # is_visible_in_feed. Do not re-apply doc/source-count gates here.
         rows = conn.execute(
-            f"""SELECT c.id, c.ai_title, c.ai_summary, c.doc_count,
+            f"""SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.doc_count,
                        c.unique_source_count, c.first_doc_at, c.last_doc_at,
                        c.platforms_json,
                        COALESCE(NULLIF(c.cover_url, ''), (
@@ -690,7 +783,7 @@ async def cluster_detail(request: Request, cluster_id: int):
     conn = db.get_conn()
     try:
         row = conn.execute(
-            """SELECT c.id, c.ai_title, c.ai_summary, c.ai_key_points, c.doc_count,
+            """SELECT c.id, c.ai_title, c.ai_summary, c.why_read, c.ai_key_points, c.doc_count,
                       unique_source_count,
                       c.platforms_json,
                       COALESCE(NULLIF(c.cover_url, ''), (
@@ -730,7 +823,7 @@ async def cluster_detail(request: Request, cluster_id: int):
         seen_row = None
         if uid:
             seen_row = conn.execute(
-                "SELECT clicked_at, starred_at, last_seen_version FROM cluster_status "
+                "SELECT clicked_at, starred_at, last_seen_version, feedback_kind, feedback_note FROM cluster_status "
                 "WHERE user_id=? AND cluster_id=?",
                 (uid, cluster_id),
             ).fetchone()
@@ -739,12 +832,15 @@ async def cluster_detail(request: Request, cluster_id: int):
             'clicked_at': to_utc_iso(seen_row['clicked_at']) if seen_row and seen_row['clicked_at'] else None,
             'starred_at': to_utc_iso(seen_row['starred_at']) if seen_row and seen_row['starred_at'] else None,
             'last_seen_version': user_last_seen,
+            'feedback_kind': seen_row['feedback_kind'] if seen_row else None,
+            'feedback_note': seen_row['feedback_note'] if seen_row else None,
         }
 
         body = {
             'id': row['id'],
             'ai_title': row['ai_title'],
             'ai_summary': row['ai_summary'],
+            'why_read': row['why_read'],
             'ai_key_points': kps,
             'doc_count': row['doc_count'],
             # BF-0428-1: expose unique_source_count to frontend (header "来源 N"
@@ -774,7 +870,7 @@ async def cluster_detail(request: Request, cluster_id: int):
 async def cluster_sources(
     request: Request,
     cluster_id: int,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=500),
     limit: int = Query(20, ge=1, le=100),
 ):
     public_only = _is_anonymous_public_request(request)
@@ -859,7 +955,7 @@ async def cluster_sources(
 async def cluster_bundle(
     request: Request,
     cluster_id: int,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=500),
     limit: int = Query(20, ge=1, le=100),
 ):
     uid = current_user_id(request)
@@ -930,6 +1026,85 @@ async def cluster_click(request: Request, cluster_id: int):
         )
         conn.commit()
         return {'ok': True, 'last_seen_version': lv}
+    finally:
+        conn.close()
+
+
+CLUSTER_FEEDBACK_KINDS = {'positive', 'irrelevant', 'low_quality', 'should_feature'}
+
+
+@router.post('/api/clusters/{cluster_id}/feedback')
+async def cluster_feedback(request: Request, cluster_id: int):
+    """v25.0 F-D — per-user cluster 质量反馈：幂等（同 kind 再提交=撤销），只落库不改排序。"""
+    uid, err = _require_user(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    payload = body if isinstance(body, dict) else {}
+    kind = str(payload.get('kind') or '').strip()
+    if kind not in CLUSTER_FEEDBACK_KINDS:
+        return JSONResponse({'error': 'invalid feedback kind'}, status_code=400)
+    raw_note = payload.get('note')
+    if raw_note is not None and not isinstance(raw_note, str):
+        return JSONResponse({'error': 'feedback note must be a string'}, status_code=400)
+    note = raw_note.strip() if raw_note is not None else None
+    note = note or None
+    if note is not None and len(note) > 500:
+        return JSONResponse({'error': 'feedback note exceeds 500 characters'}, status_code=400)
+
+    if remote_db.events_read_from_remote() or remote_db.status_write_to_remote():
+        try:
+            result = await run_in_threadpool(
+                remote_db.set_cluster_feedback,
+                cluster_id=cluster_id,
+                user_id=uid,
+                kind=kind,
+                note=note,
+            )
+        except remote_db.RemoteDBError as exc:
+            return _remote_error_response(exc)
+        if result is None:
+            return JSONResponse({'error': 'Cluster not found'}, status_code=404)
+        return result
+
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM clusters WHERE id = ?", (cluster_id,)
+        ).fetchone()
+        if not row:
+            return JSONResponse({'error': 'Cluster not found'}, status_code=404)
+
+        status = conn.execute(
+            "SELECT feedback_kind FROM cluster_status WHERE user_id=? AND cluster_id=?",
+            (uid, cluster_id),
+        ).fetchone()
+        if status and status['feedback_kind'] == kind:
+            conn.execute(
+                "UPDATE cluster_status "
+                "SET feedback_kind = NULL, feedback_at = NULL, feedback_note = NULL "
+                "WHERE user_id=? AND cluster_id=?",
+                (uid, cluster_id),
+            )
+            conn.commit()
+            return {'ok': True, 'feedback_kind': None, 'feedback_note': None}
+
+        conn.execute(
+            """INSERT INTO cluster_status (
+                 user_id, cluster_id, feedback_kind, feedback_at, feedback_note
+               )
+               VALUES (?, ?, ?, datetime('now'), ?)
+               ON CONFLICT(user_id, cluster_id) DO UPDATE SET
+                 feedback_kind = excluded.feedback_kind,
+                 feedback_at = excluded.feedback_at,
+                 feedback_note = excluded.feedback_note""",
+            (uid, cluster_id, kind, note),
+        )
+        conn.commit()
+        return {'ok': True, 'feedback_kind': kind, 'feedback_note': note}
     finally:
         conn.close()
 
@@ -1592,7 +1767,7 @@ async def item_generate_action(request: Request, item_id: str):
 @router.get('/api/search')
 async def context_search(
     request: Request,
-    q: str = Query('', description='search keyword'),
+    q: str = Query('', max_length=200, description='search keyword'),
     context: str = Query('recommend', pattern='^(recommend|channel|collection|history)$'),
     limit: int = Query(30, ge=1, le=100),
     categories: str | None = Query(None, description='v17.0: 精选 tab pill 筛选叠加搜索, comma-separated L1 ids'),
@@ -1689,7 +1864,7 @@ async def context_search(
             # (unique_source_count=0 by DEFAULT) leak via search even though
             # the feed correctly hides them.
             ev_rows = conn.execute(
-                f"""SELECT id, ai_title, ai_summary, doc_count,
+                f"""SELECT id, ai_title, ai_summary, why_read, doc_count,
                           unique_source_count, first_doc_at, last_doc_at,
                           platforms_json, cover_url, live_version
                    FROM clusters

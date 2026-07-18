@@ -95,7 +95,7 @@ function mapWithUpdatedItem(
 ): Map<string, FeedItem[]> {
   // FE-1(B7): 只重建包含该 item 的 section,其余复用原数组引用——
   // 原实现对每个 section 都 map 出新数组,点一张卡导致全部 section 的
-  // visibleItems memo 失效 → 全页重渲染 + Masonry 全量重测量。
+  // visibleItems memo 失效 → 全页重渲染。
   let changed = false
   const newMap = new Map<string, FeedItem[]>()
   for (const [key, items] of sectionItems) {

@@ -5,6 +5,16 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+export function safeExternalUrl(value?: string | null): string | null {
+  if (!value) return null
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
+  } catch {
+    return null
+  }
+}
+
 /** Format large numbers: 1000→1k, 10000→1w */
 export function formatNumber(n: number): string {
   if (n >= 10000) return `${(n / 10000).toFixed(1)}w`

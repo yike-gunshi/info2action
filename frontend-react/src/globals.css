@@ -10,20 +10,26 @@
     --foreground: #1A1917;
     --card: #FFFFFF;
     --card-foreground: #1A1917;
-    --primary: #4F52E4;
-    --primary-foreground: #FFFFFF;
+    /* v24.0 §21.6: 亮色 accent 家族统一映射暖铜 --brand（与暗色/admin v23.1 同一模式），
+       靛蓝全站退役。语义色不动：destructive/score/平台 glow/admin --a-*。
+       CSS 自定义属性求值与声明顺序无关，--brand 在本块下方定义、无循环引用。 */
+    --primary: var(--brand);
+    --primary-foreground: var(--brand-foreground);
     --secondary: #F2F1ED;
     --secondary-foreground: #4A4946;
     --muted: #F2F1ED;
     --muted-foreground: #6B6A65;
-    --accent: #EEECFF;
-    --accent-foreground: #4F52E4;
+    --accent: var(--brand-soft);
+    --accent-foreground: var(--brand);
     --destructive: #DC2626;
     --destructive-foreground: #FFFFFF;
     --border: #E4E2DC;
     --input: #E4E2DC;
-    --ring: #4F52E4;
+    --ring: var(--brand);
     --radius: 0.625rem;
+
+    /* v24.0 §21.3 A10: lead 摘要墨色（比 muted-foreground 深一档，纸面 ≈6.9:1） */
+    --ink-2: #54524C;
 
     /* v19.0 Global Visual Reset: editorial brand layer */
     --brand: #C65A1E;
@@ -52,10 +58,6 @@
     --glow-lingowhale: rgba(45,184,75,.18);
     --glow-waytoagi: rgba(78,110,242,.18);
 
-    /* Terminal */
-    --terminal-bg: #1A1A2E;
-    --terminal-text: #4ade80;
-    --terminal-muted: #6366F1;
     /* v21.0 action code block — 暖炭底 + 米白字,融入纸面弹窗 */
     --action-code-bg: #2B2420;
     --action-code-text: #ECE1D0;
@@ -76,8 +78,8 @@
 
     /* v15.0 事件聚合语义 token (DESIGN.md §15.3) */
     --pulse-update: #F59E0B;            /* 有更新小圆点 (琥珀,语义=被动提醒) */
-    --badge-official-bg: #EEECFF;       /* [官方] 标签底 (复用 --accent 浅) */
-    --badge-official-fg: #4F52E4;       /* [官方] 标签字 (复用 --accent) */
+    --badge-official-bg: var(--brand-soft); /* [官方] 标签底 (v24.0 §21.6 随 accent 映射暖铜) */
+    --badge-official-fg: var(--brand);      /* [官方] 标签字 */
     --floating-btn-bg: #1A1917;         /* 悬浮按钮深底 (复用 --foreground) */
     --floating-btn-fg: #FFFFFF;         /* 悬浮按钮白字 */
     --floating-btn-shadow: 0 4px 16px rgba(26, 25, 23, 0.18);
@@ -148,6 +150,9 @@
     --border: #39342B;
     --input: #463D31;
     --ring: #F0A273;
+
+    /* v24.0 §21.3 A10: lead 摘要墨色（暗色档） */
+    --ink-2: #C8BBAA;
 
     --brand: #F0A273;
     --brand-foreground: #1F1713;
@@ -538,32 +543,6 @@
   background-size: 200% 100%;
 }
 
-/* Shimmer button effect */
-.shimmer-button {
-  @apply relative overflow-hidden;
-}
-.shimmer-button::after {
-  content: '';
-  @apply absolute inset-0;
-  background: linear-gradient(110deg, transparent 25%, rgba(255,255,255,0.2) 50%, transparent 75%);
-  background-size: 200% 100%;
-  animation: shimmer 3s infinite;
-}
-.shimmer-button:hover::after {
-  animation-duration: 1.5s;
-}
-
-/* Action zone gradient */
-.action-zone {
-  background: linear-gradient(135deg, rgba(5,150,105,.04), rgba(5,150,105,.01));
-  border: 1px solid rgba(167,243,208,.4);
-  box-shadow: inset 0 1px 2px rgba(5,150,105,.06);
-}
-.dark .action-zone {
-  background: linear-gradient(135deg, rgba(5,150,105,.08), rgba(5,150,105,.02));
-  border-color: rgba(167,243,208,.15);
-}
-
 /* Detail content fade-in — masks height change when skeleton → content */
 .animate-detail-fade-in {
   animation: detail-fade-in 200ms ease-out both;
@@ -632,6 +611,34 @@
     opacity: 1 !important;
     filter: none !important;
     transform: none !important;
+  }
+}
+
+/* v24.0 模块 21.4: 行动看板拖拽 —— 只用 transform/opacity/背景色,150-200ms ease-out。
+   拾起: DragOverlay 倾斜 1.5° + 放大 1.02(lift 150ms);
+   落下: 卡片 600ms 一次性「墨迹落定」背景淡出(brand-soft → card)。 */
+@keyframes action-card-lift {
+  from { transform: rotate(0deg) scale(1); }
+  to   { transform: rotate(1.5deg) scale(1.02); }
+}
+@keyframes action-card-settle {
+  from { background-color: var(--brand-soft); }
+  to   { background-color: var(--card); }
+}
+.action-drag-overlay {
+  animation: action-card-lift 150ms ease-out both;
+}
+.action-card-settling {
+  animation: action-card-settle 600ms ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 去倾斜/缩放/落定闪现;opacity 源卡标记与泳道高亮是颜色状态,保留(21.4)。 */
+  .action-drag-overlay {
+    animation: none !important;
+    transform: none !important;
+  }
+  .action-card-settling {
+    animation: none !important;
   }
 }
 

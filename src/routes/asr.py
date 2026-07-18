@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -29,25 +30,72 @@ router = APIRouter()
 ASR_CONCURRENT_LIMIT = 3
 ZOMBIE_THRESHOLD_MIN = 30
 
+# 保留后台 ASR 任务的强引用,避免 asyncio.create_task 返回的 task 被 GC 中途回收
+# (CPython 文档明示的 footgun);任务完成后由 done_callback 自动移除。
+_ASR_BG_TASKS: set[asyncio.Task] = set()
+
 
 def _get_user_id(request: Request) -> Optional[int]:
     user = getattr(request.state, "user", None)
     return user["id"] if user else None
 
 
+# 稳定性加固(2026-07-10): 这两个 app.state dict 原来只增不删——每个曾触发/订阅
+# ASR 的 user_id / item_id 各留一个 Semaphore / Queue 常驻进程,C 端放量后随用户与
+# item 基数单调增长,持续侵蚀 1GB 小机(有 OOM 前科)的余量。改为有上限的 LRU:
+# 插入新 key 时若超过上限就淘汰最旧的一个(dict 保持插入序);事件总线在生产者结束
+# 时另有主动回收(见 trigger_asr._run 的 finally)。上限可用 env 调。
+def _asr_state_cap(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+        return n if n > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+
+_USER_SEM_CAP = _asr_state_cap("INFO2ACTION_ASR_USER_SEM_CAP", 512)
+_EVENT_BUS_CAP = _asr_state_cap("INFO2ACTION_ASR_EVENT_BUS_CAP", 256)
+
+
+def _evict_oldest_if_full(store: dict, cap: int) -> None:
+    while len(store) >= cap:
+        try:
+            oldest = next(iter(store))
+        except StopIteration:
+            return
+        store.pop(oldest, None)
+
+
 def _get_or_create_user_sem(request: Request, user_id: int) -> asyncio.Semaphore:
-    """Lazy 创建 user 级 Semaphore(3),存在 app.state 中."""
+    """Lazy 创建 user 级 Semaphore(3),存在 app.state 中(有上限 LRU)."""
     sems: dict[int, asyncio.Semaphore] = request.app.state.user_asr_sems
-    if user_id not in sems:
-        sems[user_id] = asyncio.Semaphore(ASR_CONCURRENT_LIMIT)
+    existing = sems.get(user_id)
+    if existing is not None:
+        return existing
+    _evict_oldest_if_full(sems, _USER_SEM_CAP)
+    sems[user_id] = asyncio.Semaphore(ASR_CONCURRENT_LIMIT)
     return sems[user_id]
 
 
 def _get_or_create_event_bus(request: Request, item_id: str) -> asyncio.Queue:
     buses: dict[str, asyncio.Queue] = request.app.state.asr_event_buses
-    if item_id not in buses:
-        buses[item_id] = asyncio.Queue(maxsize=200)
+    existing = buses.get(item_id)
+    if existing is not None:
+        return existing
+    _evict_oldest_if_full(buses, _EVENT_BUS_CAP)
+    buses[item_id] = asyncio.Queue(maxsize=200)
     return buses[item_id]
+
+
+def _discard_event_bus(request: Request, item_id: str) -> None:
+    """生产者结束后主动回收事件总线(消费者持有本地引用,不受字典删除影响)."""
+    try:
+        request.app.state.asr_event_buses.pop(item_id, None)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _fetch_item_asr_state_async(conn, item_id: str) -> Optional[dict]:
@@ -240,8 +288,17 @@ async def trigger_asr(request: Request, item_id: str,
                 await _emit("error", {"code": "worker_crash", "message": message})
             finally:
                 await _emit("__done__", {})  # 哨兵: 结束 SSE 流
+                # 生产者结束,主动回收事件总线(消费者已持有本地引用,pop 不影响其读取;
+                # 迟到的消费者会在 stream 入口从 DB state 直接拿到结果,不依赖总线)。
+                _discard_event_bus(request, item_id)
 
-    asyncio.create_task(_run())
+    # 保留 task 引用避免被 GC 中途回收(CPython footgun);完成后自动移除。
+    # 仅对真实 asyncio.Task 生效(生产路径);测试里 create_task 可能被 monkeypatch
+    # 成非 Task 的桩对象(不可 hash、无 add_done_callback),此时跳过保留即可。
+    task = asyncio.create_task(_run())
+    if isinstance(task, asyncio.Task):
+        _ASR_BG_TASKS.add(task)
+        task.add_done_callback(_ASR_BG_TASKS.discard)
     return {"task_id": item_id, "status": "running"}
 
 

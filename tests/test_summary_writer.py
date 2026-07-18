@@ -222,6 +222,112 @@ def test_parse_accepts_separate_summary_and_breakdown_without_key_points():
     assert parsed['key_points'] == []
 
 
+def test_parse_accepts_and_strips_why_read():
+    parsed = sw._parse_llm_json(json.dumps({
+        "title": "Claude Code 发布新版本",
+        "summary": "Claude Code 发布新版本，增强终端协作能力。",
+        "breakdown": "**版本变化**\n- 增强终端协作\n- 修复若干问题",
+        "why_read": "  新版本改变终端协作方式，值得关注升级后的实际工作流影响。  ",
+        "warnings": [],
+    }, ensure_ascii=False))
+
+    assert parsed is not None
+    assert parsed['why_read'] == '新版本改变终端协作方式，值得关注升级后的实际工作流影响。'
+
+
+@pytest.mark.parametrize('why_read', [None, '', '   ', 42, ['reason']])
+def test_parse_normalizes_missing_or_invalid_why_read_to_none(why_read):
+    payload = {
+        "title": "Claude Code 发布新版本",
+        "summary": "Claude Code 发布新版本，增强终端协作能力。",
+        "breakdown": "**版本变化**\n- 增强终端协作\n- 修复若干问题",
+        "warnings": [],
+    }
+    if why_read is not None:
+        payload['why_read'] = why_read
+
+    parsed = sw._parse_llm_json(json.dumps(payload, ensure_ascii=False))
+
+    assert parsed is not None
+    assert parsed['why_read'] is None
+
+
+def test_parse_truncates_why_read_at_last_sentence_boundary_and_logs_actual_length():
+    raw_why_read = '甲' * 80 + '。' + '乙' * 100 + '！' + '丙' * 80
+
+    with patch.object(sw, '_log_event') as mock_log:
+        parsed = sw._parse_llm_json(json.dumps({
+            "title": "Claude Code 发布新版本",
+            "summary": "Claude Code 发布新版本，增强终端协作能力。",
+            "breakdown": "**版本变化**\n- 增强终端协作\n- 修复若干问题",
+            "why_read": raw_why_read,
+            "warnings": [],
+        }, ensure_ascii=False))
+
+    expected = '甲' * 80 + '。' + '乙' * 100 + '！'
+    assert parsed is not None
+    assert parsed['why_read'] == expected
+    assert len(parsed['why_read']) <= 240
+    assert parsed['why_read'].endswith(('。', '！', '？', '；'))
+    mock_log.assert_called_once_with(
+        'cluster_summary_why_read_truncated',
+        original_chars=len(raw_why_read),
+        stored_chars=len(expected),
+    )
+
+
+def test_parse_hard_truncates_why_read_to_240_chars_without_sentence_boundary():
+    raw_why_read = '值' * 241
+
+    with patch.object(sw, '_log_event') as mock_log:
+        parsed = sw._parse_llm_json(json.dumps({
+            "title": "Claude Code 发布新版本",
+            "summary": "Claude Code 发布新版本，增强终端协作能力。",
+            "breakdown": "**版本变化**\n- 增强终端协作\n- 修复若干问题",
+            "why_read": raw_why_read,
+            "warnings": [],
+        }, ensure_ascii=False))
+
+    assert parsed is not None
+    assert parsed['why_read'] == '值' * 240
+    mock_log.assert_called_once_with(
+        'cluster_summary_why_read_truncated',
+        original_chars=241,
+        stored_chars=240,
+    )
+
+
+def test_normalize_why_read_ignores_sentence_end_at_241_and_uses_earlier_boundary():
+    raw_why_read = '甲' * 80 + '。' + '乙' * 159 + '。'
+
+    assert len(raw_why_read) == 241
+    assert sw._normalize_why_read(raw_why_read) == '甲' * 80 + '。'
+
+
+def test_normalize_why_read_hard_cuts_when_only_sentence_end_is_at_241():
+    raw_why_read = '值' * 240 + '。'
+
+    assert len(raw_why_read) == 241
+    assert sw._normalize_why_read(raw_why_read) == '值' * 240
+
+
+def test_parse_leaves_why_read_at_or_below_240_chars_unchanged():
+    raw_why_read = '值' * 239 + '。'
+
+    with patch.object(sw, '_log_event') as mock_log:
+        parsed = sw._parse_llm_json(json.dumps({
+            "title": "Claude Code 发布新版本",
+            "summary": "Claude Code 发布新版本，增强终端协作能力。",
+            "breakdown": "**版本变化**\n- 增强终端协作\n- 修复若干问题",
+            "why_read": raw_why_read,
+            "warnings": [],
+        }, ensure_ascii=False))
+
+    assert parsed is not None
+    assert parsed['why_read'] == raw_why_read
+    mock_log.assert_not_called()
+
+
 def test_cluster_summary_prompt_requests_direct_markdown_bold():
     prompt = sw.load_prompt('07_cluster_summary.md')
 
@@ -318,6 +424,26 @@ def test_parse_accepts_literal_newlines_inside_summary_string():
     assert parsed['warnings'] == []
 
 
+def test_parse_relaxed_literal_newlines_extracts_why_read():
+    parsed = sw._parse_llm_json(
+        '{\n'
+        '  "title": "TaxoBench 发布研究基准",\n'
+        '  "summary": "【精华速览】\n'
+        '**TaxoBench** 发布，用专家分类法评估研究代理。\n'
+        '\n'
+        '【全文拆解】\n'
+        '**基准定位**\n'
+        '- 评估研究代理的信息发现能力\n'
+        '",\n'
+        '  "why_read": "它给研究代理提供了可复用的评估标尺，后续模型对比会更有依据。",\n'
+        '  "warnings": []\n'
+        '}'
+    )
+
+    assert parsed is not None
+    assert parsed['why_read'] == '它给研究代理提供了可复用的评估标尺，后续模型对比会更有依据。'
+
+
 def test_parse_relaxed_literal_newlines_preserves_invalid_warning():
     parsed = sw._parse_llm_json(
         '{\n'
@@ -349,6 +475,14 @@ def test_parse_invalid_warning_without_title_as_non_event():
 
 
 class TestDraftLiveSwap:
+    def test_local_cluster_schema_includes_why_read(self, tmp_db):
+        columns = {
+            row['name']
+            for row in tmp_db.execute("PRAGMA table_info(clusters)").fetchall()
+        }
+
+        assert 'why_read' in columns
+
     def test_happy_path_swaps_live_and_bumps_version(self, tmp_db):
         cid = _seed_cluster_with_members(tmp_db, doc_count=3, prior_live=0)
         with patch.object(sw, '_call_llm_chat', return_value=_MOCK_LLM_OUTPUT):
@@ -366,6 +500,51 @@ class TestDraftLiveSwap:
         # drafts cleared after swap
         assert row['ai_title_draft'] is None
         assert row['ai_summary_draft'] is None
+
+    def test_happy_path_persists_why_read(self, tmp_db):
+        cid = _seed_cluster_with_members(tmp_db, doc_count=3, prior_live=0)
+        raw = json.loads(_MOCK_LLM_OUTPUT)
+        raw['why_read'] = '模型能力与价格同时变化，直接影响开发者的升级判断。'
+
+        with patch.object(sw, '_call_llm_chat', return_value=json.dumps(raw, ensure_ascii=False)):
+            ok = sw.regenerate_and_swap(
+                tmp_db,
+                cid,
+                api_key='k',
+                api_base=None,
+                model='MiniMax-M2.7',
+            )
+
+        row = tmp_db.execute(
+            "SELECT why_read FROM clusters WHERE id=?",
+            (cid,),
+        ).fetchone()
+        assert ok is True
+        assert row['why_read'] == '模型能力与价格同时变化，直接影响开发者的升级判断。'
+
+    def test_missing_why_read_clears_previous_value_on_regeneration(self, tmp_db):
+        cid = _seed_cluster_with_members(tmp_db, doc_count=3, prior_live=0)
+        tmp_db.execute(
+            "UPDATE clusters SET why_read = ? WHERE id = ?",
+            ('旧的必读理由', cid),
+        )
+        tmp_db.commit()
+
+        with patch.object(sw, '_call_llm_chat', return_value=_MOCK_LLM_OUTPUT):
+            ok = sw.regenerate_and_swap(
+                tmp_db,
+                cid,
+                api_key='k',
+                api_base=None,
+                model='MiniMax-M2.7',
+            )
+
+        row = tmp_db.execute(
+            "SELECT why_read FROM clusters WHERE id=?",
+            (cid,),
+        ).fetchone()
+        assert ok is True
+        assert row['why_read'] is None
 
     def test_llm_failure_preserves_live(self, tmp_db):
         cid = _seed_cluster_with_members(

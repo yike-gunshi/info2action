@@ -55,7 +55,12 @@ logger = logging.getLogger('clustering.pipeline')
 
 # Batching: OpenRouter text-embedding-3-small accepts batched inputs; keep conservative.
 _EMBED_BATCH = 16
-_CANDIDATE_WINDOW_DAYS_DEFAULT = 30
+# perf-v27 P2: 候选簇捞取窗口 30→3 天(目标架构定稿 §0-8,用户拍板)。
+# 依据:item 侧时间邻接判定本就是 ±3 天(temporal_candidate_window_days=3),
+# 30 天的 DB 候选窗只是白白让每条新内容和 10 倍量的簇算向量距离
+# (pg_stat 实测该向量搜索累计 809min=总耗时第一)。收窄后超过 3 天的
+# 老簇不再接收新成员(同一事件久后重报会开新簇)——产品已认可。
+_CANDIDATE_WINDOW_DAYS_DEFAULT = 3
 _TEMPORAL_ADJACENCY_DAYS_DEFAULT = 3.0
 _MAX_MERGED_SPAN_DAYS_DEFAULT = 7.0
 _GRAY_RECALL_MAX_TEMPORAL_HOURS_DEFAULT = 2.0
@@ -1667,6 +1672,86 @@ def _clusters_requiring_summary(
     return list(dict.fromkeys(ids))
 
 
+def _clusters_meeting_bar(conn, cluster_ids) -> set[int]:
+    ids = sorted(set(cluster_ids))
+    if not ids:
+        return set()
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"""SELECT c.id
+              FROM clusters c
+             WHERE c.id IN ({placeholders})
+               AND EXISTS (
+                 SELECT 1
+                   FROM cluster_items ci
+                   JOIN items i ON i.id = ci.item_id
+                  WHERE ci.cluster_id = c.id
+                    AND i.highlight_include_in_highlights IS TRUE
+               )""",
+        tuple(ids),
+    ).fetchall()
+    return {int(row['id']) for row in rows}
+
+
+def _clusters_meeting_bar_remote(cluster_ids) -> set[int]:
+    ids = sorted(set(cluster_ids))
+    if not ids:
+        return set()
+    schema = remote_db.remote_schema()
+    placeholders = ", ".join(["%s"] * len(ids))
+    with remote_db.connect() as pg_conn:
+        rows = pg_conn.execute(
+            f"""SELECT c.id
+                  FROM {schema}.clusters c
+                 WHERE c.id IN ({placeholders})
+                   AND EXISTS (
+                     SELECT 1
+                       FROM {schema}.cluster_items ci
+                       JOIN {schema}.items i ON i.id = ci.item_id
+                      WHERE ci.cluster_id = c.id
+                        AND i.highlight_include_in_highlights IS TRUE
+                   )""",
+            tuple(ids),
+        ).fetchall()
+    return {int(row['id']) for row in rows}
+
+
+def _apply_highlights_qualify_gate(
+    conn,
+    summary_cluster_ids,
+    *,
+    run_id: int | None,
+    remote_cluster_backend: bool,
+) -> list[int]:
+    cluster_ids = list(summary_cluster_ids)
+    if os.environ.get("INFO2ACTION_HIGHLIGHTS_QUALIFY_GATE", "0").strip() != "1":
+        return cluster_ids
+
+    qualified = (
+        _clusters_meeting_bar_remote(cluster_ids)
+        if remote_cluster_backend
+        else _clusters_meeting_bar(conn, cluster_ids)
+    )
+    for cluster_id in sorted(set(cluster_ids) - qualified):
+        kwargs = {
+            "warning": "未达标：无举旗成员",
+            "publish_immediately": run_id is None,
+            "run_id": run_id,
+        }
+        if remote_cluster_backend:
+            remote_db.mark_cluster_hidden_remote(None, cluster_id, **kwargs)
+        else:
+            summary_writer._mark_cluster_hidden(conn, cluster_id, **kwargs)
+
+    filtered_ids = sorted(qualified)
+    _log_event(
+        'cluster_summary_qualify_gate_applied',
+        before_count=len(cluster_ids),
+        after_count=len(filtered_ids),
+    )
+    return filtered_ids
+
+
 def _remote_summary_window_filter_sql(
     cluster_alias: str = "c",
     *,
@@ -3091,8 +3176,14 @@ def run_pipeline(
                 window_end=window_end,
                 require_published_at=require_published_at,
             )
-        effective_summary_workers = max(1, int(summary_workers or 1))
         remote_cluster_backend = remote_db.cluster_to_remote()
+        summary_cluster_ids = _apply_highlights_qualify_gate(
+            conn,
+            summary_cluster_ids,
+            run_id=run_id,
+            remote_cluster_backend=remote_cluster_backend,
+        )
+        effective_summary_workers = max(1, int(summary_workers or 1))
         if run_id is None:
             # Immediate publish mutates live version/action staleness and has a
             # narrower call surface. Keep it single-connection for compatibility.
@@ -3334,7 +3425,7 @@ def _main():
             conn, provider=provider,
             api_key=chat_api_key, api_base=api_base, model=model,
             tau_hours=float(clustering_cfg.get('representative_decay_tau_hours', 24)),
-            candidate_window_days=int(clustering_cfg.get('candidate_window_days', 30)),
+            candidate_window_days=int(clustering_cfg.get('candidate_window_days', _CANDIDATE_WINDOW_DAYS_DEFAULT)),
             summary_max_docs=int(clustering_cfg.get('summary_max_docs', 20)),
             top_k=int(
                 args.top_k

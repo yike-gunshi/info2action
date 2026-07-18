@@ -53,7 +53,9 @@ describe('HighlightsView v19 shell', () => {
     expect(tabsInner.className).toContain('w-full')
     expect(tabsInner.className).toContain('min-w-0')
     expect(tabsInner.className).toContain('border-b')
-    expect(tabsInner.className).toContain('sm:justify-center')
+    // v24.2: 筛选 tab 左对齐,作为「全部 > 日期 > 行区」缩进层级的最左基准
+    expect(tabsInner.className).toContain('justify-start')
+    expect(tabsInner.className).not.toContain('sm:justify-center')
     const allTab = screen.getByTestId('highlights-filter-tab-all')
     expect(allTab.className).toContain('font-event-title')
     expect(allTab.className).toContain('text-[16px]')

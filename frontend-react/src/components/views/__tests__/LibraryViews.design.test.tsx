@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import type { ReactNode } from 'react'
 import { fetchLibrary } from '../../../lib/api'
 import type { FeedItem, LibraryEntry, LibraryResponse } from '../../../lib/types'
 import { StarredView } from '../StarredView'
@@ -9,16 +8,6 @@ import { HistoryView } from '../HistoryView'
 
 vi.mock('../../../lib/api', () => ({
   fetchLibrary: vi.fn(),
-}))
-
-vi.mock('../../feed/Masonry', () => ({
-  Masonry: ({ items, renderItem }: { items: LibraryEntry[]; renderItem: (item: LibraryEntry, index: number) => ReactNode }) => (
-    <div data-testid="mock-masonry">
-      {items.map((item, index) => (
-        <div key={item.id}>{renderItem(item, index)}</div>
-      ))}
-    </div>
-  ),
 }))
 
 vi.mock('../../feed/InfoCard', () => ({
@@ -113,7 +102,7 @@ describe('utility library pages design tokens', () => {
     const all = screen.getByRole('button', { name: '全部' })
     expect(all.className).toContain('border-b-2')
     expect(all.className).toContain('border-[var(--brand)]')
-    expect(all.className).toContain('font-body-cjk')
+    expect(all.className).toContain('font-event-title')  // v24.2: 同 pill 对齐 topbar
     expect(all.className).not.toContain('rounded-full')
     expect(all.className).not.toContain('bg-foreground')
 

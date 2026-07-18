@@ -1,9 +1,11 @@
 """Interests API: CRUD + scan + keyword generation."""
 
+import functools
 import threading
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 import db
 import interest_engine
@@ -64,8 +66,28 @@ async def create_interest(request: Request):
         return JSONResponse({'error': '名称不能为空'}, status_code=400)
     if remote_db.app_state_to_remote():
         try:
-            interest_id = remote_db.create_interest_remote(
-                name=name,
+            interest_id = await run_in_threadpool(
+                functools.partial(
+                    remote_db.create_interest_remote,
+                    name=name,
+                    description=body.get('description'),
+                    keywords=body.get('keywords', []),
+                    sort=body.get('sort', 'relevance'),
+                    item_limit=body.get('item_limit', 30),
+                    scope=body.get('scope', 'all'),
+                    user_id=current_user_id(request),
+                )
+            )
+            interest = await run_in_threadpool(remote_db.get_interest_remote, interest_id)
+            return {'ok': True, 'interest': interest}
+        except Exception as e:
+            return JSONResponse({'error': str(e)}, status_code=500)
+
+    def _create_local_blocking():
+        conn = db.get_conn()
+        try:
+            interest_id = db.create_interest(
+                conn, name,
                 description=body.get('description'),
                 keywords=body.get('keywords', []),
                 sort=body.get('sort', 'relevance'),
@@ -73,28 +95,14 @@ async def create_interest(request: Request):
                 scope=body.get('scope', 'all'),
                 user_id=current_user_id(request),
             )
-            interest = remote_db.get_interest_remote(interest_id)
+            interest = db.get_interest(conn, interest_id)
             return {'ok': True, 'interest': interest}
         except Exception as e:
             return JSONResponse({'error': str(e)}, status_code=500)
+        finally:
+            conn.close()
 
-    conn = db.get_conn()
-    try:
-        interest_id = db.create_interest(
-            conn, name,
-            description=body.get('description'),
-            keywords=body.get('keywords', []),
-            sort=body.get('sort', 'relevance'),
-            item_limit=body.get('item_limit', 30),
-            scope=body.get('scope', 'all'),
-            user_id=current_user_id(request),
-        )
-        interest = db.get_interest(conn, interest_id)
-        return {'ok': True, 'interest': interest}
-    except Exception as e:
-        return JSONResponse({'error': str(e)}, status_code=500)
-    finally:
-        conn.close()
+    return await run_in_threadpool(_create_local_blocking)
 
 
 @router.post('/api/interests/generate-keywords')
@@ -103,8 +111,13 @@ async def generate_keywords(request: Request):
     description = body.get('description', '').strip()
     if not description:
         return JSONResponse({'error': '描述不能为空'}, status_code=400)
+    # 稳定性加固(2026-07-10): description 有上限,避免超长文本灌进 LLM(费用/延迟)。
+    if len(description) > 2000:
+        return JSONResponse({'error': '描述过长(最多 2000 字)'}, status_code=400)
     try:
-        keywords = interest_engine.generate_keywords(description)
+        # LLM 调用离开事件循环:单 worker 下内联的 generate_keywords 会把整个
+        # 生成延迟期间的所有并发请求全部冻住。
+        keywords = await run_in_threadpool(interest_engine.generate_keywords, description)
         return {'ok': True, 'keywords': keywords}
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -116,24 +129,58 @@ async def update_interest(interest_id: int, request: Request):
     scope_user_id = owner_scope_user_id(request)
     if body.get('_method') == 'DELETE':
         if remote_db.app_state_to_remote():
-            ok = remote_db.delete_interest_remote(interest_id, owner_user_id=scope_user_id)
+            ok = await run_in_threadpool(
+                functools.partial(
+                    remote_db.delete_interest_remote,
+                    interest_id,
+                    owner_user_id=scope_user_id,
+                )
+            )
             if not ok:
                 return JSONResponse({'error': '兴趣配置不存在'}, status_code=404)
             return {'ok': ok}
 
-        conn = db.get_conn()
-        try:
-            ok = db.delete_interest(conn, interest_id, owner_user_id=scope_user_id)
-            if not ok:
-                return JSONResponse({'error': '兴趣配置不存在'}, status_code=404)
-            return {'ok': ok}
-        finally:
-            conn.close()
+        def _delete_local_blocking():
+            conn = db.get_conn()
+            try:
+                ok = db.delete_interest(conn, interest_id, owner_user_id=scope_user_id)
+                if not ok:
+                    return JSONResponse({'error': '兴趣配置不存在'}, status_code=404)
+                return {'ok': ok}
+            finally:
+                conn.close()
+
+        return await run_in_threadpool(_delete_local_blocking)
     # PATCH: update interest config
     if remote_db.app_state_to_remote():
         try:
-            ok = remote_db.update_interest_remote(
-                interest_id,
+            ok = await run_in_threadpool(
+                functools.partial(
+                    remote_db.update_interest_remote,
+                    interest_id,
+                    owner_user_id=scope_user_id,
+                    name=body.get('name'),
+                    description=body.get('description'),
+                    keywords=body.get('keywords'),
+                    sort=body.get('sort'),
+                    item_limit=body.get('item_limit'),
+                    scope=body.get('scope'),
+                    enabled=body.get('enabled'),
+                )
+            )
+            if not ok:
+                return JSONResponse({'error': '兴趣配置不存在'}, status_code=404)
+            interest = await run_in_threadpool(
+                functools.partial(remote_db.get_interest_remote, interest_id, user_id=scope_user_id)
+            )
+            return {'ok': ok, 'interest': interest}
+        except Exception as e:
+            return JSONResponse({'error': str(e)}, status_code=500)
+
+    def _update_local_blocking():
+        conn = db.get_conn()
+        try:
+            ok = db.update_interest(conn, interest_id,
                 owner_user_id=scope_user_id,
                 name=body.get('name'),
                 description=body.get('description'),
@@ -141,34 +188,17 @@ async def update_interest(interest_id: int, request: Request):
                 sort=body.get('sort'),
                 item_limit=body.get('item_limit'),
                 scope=body.get('scope'),
-                enabled=body.get('enabled'),
-            )
+                enabled=body.get('enabled'))
             if not ok:
                 return JSONResponse({'error': '兴趣配置不存在'}, status_code=404)
-            interest = remote_db.get_interest_remote(interest_id, user_id=scope_user_id)
+            interest = db.get_interest(conn, interest_id, user_id=scope_user_id)
             return {'ok': ok, 'interest': interest}
         except Exception as e:
             return JSONResponse({'error': str(e)}, status_code=500)
+        finally:
+            conn.close()
 
-    conn = db.get_conn()
-    try:
-        ok = db.update_interest(conn, interest_id,
-            owner_user_id=scope_user_id,
-            name=body.get('name'),
-            description=body.get('description'),
-            keywords=body.get('keywords'),
-            sort=body.get('sort'),
-            item_limit=body.get('item_limit'),
-            scope=body.get('scope'),
-            enabled=body.get('enabled'))
-        if not ok:
-            return JSONResponse({'error': '兴趣配置不存在'}, status_code=404)
-        interest = db.get_interest(conn, interest_id, user_id=scope_user_id)
-        return {'ok': ok, 'interest': interest}
-    except Exception as e:
-        return JSONResponse({'error': str(e)}, status_code=500)
-    finally:
-        conn.close()
+    return await run_in_threadpool(_update_local_blocking)
 
 
 @router.delete('/api/interests/{interest_id}')

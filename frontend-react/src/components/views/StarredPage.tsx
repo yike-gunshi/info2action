@@ -17,7 +17,7 @@ export function StarredPage() {
   return (
     <div className="min-h-screen bg-background" style={{ overflowX: 'clip' }}>
       <TopBar activeL1={null} />
-      <main className="max-w-[1200px] mx-auto">
+      <main className="max-w-[1168px] mx-auto">
         <StarredView />
       </main>
       <ClusterDetailPanel />

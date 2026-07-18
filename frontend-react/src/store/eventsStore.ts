@@ -407,6 +407,7 @@ export const useEventsStore = create<EventsState>((set, get) => ({
   reset: () => {
     _firstPageCache.clear()
     _filterSeq += 1
+
     set({
       enabled: null,
       events: [],

@@ -157,6 +157,21 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
         </nav>
 
         <div className="col-start-2 row-start-1 flex items-center justify-self-end gap-2 sm:col-start-auto sm:row-start-auto">
+          {/* v24.0 §21.6: <640px 此前无任何搜索入口(功能缺口) — 补 icon 按钮,
+              点击后在 TopBar 下方展开输入行(见 header 尾部),复用同一套搜索状态/逻辑 */}
+          {!searchExpanded && (
+            <button
+              type="button"
+              onClick={() => setSearchExpanded(true)}
+              className={cn(iconButtonClass, 'sm:hidden')}
+              aria-label="搜索"
+              title="搜索"
+              data-testid="topbar-search-mobile-trigger"
+            >
+              <Search className="h-[19px] w-[19px]" strokeWidth={1.6} />
+            </button>
+          )}
+
           {/* Search */}
           <div
             className={cn(
@@ -234,6 +249,36 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
           <UserMenu />
         </div>
       </div>
+
+      {/* v24.0 §21.6: <640px 搜索展开行 — 与桌面同款下划线输入,只做入口不碰搜索语义 */}
+      {searchExpanded && (
+        <div className="border-t border-border/80 px-4 py-2 sm:hidden" data-testid="topbar-search-mobile">
+          <div className="flex h-9 w-full items-center border-b-2 border-[var(--brand-border)] text-foreground transition-colors focus-within:border-[var(--brand)]">
+            <Search className="h-[18px] w-[18px] shrink-0 text-muted-foreground" strokeWidth={1.6} />
+            <input
+              type="text"
+              aria-label="搜索信息"
+              value={localSearch}
+              autoFocus
+              onChange={(e) => handleSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape' && !localSearch.trim()) setSearchExpanded(false)
+              }}
+              placeholder="搜索..."
+              className="min-w-0 flex-1 bg-transparent px-3 font-event-title text-[16px] text-foreground outline-none placeholder:font-body-cjk placeholder:text-sm placeholder:text-muted-foreground"
+              data-testid="topbar-search-mobile-input"
+            />
+            <button
+              type="button"
+              onClick={handleClearSearch}
+              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[4px] text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]"
+              aria-label="清除搜索"
+            >
+              <X className="h-[17px] w-[17px]" strokeWidth={1.65} />
+            </button>
+          </div>
+        </div>
+      )}
     </header>
   )
 }

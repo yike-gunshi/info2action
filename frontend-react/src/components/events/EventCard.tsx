@@ -4,6 +4,8 @@
  * 日期与连续时间轴由 LatestEvents 容器统一渲染；单卡展示 cluster 首个 item 的 HH:mm。
  * 行间不使用分割线，靠时间、dot、留白和 hover 状态区分。
  * 整卡可点 → onSelect(cluster.id)
+ *
+ * v24 头版三档半行配方（lede/second/brief）已退役：全部卡片统一标准条渲染。
  */
 import { memo, useEffect, useMemo, useState } from 'react'
 import { cn } from '../../lib/utils'
@@ -99,15 +101,26 @@ export const EventCard = memo(function EventCard({
 
   // FE-7(B7): 多条正则的 markdown 解析 memo 化——原先每次渲染重跑,
   // loadMore/markSeen/refresh 时已加载的全部卡片一起重解析
-  const summary = useMemo(() => parseClusterSummary(cluster.ai_summary).speedReview, [cluster.ai_summary])
-  const summaryText = useMemo(() => (summary ? plainSummaryText(summary) : ''), [summary])
+  const summaryText = useMemo(() => {
+    const whyRead = cluster.why_read?.trim()
+    if (whyRead) return plainSummaryText(whyRead)
+    const summary = parseClusterSummary(cluster.ai_summary).speedReview
+    return summary ? plainSummaryText(summary) : ''
+  }, [cluster.ai_summary, cluster.why_read])
   const categoryLabel = eventCategoryLabel(cluster.category)
   const displayTime = cluster.first_doc_at || cluster.last_doc_at
   const displayTimeLabel = timeLabel ?? formatEventClock(displayTime)
   const readState: 'new' | 'read' = cluster.last_seen_version != null ? 'read' : 'new'
+  const isRead = readState === 'read'
   const coverUrl = cluster.cover_url?.trim() || ''
   const [failedCoverUrl, setFailedCoverUrl] = useState<string | null>(null)
   const showImage = Boolean(coverUrl && failedCoverUrl !== coverUrl)
+  const showInlineCategory = Boolean(categoryLabel)
+
+  // v24.1: 时间列 52/56px + 栏距统一 16px（用户实物验收——时间列左侧空白过大）
+  const gridColsClasses = showImage
+    ? 'gap-x-4 sm:grid-cols-[52px_minmax(0,1fr)_200px] lg:grid-cols-[56px_minmax(0,1fr)_200px]'
+    : 'gap-x-4 sm:grid-cols-[52px_minmax(0,1fr)] lg:grid-cols-[56px_minmax(0,1fr)]'
 
   return (
     <div
@@ -124,21 +137,22 @@ export const EventCard = memo(function EventCard({
       data-testid="event-card"
       className={cn(
         'cv-auto-event group cursor-pointer outline-none',
-        'relative z-10 grid grid-cols-1 gap-y-2 border-b border-border/50 py-3.5 transition-[background-color,opacity] hover:bg-muted focus-visible:bg-muted sm:gap-y-0',
-        showImage
-          ? 'sm:grid-cols-[72px_minmax(0,1fr)_200px] sm:gap-x-5 sm:py-4 lg:grid-cols-[80px_minmax(0,1fr)_200px] lg:gap-x-6'
-          : 'sm:grid-cols-[72px_minmax(0,1fr)] sm:gap-x-5 sm:py-4 lg:grid-cols-[80px_minmax(0,1fr)] lg:gap-x-6',
-        readState === 'read' && 'opacity-60',
+        'relative z-10 grid grid-cols-1 gap-y-2 border-b border-border/50 transition-[background-color,opacity] hover:bg-muted focus-visible:bg-muted sm:gap-y-0',
+        'py-3.5 sm:py-4',
+        gridColsClasses,
+        isRead && 'opacity-60',
       )}
     >
       <div data-testid="event-card-layout" className="contents">
-        <time
-          data-testid="event-time"
-          dateTime={displayTime || undefined}
-          className="self-start text-left font-mono text-[12px] font-medium tabular-nums leading-none text-muted-foreground sm:mt-[8px] sm:text-right sm:text-[14px]"
-        >
-          {displayTimeLabel}
-        </time>
+        <div data-testid="event-time-column" className="self-start text-left sm:text-right">
+          <time
+            data-testid="event-time"
+            dateTime={displayTime || undefined}
+            className="block self-start text-left font-mono text-[12px] font-medium tabular-nums leading-none text-muted-foreground sm:mt-[8px] sm:text-right sm:text-[14px]"
+          >
+            {displayTimeLabel}
+          </time>
+        </div>
 
         <div
           data-testid="event-content"
@@ -146,7 +160,7 @@ export const EventCard = memo(function EventCard({
         >
           <h3 className="flex min-w-0 items-baseline gap-2 font-event-title text-[18px] font-medium leading-[1.32] text-foreground sm:text-[20px] sm:font-semibold">
             <span data-testid="event-title-text" className="min-w-0 line-clamp-2">
-              {categoryLabel && (
+              {showInlineCategory && (
                 <>
                   <span data-testid="event-category-label" className="text-[var(--brand)]">{categoryLabel}</span>
                   <span data-testid="event-category-separator">{' | '}</span>
@@ -159,7 +173,7 @@ export const EventCard = memo(function EventCard({
           {summaryText && (
             <p
               data-testid="event-summary"
-              className="mt-2 font-event-title text-[16px] font-medium leading-[1.58] tracking-normal text-muted-foreground line-clamp-2 sm:line-clamp-3"
+              className="mt-2 font-event-title font-medium tracking-normal text-muted-foreground text-[16px] leading-[1.58] line-clamp-3"
             >
               {summaryText}
             </p>
@@ -174,7 +188,7 @@ export const EventCard = memo(function EventCard({
             <EventMediaThumb
               cluster={cluster}
               coverUrl={coverUrl}
-              isRead={readState === 'read'}
+              isRead={isRead}
               onError={() => setFailedCoverUrl(coverUrl)}
             />
           </div>

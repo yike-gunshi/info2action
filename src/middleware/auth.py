@@ -7,6 +7,7 @@ Supports both:
 When JWT mode is active (users table has records), JWT takes priority.
 AUTH_TOKEN still works as a fallback for backward compatibility during transition.
 """
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -213,7 +214,28 @@ class AuthTokenMiddleware(BaseHTTPMiddleware):
         # BE-2(C 端放量梳理): session 校验在 60s 缓存 miss 时是一条远程
         # 3 表 JOIN;本中间件覆盖所有端点,必须离开事件循环,否则每个登录
         # 用户每分钟一次全站级阻塞。
-        user = await run_in_threadpool(_try_jwt_auth, request)
+        #
+        # 稳定性加固(2026-07-10): 该校验会走 remote_db round-trip,Supabase 承压/
+        # 不可达时抛 RemoteDBError。中间件在路由 degrade 逻辑之前执行——若在此
+        # fail-closed 抛出,会让**每个登录用户的每个请求**在中间件层直接 500,把
+        # 一次瞬时 DB 抖动放大成登录态全站 500 风暴(连 /api/feed/events 这种自带
+        # 降级的读路径也来不及降级)。这里改为 fail-open 到匿名:读路径继续返回
+        # 公开/降级内容,受保护写路径返回 401(前端 BF-0708 把 401→refresh 5xx
+        # 判为 "unavailable" 而非 "已登出",不会误踢用户)。
+        try:
+            user = await run_in_threadpool(_try_jwt_auth, request)
+        except remote_db.RemoteDBError as exc:
+            logging.getLogger(__name__).warning(
+                "auth middleware: session verification unavailable (%s); treating request as anonymous",
+                exc,
+            )
+            user = None
+        except Exception as exc:  # noqa: BLE001 — middleware must never 500 the whole site
+            logging.getLogger(__name__).error(
+                "auth middleware: unexpected session verification error (%s); treating request as anonymous",
+                exc,
+            )
+            user = None
         if user:
             request.state.user = user
             return await call_next(request)

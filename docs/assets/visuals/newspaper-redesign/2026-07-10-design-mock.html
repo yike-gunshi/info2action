@@ -1,0 +1,848 @@
+<title>info2act 前端重设计 · 视觉小样</title>
+<style>
+/* ============ 产品 token（与 frontend-react/src/globals.css 同值） ============ */
+#app{
+  --bg:#F4F3EF; --card:#FFFFFF; --fg:#1A1917; --border:#E4E2DC;
+  --muted:#F2F1ED; --muted-fg:#6B6A65; --ink-2:#54524C;
+  --brand:#C65A1E; --brand-soft:#F6E5DC; --brand-border:#E2B49F; --brand-fg:#FFFFFF;
+  --indigo:#4F52E4; --indigo-soft:#EEECFF;
+  --lift-bg:#FFFCF8;
+  --ph-a:#E9E4DA; --ph-b:#DDD6C8;
+  --shadow-med:0 6px 22px rgba(26,25,23,.14);
+  --serif:'Noto Serif SC','Songti SC','STSong',Georgia,serif;
+  --sans:'Inter',-apple-system,'PingFang SC','Noto Sans SC','Helvetica Neue',sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace;
+  --wordmark:'Cormorant Garamond','Cormorant',Georgia,serif;
+  background:var(--bg); color:var(--fg); font-family:var(--sans);
+  min-height:100vh; line-height:1.5;
+}
+#app.dark{
+  --bg:#181611; --card:#211E18; --fg:#ECE4D8; --border:#39342B;
+  --muted:#25211B; --muted-fg:#A79D90; --ink-2:#C8BBAA;
+  --brand:#F0A273; --brand-soft:#3A2A21; --brand-border:#7A573F; --brand-fg:#1F1713;
+  --indigo:#8B8DF0; --indigo-soft:#2A2A44;
+  --lift-bg:#26221B;
+  --ph-a:#2C2820; --ph-b:#241F19;
+  --shadow-med:0 8px 26px rgba(0,0,0,.5);
+}
+#app *{box-sizing:border-box;margin:0;padding:0}
+#app{overflow-x:clip}
+#app button{font-family:inherit;color:inherit;background:none;border:none;cursor:pointer}
+#app button:focus-visible,#app [tabindex]:focus-visible{outline:2px solid var(--brand);outline-offset:2px;border-radius:3px}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+
+/* ============ 审阅工具条（非产品 UI） ============ */
+.chrome{position:sticky;top:0;z-index:60;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:9px 20px;background:color-mix(in srgb,var(--bg) 88%,var(--fg) 4%);
+  border-bottom:1px solid var(--border);backdrop-filter:blur(6px)}
+.chrome-label{font-family:var(--mono);font-size:11px;color:var(--muted-fg);letter-spacing:.04em}
+.chrome-tabs{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
+.chrome-tabs::-webkit-scrollbar{display:none}
+.chrome-tab{padding:5px 12px;font-size:13px;border-radius:4px;color:var(--muted-fg);white-space:nowrap}
+.chrome-tab:hover{color:var(--fg);background:var(--muted)}
+.chrome-tab.on{color:var(--brand);background:var(--brand-soft);font-weight:600}
+.chrome-right{margin-left:auto;display:flex;gap:8px}
+.chrome-btn{font-size:12px;padding:5px 10px;border:1px solid var(--border);border-radius:4px;color:var(--muted-fg)}
+.chrome-btn:hover{color:var(--fg);border-color:var(--brand-border)}
+
+.view{display:none}
+.view.active{display:block}
+
+/* ============ 产品 TopBar 摹本 ============ */
+.topbar{display:flex;align-items:center;gap:24px;height:60px;padding:0 24px;
+  border-bottom:1px solid var(--border);background:var(--bg)}
+.wordmark{font-family:var(--wordmark);font-weight:700;font-size:26px;line-height:.82;letter-spacing:0}
+.wordmark .two{color:var(--brand);font-style:italic;font-weight:600}
+.topnav{display:flex;gap:28px;margin:0 auto}
+.topnav span{font-family:var(--serif);font-size:16px;font-weight:500;color:var(--muted-fg);
+  padding:19px 2px;border-bottom:2px solid transparent}
+.topnav .on{color:var(--fg);border-color:var(--brand)}
+.top-icons{display:flex;gap:14px}
+.top-icons i{width:18px;height:18px;border:1.5px solid var(--muted-fg);border-radius:50%;display:block}
+.top-icons i.sq{border-radius:4px}
+
+/* ============ 通用版面件 ============ */
+.paper{margin:0 auto;padding:0 24px 72px}
+.w1040{max-width:1040px}.w1168{max-width:1216px}.w1200{max-width:1248px}
+.filter-row{display:flex;gap:28px;justify-content:center;border-bottom:1px solid color-mix(in srgb,var(--border) 70%,transparent);
+  margin-bottom:4px;overflow-x:auto;scrollbar-width:none}
+.filter-row::-webkit-scrollbar{display:none}
+.ftab{font-family:var(--serif);font-size:16px;font-weight:500;color:var(--muted-fg);
+  padding:10px 2px;border-bottom:2px solid transparent;white-space:nowrap;flex-shrink:0}
+.ftab.on{color:var(--brand);border-color:var(--brand)}
+.ftab:hover{color:var(--fg)}
+
+/* 报眉 + Scotch rule 双线 */
+.folio{display:flex;align-items:baseline;gap:12px;padding:26px 0 10px}
+.folio-date{font-family:var(--serif);font-size:22px;font-weight:600}
+.folio-meta{font-size:13px;color:var(--muted-fg)}
+.folio-right{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--muted-fg)}
+.scotch{border-top:2px solid var(--fg);padding-top:2px;border-bottom:1px solid var(--border);height:5px;margin-bottom:2px}
+
+/* 精选行配方 */
+.row{display:grid;grid-template-columns:80px minmax(0,1fr);gap:0 24px;
+  padding:16px 0;border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent);cursor:pointer}
+.row:hover{background:var(--muted)}
+.row.has-img{grid-template-columns:80px minmax(0,1fr) 200px}
+.row.lede{grid-template-columns:80px minmax(0,1fr) 320px;padding:20px 0}
+.rtime{font-family:var(--mono);font-size:14px;color:var(--muted-fg);text-align:right;padding-top:6px;font-variant-numeric:tabular-nums}
+.kicker{font-size:13px;font-weight:500;color:var(--brand);letter-spacing:.02em;margin-bottom:6px}
+.kicker .ai{margin-left:2px}
+.hed{font-family:var(--serif);font-weight:600;color:var(--fg)}
+.lede .hed{font-size:28px;line-height:1.22;text-wrap:balance}
+.h2nd .hed{font-size:22px;line-height:1.3}
+.hstd .hed{font-size:20px;line-height:1.32}
+.hed .cat{color:var(--brand)}
+.dek{font-family:var(--serif);font-size:16px;line-height:1.62;color:var(--ink-2);margin-top:8px;
+  display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden}
+.lede .dek{-webkit-line-clamp:3}
+.h2nd .dek,.hstd .dek{-webkit-line-clamp:2;color:var(--muted-fg)}
+.sigmeta{font-family:var(--mono);font-size:12px;color:var(--muted-fg);margin-top:10px}
+.rimg{border-radius:6px;overflow:hidden;align-self:start}
+.lede .rimg{width:320px;height:192px}
+.row:not(.lede) .rimg{width:200px;height:120px}
+.ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,var(--ph-a),var(--ph-b));position:relative}
+.ph::after{content:'';position:absolute;inset:0;
+  background:repeating-linear-gradient(45deg,transparent 0 7px,color-mix(in srgb,var(--fg) 4%,transparent) 7px 8px)}
+.ph span{font-family:var(--mono);font-size:11px;color:var(--muted-fg);z-index:1}
+.brief{display:grid;grid-template-columns:80px minmax(0,1fr);gap:0 24px;padding:11px 0;
+  border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent);cursor:pointer;min-height:44px;align-items:baseline}
+.brief:hover{background:var(--muted)}
+.brief .rtime{padding-top:0;font-size:13px}
+.brief .t{font-family:var(--serif);font-size:16px;line-height:1.45;font-weight:500;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brief .t .cat{color:var(--brand)}
+.dayend{display:flex;align-items:center;gap:16px;padding:22px 0 6px}
+.dayend::before,.dayend::after{content:'';height:1px;background:var(--border);flex:1}
+.dayend span{font-family:var(--mono);font-size:12px;color:var(--muted-fg)}
+/* 已读态分档 */
+.read-std{opacity:.6}
+.read-lede .hed,.read-lede .dek{color:var(--muted-fg)}
+.read-lede .kicker{color:color-mix(in srgb,var(--brand) 70%,transparent)}
+.read-lede .ph{filter:grayscale(.25);opacity:.8}
+
+/* ============ 信息板块 ============ */
+.subbar{display:flex;align-items:center;gap:18px;height:44px;border-bottom:1px solid var(--border);
+  margin-bottom:0;overflow-x:auto;scrollbar-width:none}
+.subbar::-webkit-scrollbar{display:none}
+.seg{display:flex;gap:12px;flex-shrink:0;font-family:var(--serif);font-size:15px}
+.seg b{font-weight:600;color:var(--brand);border-bottom:2px solid var(--brand);padding:9px 0}
+.seg span{color:var(--muted-fg);padding:9px 0}
+.vline{width:1px;height:18px;background:var(--border);flex-shrink:0}
+.secnav{display:flex;gap:20px}
+.secnav span{font-family:var(--serif);font-size:15px;color:var(--muted-fg);padding:9px 0;white-space:nowrap;border-bottom:2px solid transparent}
+.secnav .on{color:var(--fg);border-color:var(--brand)}
+.section-front{padding-top:34px}
+.sec-rule{position:relative;height:2px;background:var(--border);margin-bottom:14px}
+.sec-rule::before{content:'';position:absolute;left:0;top:-1px;width:26px;height:3px;background:var(--brand)}
+.sec-head{display:flex;align-items:baseline;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.sec-name{font-family:var(--serif);font-size:22px;font-weight:700}
+.sec-count{font-family:var(--mono);font-size:12px;color:var(--muted-fg)}
+.sec-l2{margin-left:auto;display:flex;gap:16px;overflow-x:auto;scrollbar-width:none}
+.sec-l2 span{font-size:14px;color:var(--muted-fg);padding:2px 0;border-bottom:2px solid transparent;white-space:nowrap}
+.sec-l2 .on{color:var(--brand);border-color:var(--brand)}
+.leadgrid{display:grid;grid-template-columns:repeat(12,1fr);gap:0 24px;margin-bottom:8px}
+.lead{grid-column:span 7;cursor:pointer;padding-bottom:16px}
+.lead:hover .lt{color:color-mix(in srgb,var(--fg) 78%,var(--brand))}
+.lead .limg{aspect-ratio:16/9;border-radius:6px;overflow:hidden;margin-bottom:14px}
+.lt{font-family:var(--serif);font-size:26px;line-height:1.3;font-weight:600;text-wrap:balance;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ldek{font-family:var(--serif);font-size:16px;line-height:1.7;font-weight:400;color:var(--ink-2);margin-top:10px;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.ldek .ai,.kicker .ai{color:var(--brand)}
+.lmeta{font-family:var(--mono);font-size:12px;color:var(--muted-fg);margin-top:10px}
+.rail{grid-column:span 5;display:flex;flex-direction:column}
+.rail-item{padding:14px 0;border-bottom:1px solid color-mix(in srgb,var(--border) 70%,transparent);cursor:pointer}
+.rail-item:first-child{padding-top:2px}
+.rail-item:last-child{border-bottom:none}
+.rail-item:hover{background:var(--muted)}
+.rt{font-family:var(--serif);font-size:18px;line-height:1.45;font-weight:600;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.rdek{font-family:var(--serif);font-size:14px;line-height:1.6;color:var(--muted-fg);margin-top:6px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.briefzone{border-top:1px solid var(--border);padding-top:8px;margin-top:8px;
+  columns:2;column-gap:48px;column-rule:1px solid var(--border)}
+.bitem{break-inside:avoid;display:flex;gap:10px;align-items:baseline;padding:10px 0;min-height:44px;
+  border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent);cursor:pointer}
+.bitem:hover{background:var(--muted)}
+.bt{font-family:var(--serif);font-size:15px;line-height:1.6;font-weight:500;min-width:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.bmeta{font-family:var(--mono);font-size:12px;color:var(--muted-fg);flex-shrink:0}
+.bt .repo{font-family:var(--mono);font-size:14px;font-weight:500}
+.bt .au{color:var(--muted-fg);font-family:var(--sans);font-size:13px;margin-right:6px}
+.expand{display:block;margin:22px auto 0;font-size:14px;color:var(--muted-fg);
+  padding:8px 22px;border:1px solid var(--border);border-radius:4px;background:var(--card)}
+.expand:hover{border-color:var(--brand-border);color:var(--fg)}
+.sec-gap{height:64px}
+.fadeout{mask-image:linear-gradient(180deg,#000 0%,transparent 100%);-webkit-mask-image:linear-gradient(180deg,#000 0%,transparent 100%);pointer-events:none}
+/* A7 图片三档 */
+.a7{display:flex;gap:20px;flex-wrap:wrap;margin-top:14px}
+.a7 figure{width:172px}
+.a7 .slot{width:172px;height:129px;border-radius:6px;overflow:hidden;position:relative;background:var(--muted);border:1px solid color-mix(in srgb,var(--border) 70%,transparent)}
+.a7 figcaption{font-size:12px;color:var(--muted-fg);margin-top:6px;line-height:1.5}
+.a7 .contain-ph{position:absolute;inset:0;margin:auto;width:62%;height:100%;
+  background:linear-gradient(160deg,var(--ph-a),var(--ph-b))}
+.a7 .tag{position:absolute;right:6px;bottom:6px;font-family:var(--mono);font-size:10px;
+  background:color-mix(in srgb,var(--fg) 72%,transparent);color:var(--bg);padding:1px 5px;border-radius:3px;z-index:2}
+.a7 .fadefoot{position:absolute;left:0;right:0;bottom:0;height:14px;background:linear-gradient(transparent,var(--muted))}
+
+/* ============ 行动看板 ============ */
+.datebar{display:flex;gap:32px;justify-content:center;border-bottom:1px solid color-mix(in srgb,var(--border) 70%,transparent);margin-bottom:26px}
+.lanes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:start}
+.lane{border:1px solid var(--border);border-radius:4px;padding:12px;min-height:240px;
+  transition:background-color .18s ease-out,border-color .18s ease-out}
+.lane.over{background:var(--brand-soft);border-color:var(--brand-border)}
+.lane-head{display:flex;align-items:baseline;gap:8px;padding:2px 4px 10px}
+.lane-head h3{font-family:var(--serif);font-size:22px;font-weight:700;line-height:1}
+.lane-head .n{font-size:14px;color:var(--muted-fg);font-variant-numeric:tabular-nums}
+.lane-empty{border:1px dashed color-mix(in srgb,var(--border) 90%,transparent);border-radius:4px;
+  padding:30px 12px;text-align:center;font-size:14px;color:var(--muted-fg);display:none}
+.lane.over .lane-empty{border-color:var(--brand-border);color:var(--brand)}
+.acard{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:16px;margin-bottom:12px;
+  cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none;
+  transition:border-color .15s ease-out,background-color .15s ease-out}
+.acard:hover{border-color:var(--brand-border);background:var(--lift-bg)}
+.acard h4{font-family:var(--serif);font-size:19px;line-height:1.36;font-weight:600;margin-bottom:10px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.acard.done-style h4{color:var(--muted-fg);text-decoration:line-through}
+.acard ul{list-style:none;display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+.acard li{font-family:var(--serif);font-size:15px;line-height:1.58;color:var(--ink-2);display:flex;gap:8px;min-width:0}
+.acard li::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--brand);opacity:.7;flex-shrink:0;margin-top:.55em}
+.acard li span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-width:0}
+.afoot{display:flex;gap:12px;font-size:13px;color:var(--muted-fg)}
+.afoot .d{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.acard.ghost{opacity:.4;cursor:grabbing}
+.drag-clone{position:fixed;z-index:90;pointer-events:none;
+  transform:rotate(1.5deg) scale(1.02);border-color:var(--brand-border)!important;
+  background:var(--lift-bg)!important;box-shadow:var(--shadow-med);margin:0}
+.acard.settle{animation:settle .6s ease-out both}
+@keyframes settle{from{background-color:var(--brand-soft)}to{background-color:var(--card)}}
+.toastwrap{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:95;display:flex;flex-direction:column;gap:8px}
+.toast{display:flex;align-items:center;gap:14px;background:var(--card);border:1px solid var(--border);
+  border-radius:6px;padding:10px 16px;font-size:14px;box-shadow:var(--shadow-med)}
+.toast button{color:var(--brand);font-weight:600;font-size:14px}
+.demo-hint{font-family:var(--mono);font-size:12px;color:var(--muted-fg);text-align:center;margin-bottom:18px}
+
+/* ============ 事件内页 ============ */
+.mini-head{display:flex;align-items:center;gap:16px;height:52px;padding:0 24px;
+  border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--bg) 92%,transparent);
+  backdrop-filter:blur(6px);position:sticky;top:47px;z-index:40}
+.mini-head .back{font-size:14px;color:var(--muted-fg)}
+.mini-head .back:hover{color:var(--brand)}
+.mini-head .wordmark{font-size:20px;margin:0 auto}
+.detail-cols{display:grid;grid-template-columns:repeat(12,1fr);gap:0 32px;margin-top:26px}
+.dleft{grid-column:span 7}
+.dright{grid-column:span 5;border-left:1px solid var(--border);padding-left:32px}
+.dk{font-family:var(--mono);font-size:12px;color:var(--muted-fg);margin-bottom:10px}
+.dk b{color:var(--brand);font-weight:500}
+.dtitle{font-family:var(--serif);font-size:28px;line-height:1.3;font-weight:700;text-wrap:balance;margin-bottom:16px}
+.srcrow{display:grid;grid-template-columns:52px minmax(0,1fr) 20px;gap:0 14px;padding:13px 0;
+  border-bottom:1px solid color-mix(in srgb,var(--border) 70%,transparent);cursor:pointer;align-items:baseline}
+.srcrow:hover{background:var(--muted)}
+.srcrow .st{font-family:var(--mono);font-size:12px;color:var(--muted-fg);text-align:right;font-variant-numeric:tabular-nums}
+.srcrow .sn{min-width:0}
+.srcrow .who{font-size:13px;color:var(--muted-fg);margin-bottom:2px}
+.srcrow .who b{font-weight:500;color:var(--ink-2)}
+.srcrow .stt{font-family:var(--serif);font-size:16px;line-height:1.5;font-weight:500;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.srcrow .chev{color:var(--muted-fg);font-size:12px;justify-self:end}
+.dsec{font-family:var(--serif);font-size:16px;font-weight:700;margin-bottom:12px}
+.dsec .ai{color:var(--brand)}
+.dbody{font-family:var(--serif);font-size:16px;line-height:1.75;color:var(--ink-2);margin-bottom:26px}
+.dbody b{font-weight:700;color:var(--fg)}
+.dact{background:color-mix(in srgb,var(--card) 70%,var(--bg));border:1px solid var(--border);border-radius:4px;padding:16px}
+.dact h5{font-family:var(--serif);font-size:17px;font-weight:600;margin-bottom:8px}
+.dact p{font-family:var(--serif);font-size:15px;line-height:1.6;color:var(--ink-2);margin-bottom:12px}
+.dact .btns{display:flex;gap:10px}
+.dact .btns button{font-size:13px;padding:6px 14px;border-radius:4px;border:1px solid var(--border);color:var(--ink-2)}
+.dact .btns button.pri{background:var(--brand);border-color:var(--brand);color:var(--brand-fg);font-weight:500}
+.dact .btns button:hover{border-color:var(--brand-border)}
+.dact .btns button.pri:hover{opacity:.92}
+
+/* ============ Token 对照 ============ */
+.tk-cols{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:26px}
+.tk-panel{border:1px solid var(--border);border-radius:6px;padding:22px;background:var(--card)}
+.tk-panel h3{font-family:var(--serif);font-size:18px;font-weight:700;margin-bottom:4px}
+.tk-panel .sub{font-family:var(--mono);font-size:11px;color:var(--muted-fg);margin-bottom:18px}
+.tk-row{display:flex;align-items:center;gap:14px;padding:11px 0;border-bottom:1px solid color-mix(in srgb,var(--border) 60%,transparent);flex-wrap:wrap}
+.tk-row:last-child{border-bottom:none}
+.tk-row .lbl{font-size:12px;color:var(--muted-fg);width:96px;flex-shrink:0}
+.btn-demo{font-size:14px;font-weight:500;padding:7px 16px;border-radius:4px;color:#fff;border:none}
+.link-demo{font-size:14px;font-weight:500;text-decoration:none;background-image:linear-gradient(currentColor,currentColor);
+  background-repeat:no-repeat;background-position:50% 100%;background-size:100% 1px}
+.input-demo{width:150px;height:34px;border-radius:4px;border:1px solid var(--border);background:var(--card);padding:0 10px;font-size:13px;color:var(--muted-fg);display:flex;align-items:center}
+.badge-demo{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px}
+.tab-demo{font-family:var(--serif);font-size:15px;font-weight:600;padding:4px 1px;border-bottom:2px solid}
+.tk-note{margin-top:16px;font-size:13px;color:var(--ink-2);line-height:1.7}
+.tk-note b{color:var(--brand)}
+
+/* ============ 设计要点注脚 ============ */
+.notes{max-width:880px;margin:44px auto 0;border-top:2px solid var(--fg);padding-top:4px}
+.notes-in{border-top:1px solid var(--border);padding-top:14px}
+.notes h6{font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--muted-fg);margin-bottom:10px}
+.notes ol{padding-left:18px;display:flex;flex-direction:column;gap:5px}
+.notes li{font-size:13px;line-height:1.65;color:var(--ink-2)}
+.notes li b{font-weight:600;color:var(--fg)}
+.footer{max-width:880px;margin:40px auto 0;padding:16px 24px 40px;font-family:var(--mono);font-size:11px;color:var(--muted-fg);line-height:1.8}
+
+/* ============ 响应式 ============ */
+@media (max-width:960px){
+  .lanes{grid-template-columns:1fr}
+  .tk-cols{grid-template-columns:1fr}
+  .leadgrid{grid-template-columns:1fr}
+  .lead,.rail{grid-column:auto}
+  .rail{border-top:1px solid var(--border);padding-top:6px}
+  .briefzone{columns:1}
+  .detail-cols{grid-template-columns:1fr}
+  .dleft,.dright{grid-column:auto}
+  .dright{border-left:none;padding-left:0;border-top:1px solid var(--border);padding-top:22px;margin-top:22px}
+  .row.lede{grid-template-columns:80px minmax(0,1fr)}
+  .lede .rimg{display:none}
+  .row.has-img{grid-template-columns:80px minmax(0,1fr)}
+  .row:not(.lede) .rimg{display:none}
+  .topnav{gap:16px}
+}
+@media (prefers-reduced-motion:reduce){
+  .drag-clone{transform:none}
+  .acard.settle{animation:none}
+  .lane,.acard{transition:none}
+}
+</style>
+
+<div id="app">
+  <div class="chrome">
+    <span class="chrome-label">info2act 重设计小样 v1 · 2026-07-10 · 审阅用（字体以实机自托管 Noto Serif SC 为准）</span>
+    <nav class="chrome-tabs" id="chromeTabs">
+      <button class="chrome-tab on" data-v="v-hl">① 精选·日报头版</button>
+      <button class="chrome-tab" data-v="v-info">② 信息·报纸板块</button>
+      <button class="chrome-tab" data-v="v-act">③ 行动·拖拽看板</button>
+      <button class="chrome-tab" data-v="v-detail">④ 事件·内页</button>
+      <button class="chrome-tab" data-v="v-token">⑤ Token 对照</button>
+    </nav>
+    <div class="chrome-right">
+      <button class="chrome-btn" id="themeBtn">暗色 ◐</button>
+    </div>
+  </div>
+
+  <!-- ==================== ① 精选 · 日报头版 ==================== -->
+  <section class="view active" id="v-hl">
+    <div class="topbar">
+      <span class="wordmark">info<span class="two">2</span>act</span>
+      <nav class="topnav"><span class="on">精选</span><span>信息</span><span>行动</span></nav>
+      <div class="top-icons"><i></i><i class="sq"></i></div>
+    </div>
+    <div class="paper w1040">
+      <div class="filter-row">
+        <span class="ftab on">全部</span><span class="ftab">产品</span><span class="ftab">工具</span>
+        <span class="ftab">Coding</span><span class="ftab">模型</span><span class="ftab">行业</span><span class="ftab">投资</span>
+      </div>
+
+      <div class="folio">
+        <span class="folio-date">2026.7.10 星期五</span>
+        <span class="folio-meta">共 12 条更新</span>
+        <span class="folio-right">morning edition</span>
+      </div>
+      <div class="scotch"></div>
+
+      <!-- 头条 -->
+      <article class="row lede">
+        <time class="rtime">09:42</time>
+        <div>
+          <p class="kicker">模型 <span class="ai">✦</span></p>
+          <h3 class="hed">OpenAI 发布 GPT-5.5 Turbo：推理成本降六成，Agent 长任务错误率减半</h3>
+          <p class="dek">新模型把 o 系列的推理链压缩进单次前向，官方称 SWE-bench Verified 提升 9 个百分点；API 价格同步下调，输入每百万 token 定价进入 1 美元区间，直接对标 Gemini 3 Flash 的企业长任务市场。</p>
+          <p class="sigmeta">6 个来源 · 14 条报道 · 语鲸 / 量子位 / Hacker News</p>
+        </div>
+        <div class="rimg"><div class="ph"><span>封面 320×192 · 5:3</span></div></div>
+      </article>
+
+      <!-- 次条 -->
+      <article class="row has-img h2nd">
+        <time class="rtime">08:15</time>
+        <div>
+          <p class="kicker">工具 <span class="ai">✦</span></p>
+          <h3 class="hed">Anthropic 开源 MCP 网关：企业内网工具一键接入 Claude</h3>
+          <p class="dek">网关承担鉴权、审计与速率控制，内网系统不再逐个写 server；发布当天 GitHub 破 4k star。</p>
+        </div>
+        <div class="rimg"><div class="ph"><span>200×120</span></div></div>
+      </article>
+
+      <!-- 标准条 ×2 -->
+      <article class="row hstd">
+        <time class="rtime">07:58</time>
+        <div>
+          <h3 class="hed"><span class="cat">Coding</span>｜Cursor 2.0 引入多文件 Agent 计划视图，改动先出计划再落 diff</h3>
+          <p class="dek">✦ 计划视图把跨文件重构拆成可勾选步骤，付费用户先行；社区实测大型 monorepo 上采纳率明显高于直接生成。</p>
+        </div>
+      </article>
+      <article class="row has-img hstd">
+        <time class="rtime">07:31</time>
+        <div>
+          <h3 class="hed"><span class="cat">行业</span>｜英伟达 B300 出货爬坡：三大云厂商 Q3 算力容量翻倍</h3>
+          <p class="dek">✦ 供应链消息称良率问题已解决，云侧训练报价开始松动。</p>
+        </div>
+        <div class="rimg"><div class="ph"><span>200×120</span></div></div>
+      </article>
+
+      <!-- 简讯 ×3 -->
+      <article class="brief"><time class="rtime">06:50</time><p class="t"><span class="cat">模型</span>｜DeepSeek V4 全量权重上线 HuggingFace，含 16B 蒸馏版</p></article>
+      <article class="brief"><time class="rtime">06:22</time><p class="t"><span class="cat">工具</span>｜字节 Trae 插件市场开放第三方提交，首批过审 120 款</p></article>
+      <article class="brief"><time class="rtime">05:47</time><p class="t"><span class="cat">创作</span>｜Midjourney v8 网页端开放批量局部重绘</p></article>
+
+      <div class="dayend"><span>· 7 月 10 日 共 12 条 ·</span></div>
+
+      <!-- 昨日（已读态示例） -->
+      <div class="folio">
+        <span class="folio-date">2026.7.9 星期四</span>
+        <span class="folio-meta">共 9 条更新</span>
+      </div>
+      <div class="scotch"></div>
+
+      <article class="row lede read-lede">
+        <time class="rtime">10:03</time>
+        <div>
+          <p class="kicker">产品 <span class="ai">✦</span></p>
+          <h3 class="hed">谷歌把 Gemini 侧边栏推入 Workspace 全家桶，企业席位免费开放</h3>
+          <p class="dek">Docs / Sheets / Meet 内嵌同一 Agent 上下文，管理员可按部门关闭；分析师认为此举意在正面拦截 Copilot 的续费窗口。</p>
+          <p class="sigmeta">5 个来源 · 11 条报道</p>
+        </div>
+        <div class="rimg"><div class="ph"><span>已读头条：墨降档</span></div></div>
+      </article>
+      <article class="row hstd read-std">
+        <time class="rtime">09:12</time>
+        <div>
+          <h3 class="hed"><span class="cat">评测</span>｜LMSYS 新榜：开源模型首次进入总榜前三</h3>
+          <p class="dek">✦ Qwen-4-235B 在硬提示分组反超闭源第二梯队。</p>
+        </div>
+      </article>
+
+      <div class="notes"><div class="notes-in">
+        <h6>① 设计要点 · 方案 A「日报头版」</h6>
+        <ol>
+          <li><b>三档行配方</b>：头条 28px/1.22 + 320×192 图 + 3 行摘要 + 来源 meta；标准条 20px 维持现状；简讯 16px 单行、强制无图、行高压缩（整行仍 ≥44px 可点）。字号阶梯只有 16/20/22/28。</li>
+          <li><b>眉题 kicker</b>：头条/次条的分类从「分类｜标题」内联升格为独立眉题行（13px brand 色）；标准条/简讯保持内联省高度。</li>
+          <li><b>报眉 + 日界</b>：日期行下加「上粗下细」双线（Scotch rule）；每天末尾居中日界收束线，把无限流切成「一天一版」。</li>
+          <li><b>头条自动选取</b>：前端合成分（来源数×报道数×平台数），meta 行「6 个来源 · 14 条报道」即头条资格证；历史日冻结、今日只升不换降；条数 &lt;3 或筛选/搜索激活时整体退回平铺。</li>
+          <li><b>已读分档</b>：标准条/简讯维持整行压暗；头条/次条改「墨水降档」（见 7.9 示例），大字版面不塌。</li>
+          <li><b>移动端</b>：头条成为唯一有图行（通栏图 + 24px 题），次条降为标准条；弹窗内容区零改动。</li>
+        </ol>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- ==================== ② 信息 · 报纸板块 ==================== -->
+  <section class="view" id="v-info">
+    <div class="topbar">
+      <span class="wordmark">info<span class="two">2</span>act</span>
+      <nav class="topnav"><span>精选</span><span class="on">信息</span><span>行动</span></nav>
+      <div class="top-icons"><i></i><i class="sq"></i></div>
+    </div>
+    <div class="paper w1168">
+      <div class="subbar">
+        <div class="seg"><b>按类型</b><span>按来源</span></div>
+        <div class="vline"></div>
+        <nav class="secnav">
+          <span class="on">产品</span><span>工具</span><span>Coding</span><span>Skill</span><span>模型</span>
+          <span>评测</span><span>技术</span><span>教程</span><span>行业</span><span>创作</span><span>投资</span>
+        </nav>
+      </div>
+
+      <!-- 板块：产品 -->
+      <div class="section-front">
+        <div class="sec-rule"></div>
+        <div class="sec-head">
+          <h2 class="sec-name">产品</h2><span class="sec-count">128 条</span>
+          <div class="sec-l2"><span class="on">全部</span><span>ChatBot</span><span>AI 浏览器</span><span>搜索</span><span>硬件</span></div>
+        </div>
+
+        <div class="leadgrid">
+          <article class="lead">
+            <div class="limg"><div class="ph"><span>lead 16:9</span></div></div>
+            <p class="kicker">ChatBot</p>
+            <h3 class="lt">Perplexity 推出团队知识库：搜索答案可直接引用内部文档</h3>
+            <p class="ldek"><span class="ai">✦</span> 企业版把 Notion、Drive、Slack 接入统一索引，回答带内部来源角标；定价按席位而非用量，直指中小团队的「第一个 AI 采购」预算。</p>
+            <p class="lmeta">语鲸 · 深聊 AI · 2 小时前</p>
+          </article>
+          <div class="rail">
+            <article class="rail-item">
+              <p class="kicker">AI 浏览器</p>
+              <h4 class="rt">Arc 继任者 Dia 开放公测：地址栏即对话框</h4>
+              <p class="rdek">浏览历史成为上下文，标签页可被 Agent 代管。</p>
+              <p class="lmeta">The Browser Company · 4 小时前</p>
+            </article>
+            <article class="rail-item">
+              <p class="kicker">硬件</p>
+              <h4 class="rt">Rabbit 二代放弃独立硬件，转做手机常驻 Agent</h4>
+              <p class="rdek">首代 r1 库存转为开发者套件清仓。</p>
+              <p class="lmeta">爱范儿 · 5 小时前</p>
+            </article>
+            <article class="rail-item">
+              <p class="kicker">搜索</p>
+              <h4 class="rt">夸克升级「超级搜索框」：长文任务默认走 Agent 流水线</h4>
+              <p class="lmeta">量子位 · 昨天</p>
+            </article>
+          </div>
+        </div>
+
+        <div class="briefzone">
+          <div class="bitem"><p class="bt">Notion 3.0 把数据库公式升级为自然语言查询</p><span class="bmeta">36kr · 3h</span></div>
+          <div class="bitem"><p class="bt"><span class="au">@karpathy</span>「上下文工程」将取代提示工程成为核心技能，配 12 条实践清单</p><span class="bmeta">𝕏 · 4h</span></div>
+          <div class="bitem"><p class="bt"><span class="repo">danny-avila/LibreChat</span> ★ 31.2k — 开源多模型聊天前端，新增 MCP 面板</p><span class="bmeta">GitHub · 6h</span></div>
+          <div class="bitem"><p class="bt">钉钉 AI 表格开放 API，按行调用大模型批处理</p><span class="bmeta">少数派 · 7h</span></div>
+          <div class="bitem"><p class="bt"><span class="au">@sama</span> 预告下周「一个小而重要的发布」，社区猜测为记忆体系改版</p><span class="bmeta">𝕏 · 8h</span></div>
+          <div class="bitem"><p class="bt">Granola 拿下 B 轮：会议纪要工具切入 CRM 自动回填</p><span class="bmeta">TechCrunch · 9h</span></div>
+        </div>
+        <button class="expand">展开更多 · 还有 96 条</button>
+      </div>
+
+      <div class="sec-gap"></div>
+
+      <!-- 板块：工具（节奏示意，渐隐） -->
+      <div class="section-front" style="padding-top:0">
+        <div class="sec-rule"></div>
+        <div class="sec-head">
+          <h2 class="sec-name">工具</h2><span class="sec-count">86 条</span>
+          <div class="sec-l2"><span class="on">全部</span><span>效率</span><span>剪辑</span><span>设计</span></div>
+        </div>
+        <div class="leadgrid fadeout" style="max-height:150px;overflow:hidden">
+          <article class="lead">
+            <div class="limg"><div class="ph"><span>下一板块（间距 64px，板块眉 sticky）</span></div></div>
+          </article>
+          <div class="rail"><article class="rail-item"><h4 class="rt">Raycast AI 指令面板支持本地模型混跑</h4></article></div>
+        </div>
+      </div>
+
+      <!-- A7 图片三档 -->
+      <div class="notes"><div class="notes-in">
+        <h6>A7 · 异构图片三档规格（缩略图槽演示）</h6>
+        <div class="a7">
+          <figure>
+            <div class="slot"><div class="ph"><span>r ≥ 1.4 横图</span></div></div>
+            <figcaption>照片/OG 图 → 4:3 槽 object-cover 居中裁</figcaption>
+          </figure>
+          <figure>
+            <div class="slot"><div class="contain-ph"></div></div>
+            <figcaption>近方截图 → contain + muted 底纹（不用 blur）</figcaption>
+          </figure>
+          <figure>
+            <div class="slot"><div class="ph" style="height:220%"><span></span></div><div class="fadefoot"></div><span class="tag">长图</span></div>
+            <figcaption>r &lt; 0.75 长图 → 顶部裁切 + 底部渐隐 + 角标（A7 场景）</figcaption>
+          </figure>
+        </div>
+      </div></div>
+
+      <div class="notes" style="margin-top:24px"><div class="notes-in">
+        <h6>② 设计要点 · 方案 A「日报纸面」（简讯区即方案 B 的行语言）</h6>
+        <ol>
+          <li><b>告别瀑布流</b>：masonry 视觉序 ≠ DOM 序（违 WCAG 2.4.3），换「lead 7 栏 + 次级 5 栏 + 简讯双文字栏」，源序 = 视觉序，密度反而更高。</li>
+          <li><b>去卡片化</b>：白盒描边退场，层级靠 hairline、字号（26/18/15）与四档字重（标题 600 / 简讯题 500 / 正文摘要 400 / kicker 500）；整行可点 + hover 换底色。</li>
+          <li><b>异构分型</b>：article/video 才可任 lead；micro（推文，作者+正文体）与 repo（mono 一行式 ★ 数）固定进简讯区——卡片高度参差的病根是选材，不是排版。</li>
+          <li><b>板块眉</b>：2px 暖铜短标线 + 通栏 hairline + 22px 衬线板块名 + mono 计数 + 右侧 L2；滚动中当前板块眉 sticky（移动端不 sticky，省屏幕）。</li>
+          <li><b>已读换墨水降档</b>：现 opacity-40 对比度跌穿 AA；改标题降 muted、图 saturate(.6)。</li>
+          <li><b>保留件</b>：按类型/按来源双视角、折叠展开（计数按钮保留、追加简讯行）、点击开弹窗、cv-auto 懒渲染。A10 四项（字重/墨色/clamp/图规格）随本模板一并收口。</li>
+        </ol>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- ==================== ③ 行动 · 拖拽看板 ==================== -->
+  <section class="view" id="v-act">
+    <div class="topbar">
+      <span class="wordmark">info<span class="two">2</span>act</span>
+      <nav class="topnav"><span>精选</span><span>信息</span><span class="on">行动</span></nav>
+      <div class="top-icons"><i></i><i class="sq"></i></div>
+    </div>
+    <div class="paper w1200">
+      <div class="datebar">
+        <span class="ftab on">全部</span><span class="ftab">今天</span><span class="ftab">本周</span>
+      </div>
+      <p class="demo-hint">↓ 这是可操作的活演示：按住卡片拖到另一条泳道（Esc 取消；拖入「已完成」有撤销 toast）</p>
+
+      <div class="lanes" id="lanes">
+        <section class="lane" data-lane="pending">
+          <div class="lane-head"><h3>待处理</h3><span class="n">3</span></div>
+          <div class="cards">
+            <div class="acard" data-ts="3" tabindex="0">
+              <h4>试用 MCP 网关接入内部 wiki，评估替换现有检索链路</h4>
+              <ul><li><span>在测试环境部署 gateway，接 Confluence 只读凭证</span></li>
+              <li><span>对比 10 个真实问题的召回质量与延迟</span></li></ul>
+              <div class="afoot"><span>来自 3 条信息</span><span class="d">2026-07-10</span></div>
+            </div>
+            <div class="acard" data-ts="2" tabindex="0">
+              <h4>把周报生成迁到 GPT-5.5 Turbo，验证成本下降幅度</h4>
+              <ul><li><span>改 model 参数跑一周对照，记录 token 账单</span></li></ul>
+              <div class="afoot"><span>来自 2 条信息</span><span class="d">2026-07-10</span></div>
+            </div>
+            <div class="acard" data-ts="1" tabindex="0">
+              <h4>读 karpathy 上下文工程清单，沉淀成团队 prompt 规范</h4>
+              <ul><li><span>摘 12 条中适用于客服场景的 6 条</span></li></ul>
+              <div class="afoot"><span>来自 1 条信息</span><span class="d">2026-07-09</span></div>
+            </div>
+          </div>
+          <div class="lane-empty">放到这里</div>
+        </section>
+
+        <section class="lane" data-lane="progress">
+          <div class="lane-head"><h3>执行中</h3><span class="n">1</span></div>
+          <div class="cards">
+            <div class="acard" data-ts="5" tabindex="0">
+              <h4>Cursor 计划视图灰度：给前端组开 5 个席位收集反馈</h4>
+              <ul><li><span>周五收 satisfaction 表单，决定是否全组升级</span></li></ul>
+              <div class="afoot"><span>来自 2 条信息</span><span class="d">2026-07-10</span></div>
+            </div>
+          </div>
+          <div class="lane-empty">放到这里</div>
+        </section>
+
+        <section class="lane" data-lane="done">
+          <div class="lane-head"><h3>已完成</h3><span class="n">1</span></div>
+          <div class="cards">
+            <div class="acard done-style" data-ts="4" tabindex="0">
+              <h4>对比 DeepSeek V4 蒸馏版与现网模型的分类准确率</h4>
+              <ul><li><span>16B 版在中文标签集上持平，成本降 40%</span></li></ul>
+              <div class="afoot"><span>来自 4 条信息</span><span class="d">2026-07-09</span></div>
+            </div>
+          </div>
+          <div class="lane-empty">放到这里</div>
+        </section>
+      </div>
+
+      <div class="notes"><div class="notes-in">
+        <h6>③ 设计要点 · dnd-kit v1 规则集</h6>
+        <ol>
+          <li><b>选型</b>：@dnd-kit/core 经典版（不装 sortable）——键盘拖拽 + aria-live 中文播报内建，DragOverlay 可完全定制出「安静」的动效；Atlassian pragmatic-dnd 列备选。</li>
+          <li><b>只改泳道，不改序</b>：顺序恒为创建时间倒序（Linear/GitHub Projects 先例）→ 无插入线、无空槽，只做整泳道背景高亮（本演示所示），最安静也最符合 Atlassian 规范。</li>
+          <li><b>拾起态</b>：源卡原位降 40% 透明（不塌陷）；预览卡 rotate 1.5° + scale 1.02 + 暖纸底 + shadow-medium（系统内唯一合法投影场景=悬浮层）。</li>
+          <li><b>拖入「执行中」默认落 confirmed</b>；派发（Discord）保持菜单/弹窗专属入口，不混进拖拽手势；已完成 → markActionDone；撤销 toast 仅在拖入「已完成」时出现。</li>
+          <li><b>乐观更新 + 失败回滚</b>：卡片先动、请求后发；失败飞回原泳道 + toast 重试；拖拽期间冻结 refetch（防分页窗口把刚拖的卡吞掉——最大实现风险已有预案）。</li>
+          <li><b>移动端 v1</b>：「···」菜单为主 + 长按 250ms 拖拽为辅；泳道折叠成投放条列 v2。键盘：Space 拾起 → ←→ 换泳道 → Enter 落下 → Esc 取消。</li>
+        </ol>
+      </div></div>
+    </div>
+    <div class="toastwrap" id="toastwrap"></div>
+    <div class="sr-only" aria-live="polite" id="live"></div>
+  </section>
+
+  <!-- ==================== ④ 事件 · 内页 ==================== -->
+  <section class="view" id="v-detail">
+    <div class="mini-head">
+      <button class="back">← 返回精选</button>
+      <span class="wordmark">info<span class="two">2</span>act</span>
+      <span style="font-size:13px;color:var(--muted-fg)">分享 ↗</span>
+    </div>
+    <div class="paper w1040">
+      <div class="detail-cols">
+        <div class="dleft">
+          <p class="dk"><b>模型 ✦</b> · 6 个来源 · 14 条报道 · 07-10 09:42</p>
+          <h1 class="dtitle">OpenAI 发布 GPT-5.5 Turbo：推理成本降六成，Agent 长任务错误率减半</h1>
+          <div class="scotch" style="margin-bottom:10px"></div>
+          <article class="srcrow">
+            <time class="st">09:42</time>
+            <div class="sn"><p class="who"><b>Hacker News</b> · 1.2k points</p>
+            <p class="stt">GPT-5.5 Turbo: reasoning at 40% of the cost</p></div>
+            <span class="chev">▾</span>
+          </article>
+          <article class="srcrow">
+            <time class="st">09:18</time>
+            <div class="sn"><p class="who"><b>量子位</b></p>
+            <p class="stt">OpenAI 深夜上新：推理链压缩进单次前向，API 降价六成</p></div>
+            <span class="chev">▾</span>
+          </article>
+          <article class="srcrow">
+            <time class="st">08:55</time>
+            <div class="sn"><p class="who"><b>语鲸 · 特工宇宙</b></p>
+            <p class="stt">一文看懂 GPT-5.5 Turbo 的定价策略与 Agent 影响</p></div>
+            <span class="chev">▾</span>
+          </article>
+        </div>
+        <aside class="dright">
+          <h4 class="dsec"><span class="ai">✦</span> AI 速览</h4>
+          <p class="dbody">OpenAI 发布 <b>GPT-5.5 Turbo</b>，把 o 系列推理链压缩进单次前向：官方口径 SWE-bench Verified <b>提升 9pp</b>，长任务错误率约减半；输入价进入每百万 token 1 美元区间，直接冲击企业 Agent 市场的成本模型。</p>
+          <h4 class="dsec">建议行动</h4>
+          <div class="dact">
+            <h5>把周报生成链路迁到 GPT-5.5 Turbo 试算成本</h5>
+            <p>现网月账单约 $420，若降幅兑现可省一半以上；先在 staging 跑一周对照。</p>
+            <div class="btns"><button class="pri">标记完成</button><button>派发</button><button>忽略</button></div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="notes"><div class="notes-in">
+        <h6>④ 设计要点 · 事件全屏页 v19 化（报纸内页）</h6>
+        <ol>
+          <li><b>定位</b>：弹窗是「快报」，全屏页是「内页深读」——精选头版确立的衬线标题、Scotch rule、时间线语言直接延伸进来；也是分享链接的门面。</li>
+          <li><b>修真 bug</b>：展开原文正文现写死亮色墨（ItemLeftPanel 硬编码 #3F3A34），暗色下近乎不可读 → 全部改走 modal-text/reading-* token（可切本页暗色感受修复后效果）。</li>
+          <li><b>清 v15 残留</b>：靛蓝行动列表/badge/hover、emoji ⚠️ 图标、rounded-14px 图片、12px 正文 → 统一暖铜点睛、lucide 图标、4px 圆角、16px 阅读底线；右栏手写行动列表删除，复用已达标的 ClusterActionZone。</li>
+          <li><b>规格同步</b>：DESIGN.md §15.10/15.11（仍写着浅紫底）随本轮改写，消除文档与 v19 的冲突。</li>
+        </ol>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- ==================== ⑤ Token 对照 ==================== -->
+  <section class="view" id="v-token">
+    <div class="paper w1040" style="padding-top:34px">
+      <h2 style="font-family:var(--serif);font-size:24px;font-weight:700">亮色主题 accent 决策：靛蓝 → 暖铜？</h2>
+      <p style="font-size:14px;color:var(--ink-2);margin-top:8px;max-width:640px;line-height:1.7">
+        现状：暗色主题的 <code style="font-family:var(--mono);font-size:12px">--primary/--ring</code> 已是暖橙，亮色却还是 v19 前的靛蓝——同一控件两主题异色。
+        建议与 admin v23.1 同一决策：<b>亮色 accent 家族统一映射暖铜 --brand</b>，靛蓝全站退役；红（destructive）、琥珀（score）等语义色不动。
+      </p>
+      <div class="tk-cols">
+        <div class="tk-panel">
+          <h3>现状 · 亮色靛蓝</h3>
+          <p class="sub">--primary #4F52E4 · --accent #EEECFF（暗色却是暖橙 #F0A273）</p>
+          <div class="tk-row"><span class="lbl">主按钮</span><button class="btn-demo" style="background:var(--indigo)">生成行动</button></div>
+          <div class="tk-row"><span class="lbl">文字链接</span><a class="link-demo" style="color:var(--indigo)">查看全部来源</a></div>
+          <div class="tk-row"><span class="lbl">focus ring</span><div class="input-demo" style="border-color:var(--indigo);box-shadow:0 0 0 3px color-mix(in srgb,var(--indigo) 18%,transparent)">搜索…</div></div>
+          <div class="tk-row"><span class="lbl">官方 badge</span><span class="badge-demo" style="background:var(--indigo-soft);color:var(--indigo)">官方</span></div>
+          <div class="tk-row"><span class="lbl">选中 tab</span><span class="tab-demo" style="color:var(--indigo);border-color:var(--indigo)">按类型</span></div>
+        </div>
+        <div class="tk-panel">
+          <h3>提案 · 亮色统一暖铜</h3>
+          <p class="sub">--primary → var(--brand) #C65A1E · 与暗色/admin/精选 active 同源</p>
+          <div class="tk-row"><span class="lbl">主按钮</span><button class="btn-demo" style="background:var(--brand);color:var(--brand-fg)">生成行动</button></div>
+          <div class="tk-row"><span class="lbl">文字链接</span><a class="link-demo" style="color:var(--brand)">查看全部来源</a></div>
+          <div class="tk-row"><span class="lbl">focus ring</span><div class="input-demo" style="border-color:var(--brand-border);box-shadow:0 0 0 3px color-mix(in srgb,var(--brand) 16%,transparent)">搜索…</div></div>
+          <div class="tk-row"><span class="lbl">官方 badge</span><span class="badge-demo" style="background:var(--brand-soft);color:var(--brand)">官方</span></div>
+          <div class="tk-row"><span class="lbl">选中 tab</span><span class="tab-demo" style="color:var(--brand);border-color:var(--brand)">按类型</span></div>
+        </div>
+      </div>
+      <p class="tk-note">随决策一并清扫的<b>一致性收尾包</b>：Onboarding 三步页 / App 启动 loader / ResetPassword 残留 i2a 方块标 → 纸面语言；Toaster 接主题 token（现暗色恒弹白 toast）；8 处带阴影「加载更多」胶囊 → hairline 按钮（见 ② 演示）；4 套骨架并 1 套；3 处 emoji 图标 → lucide；幽灵 token --warn 删除。切换本页暗色可验证暖铜在两主题下同源。</p>
+    </div>
+  </section>
+
+  <div class="footer">
+    依据：docs/调研/2026-07-10-前端重设计-{精选报纸头版,信息板块化,行动拖拽看板,其他界面盘点}调研.md（commit 9b22ce85）·
+    小样为方向确认用（Image2 门禁），最终以 DESIGN.md token 与真实截图为准 · 弹窗「精华速览/要点拆解」内容区零改动
+  </div>
+</div>
+
+<script>
+(function(){
+  var app=document.getElementById('app');
+  /* ---- 主题：初始跟随查看器，手动切换后以手动为准 ---- */
+  var manual=false, btn=document.getElementById('themeBtn');
+  function setDark(d){app.classList.toggle('dark',d);btn.textContent=d?'亮色 ◑':'暗色 ◐'}
+  function viewerDark(){var t=document.documentElement.getAttribute('data-theme');
+    if(t)return t==='dark';return matchMedia('(prefers-color-scheme: dark)').matches}
+  setDark(viewerDark());
+  btn.addEventListener('click',function(){manual=true;setDark(!app.classList.contains('dark'))});
+  new MutationObserver(function(){if(!manual)setDark(viewerDark())})
+    .observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+
+  /* ---- 视图切换 ---- */
+  var tabs=document.querySelectorAll('.chrome-tab');
+  tabs.forEach(function(t){t.addEventListener('click',function(){
+    tabs.forEach(function(x){x.classList.remove('on')});t.classList.add('on');
+    document.querySelectorAll('.view').forEach(function(v){v.classList.remove('active')});
+    document.getElementById(t.dataset.v).classList.add('active');
+    window.scrollTo({top:0});
+  })});
+
+  /* ---- 看板拖拽活演示 ---- */
+  var lanesEl=document.getElementById('lanes'), live=document.getElementById('live');
+  var laneName={pending:'待处理',progress:'执行中',done:'已完成'};
+  var reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var drag=null;
+
+  function laneCount(lane){
+    lane.querySelector('.lane-head .n').textContent=lane.querySelectorAll('.acard').length;
+    lane.querySelector('.lane-empty').style.display=lane.querySelectorAll('.acard').length?'none':'block';
+  }
+  function announce(msg){live.textContent='';setTimeout(function(){live.textContent=msg},30)}
+
+  lanesEl.addEventListener('pointerdown',function(e){
+    var card=e.target.closest('.acard');
+    if(!card||e.button!==0)return;
+    var startX=e.clientX,startY=e.clientY,started=false;
+    var srcLane=card.closest('.lane');
+
+    function move(ev){
+      if(!started){
+        if(Math.hypot(ev.clientX-startX,ev.clientY-startY)<8)return;
+        started=true;
+        var r=card.getBoundingClientRect();
+        var clone=card.cloneNode(true);
+        clone.className='acard drag-clone';
+        clone.style.width=r.width+'px';
+        document.body.appendChild(clone);
+        card.classList.add('ghost');
+        document.body.style.cursor='grabbing';
+        drag={card:card,clone:clone,srcLane:srcLane,srcRect:r,offX:startX-r.left,offY:startY-r.top,over:null};
+        announce('已拾起「'+card.querySelector('h4').textContent.slice(0,18)+'…」，当前在'+laneName[srcLane.dataset.lane]);
+      }
+      drag.clone.style.left=(ev.clientX-drag.offX)+'px';
+      drag.clone.style.top=(ev.clientY-drag.offY)+'px';
+      var overLane=null;
+      document.querySelectorAll('.lane').forEach(function(l){
+        var lr=l.getBoundingClientRect();
+        if(ev.clientX>=lr.left&&ev.clientX<=lr.right&&ev.clientY>=lr.top&&ev.clientY<=lr.bottom)overLane=l;
+      });
+      if(drag.over&&drag.over!==overLane)drag.over.classList.remove('over');
+      drag.over=(overLane&&overLane!==drag.srcLane)?overLane:null;
+      if(drag.over)drag.over.classList.add('over');
+    }
+    function finish(cancelled){
+      document.removeEventListener('pointermove',move);
+      document.removeEventListener('pointerup',up);
+      document.removeEventListener('keydown',key);
+      document.body.style.cursor='';
+      if(!started)return;
+      var d=drag;drag=null;
+      if(d.over)d.over.classList.remove('over');
+      if(!cancelled&&d.over){
+        d.clone.remove();
+        var target=d.over,cards=target.querySelector('.cards');
+        var ts=+d.card.dataset.ts,placed=false;
+        cards.querySelectorAll('.acard').forEach(function(c){
+          if(!placed&&+c.dataset.ts<ts){cards.insertBefore(d.card,c);placed=true}
+        });
+        if(!placed)cards.appendChild(d.card);
+        d.card.classList.remove('ghost');
+        d.card.classList.toggle('done-style',target.dataset.lane==='done');
+        if(!reduced){d.card.classList.add('settle');setTimeout(function(){d.card.classList.remove('settle')},650)}
+        laneCount(d.srcLane);laneCount(target);
+        announce('已移动到'+laneName[target.dataset.lane]);
+        if(target.dataset.lane==='done')toastUndo(d.card,d.srcLane);
+      }else{
+        /* 取消/无效落点：飞回 */
+        if(reduced){d.clone.remove();d.card.classList.remove('ghost')}
+        else{
+          d.clone.style.transition='left .18s ease-out,top .18s ease-out,transform .18s ease-out';
+          d.clone.style.left=d.srcRect.left+'px';d.clone.style.top=d.srcRect.top+'px';
+          d.clone.style.transform='none';
+          setTimeout(function(){d.clone.remove();d.card.classList.remove('ghost')},190);
+        }
+        announce('已取消，卡片回到'+laneName[d.srcLane.dataset.lane]);
+      }
+    }
+    function up(){finish(false)}
+    function key(ev){if(ev.key==='Escape')finish(true)}
+    document.addEventListener('pointermove',move);
+    document.addEventListener('pointerup',up);
+    document.addEventListener('keydown',key);
+  });
+
+  var toastwrap=document.getElementById('toastwrap');
+  function toastUndo(card,srcLane){
+    toastwrap.innerHTML='';
+    var t=document.createElement('div');t.className='toast';
+    t.innerHTML='<span>已完成</span>';
+    var b=document.createElement('button');b.textContent='撤销';
+    b.onclick=function(){
+      var cards=srcLane.querySelector('.cards');
+      var ts=+card.dataset.ts,placed=false;
+      cards.querySelectorAll('.acard').forEach(function(c){
+        if(!placed&&+c.dataset.ts<ts){cards.insertBefore(card,c);placed=true}
+      });
+      if(!placed)cards.appendChild(card);
+      card.classList.remove('done-style');
+      document.querySelectorAll('.lane').forEach(laneCount);
+      t.remove();announce('已撤销');
+    };
+    t.appendChild(b);toastwrap.appendChild(t);
+    setTimeout(function(){t.remove()},5000);
+  }
+})();
+</script>

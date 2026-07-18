@@ -125,13 +125,60 @@ def test_run_env_exports_current_python_for_fetch_shell(monkeypatch):
     assert env['INFO2ACTION_DATA_DIR'].endswith('/data/run_sources/42')
 
 
+def test_source_fetch_timeout_covers_all_configured_x_attempts(monkeypatch):
+    monkeypatch.delenv('INFO2ACTION_SOURCE_FETCH_TIMEOUT_SEC', raising=False)
+    monkeypatch.setattr(fetch_route, '_active_x_source_count_current_backend', lambda: 165)
+    monkeypatch.setattr(fetch_route, 'load_json', lambda _path: {
+        'twitter': {'user_posts_workers': 4, 'user_posts_retry_rounds': 2},
+    })
+
+    assert fetch_route._source_fetch_timeout_sec() == 9150
+
+
+def test_source_fetch_timeout_allows_operator_override(monkeypatch):
+    monkeypatch.setenv('INFO2ACTION_SOURCE_FETCH_TIMEOUT_SEC', '3600')
+    monkeypatch.setattr(
+        fetch_route,
+        '_active_x_source_count_current_backend',
+        lambda: (_ for _ in ()).throw(AssertionError('count should not be read')),
+    )
+
+    assert fetch_route._source_fetch_timeout_sec() == 3600
+
+
+def test_count_items_current_backend_uses_remote_authority(monkeypatch):
+    class FakeConn:
+        def execute(self, sql):
+            assert 'remote_poc.items' in sql
+            return self
+
+        def fetchone(self):
+            return {'count': 42}
+
+    class FakeContext:
+        def __enter__(self):
+            return FakeConn()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(fetch_route.remote_db, 'fetch_write_to_remote', lambda: True)
+    monkeypatch.setattr(fetch_route.remote_db, 'remote_schema', lambda: 'remote_poc')
+    monkeypatch.setattr(fetch_route.remote_db, 'connect', lambda: FakeContext())
+    monkeypatch.setattr(
+        fetch_route.db,
+        'get_conn',
+        lambda: (_ for _ in ()).throw(AssertionError('local sqlite must not be read')),
+    )
+
+    assert fetch_route._count_items_current_backend() == 42
+
+
 def test_run_source_fetch_step_writes_to_output_root(monkeypatch, tmp_path):
     captured = {}
     run_root = tmp_path / 'run_sources' / '3110'
 
     monkeypatch.setattr(fetch_route, 'BASE', str(tmp_path))
-    monkeypatch.setattr(fetch_route, 'load_json', lambda _path: {'twitter': {'following_count': 17}})
-
     def fake_run(cmd, **kwargs):
         captured['cmd'] = cmd
         captured['env'] = kwargs.get('env')
@@ -150,7 +197,10 @@ def test_run_source_fetch_step_writes_to_output_root(monkeypatch, tmp_path):
     )
 
     assert ok is True
-    assert captured['cmd'][-1] == str(run_root / 'sources' / 'twitter' / '1-following-feed.json')
+    assert captured['cmd'] == [
+        fetch_route._python_executable(),
+        str(tmp_path / 'src' / 'fetch_x_users.py'),
+    ]
     assert captured['env'] is env
 
 
@@ -644,7 +694,6 @@ def test_run_fetch_refreshes_info_read_model_when_platform_prewarm_disabled(monk
     monkeypatch.setenv('INFO2ACTION_CACHE_PREWARM', '1')
     monkeypatch.setenv('INFO2ACTION_PREWARM_PLATFORMS', '0')
     monkeypatch.setenv('INFO2ACTION_INFO_READ_MODEL', '1')
-    monkeypatch.delenv('INFO2ACTION_REFRESH_PLATFORM_MV_AFTER_FETCH', raising=False)
     monkeypatch.setattr(fetch_route, '_run_summaries', lambda **_kwargs: True)
     monkeypatch.setattr(fetch_route, '_count_inserted_run_items', lambda _run_id: 3)
     monkeypatch.setattr(fetch_route, '_fetch_run_stats_current_backend', lambda: {})
@@ -708,7 +757,6 @@ def test_run_fetch_honors_info_read_model_refresh_flag(monkeypatch, tmp_path):
     monkeypatch.setenv('INFO2ACTION_INFO_READ_MODEL', '1')
     monkeypatch.setenv('INFO2ACTION_INFO_READ_MODEL_REFRESH', '0')
     monkeypatch.setenv('INFO2ACTION_HIGHLIGHTS_READ_MODEL', '0')
-    monkeypatch.delenv('INFO2ACTION_REFRESH_PLATFORM_MV_AFTER_FETCH', raising=False)
     monkeypatch.setattr(fetch_route, '_run_summaries', lambda **_kwargs: True)
     monkeypatch.setattr(fetch_route, '_count_inserted_run_items', lambda _run_id: 3)
     monkeypatch.setattr(fetch_route, '_fetch_run_stats_current_backend', lambda: {})
@@ -758,7 +806,6 @@ def test_run_fetch_refreshes_highlights_read_model_when_platform_prewarm_disable
     monkeypatch.setenv('INFO2ACTION_INFO_READ_MODEL', '0')
     monkeypatch.setenv('INFO2ACTION_HIGHLIGHTS_READ_MODEL', '1')
     monkeypatch.setenv('INFO2ACTION_HIGHLIGHTS_READ_MODEL_REFRESH_MIN_INTERVAL_SEC', '1800')
-    monkeypatch.delenv('INFO2ACTION_REFRESH_PLATFORM_MV_AFTER_FETCH', raising=False)
     monkeypatch.setattr(fetch_route, '_run_summaries', lambda **_kwargs: True)
     monkeypatch.setattr(fetch_route, '_count_inserted_run_items', lambda _run_id: 3)
     monkeypatch.setattr(fetch_route, '_fetch_run_stats_current_backend', lambda: {})
@@ -834,7 +881,6 @@ def test_run_fetch_honors_highlights_read_model_refresh_flag(monkeypatch, tmp_pa
     monkeypatch.setenv('INFO2ACTION_INFO_READ_MODEL', '0')
     monkeypatch.setenv('INFO2ACTION_HIGHLIGHTS_READ_MODEL', '1')
     monkeypatch.setenv('INFO2ACTION_HIGHLIGHTS_READ_MODEL_REFRESH', '0')
-    monkeypatch.delenv('INFO2ACTION_REFRESH_PLATFORM_MV_AFTER_FETCH', raising=False)
     monkeypatch.setattr(fetch_route, '_run_summaries', lambda **_kwargs: True)
     monkeypatch.setattr(fetch_route, '_count_inserted_run_items', lambda _run_id: 3)
     monkeypatch.setattr(fetch_route, '_fetch_run_stats_current_backend', lambda: {})
@@ -1251,9 +1297,11 @@ def test_run_source_micro_fetch_uses_run_scoped_ingest_enrich_and_cluster(monkey
     ('published_clusters', 'expected_refresh_calls', 'expected_cache_clears'),
     [
         (
+            # Wave1: _bg_prewarm 不再于预热后二次清缓存;内容变更的失效由 run
+            # 收尾 finally 块 (feed_content_changed) 承担,故仅剩 1 次清理。
             1,
             [{'min_interval_sec': 0}],
-            [{'clear_remote_snapshots': True}, {'clear_remote_snapshots': True}],
+            [{'clear_remote_snapshots': True}],
         ),
         (
             0,
@@ -1353,20 +1401,19 @@ def test_dynamic_micro_fetch_sources_parse_platform_source_and_interval(monkeypa
     specs = fetch_route._dynamic_micro_fetch_sources()
 
     assert specs == [
-        {'platform': 'twitter', 'source': 'following', 'interval_minutes': 5.0},
+        {'platform': 'twitter', 'source': 'registry', 'interval_minutes': 5.0},
         {'platform': 'xiaohongshu', 'source': 'search:AI_agents', 'interval_minutes': 15.0},
         {'platform': 'bilibili', 'source': 'hot', 'interval_minutes': 60.0},
     ]
 
 
-def test_dynamic_micro_fetch_sources_default_to_twitter_hot_lanes(monkeypatch):
+def test_dynamic_micro_fetch_sources_default_to_one_registry_lane(monkeypatch):
     monkeypatch.delenv('INFO2ACTION_DYNAMIC_FETCH_SOURCES', raising=False)
 
     specs = fetch_route._dynamic_micro_fetch_sources()
 
     assert specs == [
-        {'platform': 'twitter', 'source': 'following', 'interval_minutes': 5.0},
-        {'platform': 'twitter', 'source': 'for_you', 'interval_minutes': 5.0},
+        {'platform': 'twitter', 'source': 'registry', 'interval_minutes': 5.0},
     ]
 
 
@@ -1395,11 +1442,11 @@ def test_start_dynamic_micro_fetch_uses_due_source_and_cooldown(monkeypatch):
 
     assert first['ok'] is True
     assert first['platform'] == 'twitter'
-    assert first['source_name'] == 'following'
+    assert first['source_name'] == 'registry'
     assert skipped['ok'] is False
     assert skipped['skip_reason'] == 'dynamic_micro_no_due_source'
     assert second['ok'] is True
-    assert calls == [('twitter', 'following'), ('twitter', 'following')]
+    assert calls == [('twitter', 'registry'), ('twitter', 'registry')]
     fetch_route._dynamic_micro_last_started.clear()
 
 
@@ -1416,7 +1463,7 @@ def test_start_dynamic_micro_fetch_uses_persisted_cooldown_after_restart(monkeyp
     monkeypatch.setattr(
         fetch_route,
         '_latest_micro_fetch_started_at_current_backend',
-        lambda platform, source: now_wall - timedelta(minutes=5) if source == 'following' else None,
+        lambda platform, source: now_wall - timedelta(minutes=5),
     )
     monkeypatch.setattr(
         fetch_route,
@@ -1431,10 +1478,9 @@ def test_start_dynamic_micro_fetch_uses_persisted_cooldown_after_restart(monkeyp
 
     result = fetch_route.start_dynamic_micro_fetch('unit')
 
-    assert result['ok'] is True
-    assert result['platform'] == 'twitter'
-    assert result['source_name'] == 'for_you'
-    assert calls == [('twitter', 'for_you')]
+    assert result['ok'] is False
+    assert result['skip_reason'] == 'dynamic_micro_no_due_source'
+    assert calls == []
     fetch_route._dynamic_micro_last_started.clear()
 
 
@@ -1522,6 +1568,42 @@ def test_count_inserted_run_items_uses_run_item_scope(monkeypatch, tmp_path):
     conn.close()
 
     assert fetch_route._count_inserted_run_items(77) == 2
+
+
+def test_load_x_source_attempts_keeps_partial_run_auditable(monkeypatch, tmp_path):
+    monkeypatch.setattr(fetch_route, 'BASE', str(tmp_path))
+    run_dir = tmp_path / 'data' / 'run_sources' / '88'
+    run_dir.mkdir(parents=True)
+    (run_dir / 'x_user_attempts.json').write_text(json.dumps({
+        'schema_version': 1,
+        'started_at': '2026-07-11T01:00:00+00:00',
+        'finished_at': None,
+        'planned_sources': [
+            {'source_id': 1, 'handle': 'done'},
+            {'source_id': 2, 'handle': 'retrying'},
+            {'source_id': 3, 'handle': 'never_started'},
+        ],
+        'planned_source_ids': [1, 2, 3],
+        'planned': 3,
+        'attempted': 2,
+        'succeeded': 1,
+        'failed': 0,
+        'missed': 2,
+        'results': [
+            {'source_id': 1, 'handle': 'done', 'outcome': 'success', 'attempts': 1},
+            {'source_id': 2, 'handle': 'retrying', 'outcome': 'retrying', 'attempts': 1},
+        ],
+    }))
+
+    summary = fetch_route._load_x_source_attempts(88)
+
+    assert summary['planned'] == 3
+    assert summary['attempted'] == 2
+    assert summary['succeeded'] == 1
+    assert summary['failed'] == 0
+    assert summary['missed'] == 2
+    assert summary['missed_source_ids'] == [2, 3]
+    assert summary['results'][1]['outcome'] == 'interrupted'
 
 
 def test_run_fetch_does_not_publish_partial_events_when_ai_fails(monkeypatch, tmp_path):

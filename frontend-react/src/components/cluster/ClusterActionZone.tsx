@@ -322,9 +322,9 @@ export function ClusterActionZone({ clusterId, showExistingActions = true }: Clu
               <ArrowRight className="w-3.5 h-3.5 text-[var(--modal-text-faint)] group-hover:text-[var(--brand)] shrink-0" />
               <span className="truncate flex-1">{action.title}</span>
               {action.is_stale ? (
+                // v24.0 §21.6: 幽灵 token --warn 退役 → score 语义 token（琥珀,两主题自适应）
                 <span
-                  className="text-[10px] px-1.5 py-0.5 rounded"
-                  style={{ background: 'var(--warn, #f59e0b)', color: '#fff' }}
+                  className="rounded-[4px] bg-[var(--score-high-bg)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--score-high)]"
                   title="此事件已更新，行动点可能过时"
                 >
                   陈旧

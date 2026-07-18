@@ -1255,6 +1255,384 @@ def test_feedback_post_writes_remote_store(monkeypatch):
     assert calls[1][1]["author"] == "A"
 
 
+def test_should_feature_feedback_uses_remote_semantic_toggle(monkeypatch):
+    import routes.feed as feed
+
+    calls = []
+
+    class FakeRequest:
+        state = SimpleNamespace(user=None, legacy_authenticated=True)
+
+        async def json(self):
+            return {
+                "item_id": "remote-item",
+                "type": "should_feature",
+                "text": "我想看这条",
+            }
+
+    monkeypatch.setattr(feed.remote_db, "app_state_to_remote", lambda: True)
+    monkeypatch.setattr(feed.remote_db, "app_state_backend", lambda: "supabase")
+    monkeypatch.setattr(
+        feed.remote_db,
+        "get_feedback_item_context_remote",
+        lambda item_id: {
+            "id": item_id,
+            "user_id": None,
+            "platform": "twitter",
+            "title": "T",
+            "author_name": "A",
+            "url": "https://x",
+            "ai_summary": "S",
+        },
+    )
+    monkeypatch.setattr(
+        feed.remote_db,
+        "toggle_item_should_feature_remote",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        feed.remote_db,
+        "add_feedback_remote",
+        lambda *args: pytest.fail("should_feature must use the atomic toggle"),
+    )
+    monkeypatch.setattr(
+        feed.remote_db,
+        "record_item_feedback_remote",
+        lambda **kwargs: pytest.fail("should_feature must use the atomic toggle"),
+    )
+
+    result = asyncio.run(feed.post_feedback(FakeRequest()))
+
+    assert result == {"ok": True, "active": True, "data_backend": "supabase"}
+    assert calls == [
+        {
+            "item_id": "remote-item",
+            "platform": "twitter",
+            "title": "T",
+            "author": "A",
+            "url": "https://x",
+            "reason": "我想看这条",
+            "topic": None,
+        }
+    ]
+
+
+def test_should_drop_feedback_uses_remote_semantic_toggle(monkeypatch):
+    import routes.feed as feed
+
+    calls = []
+
+    class FakeRequest:
+        state = SimpleNamespace(user={"id": "admin-user", "role": "admin"})
+
+        async def json(self):
+            return {
+                "item_id": "remote-item",
+                "type": "should_drop",
+                "text": "这条应排除",
+            }
+
+    monkeypatch.setattr(feed.remote_db, "app_state_to_remote", lambda: True)
+    monkeypatch.setattr(feed.remote_db, "app_state_backend", lambda: "supabase")
+    monkeypatch.setattr(
+        feed.remote_db,
+        "get_feedback_item_context_remote",
+        lambda item_id: {
+            "id": item_id,
+            "user_id": None,
+            "platform": "twitter",
+            "title": "T",
+            "author_name": "A",
+            "url": "https://x",
+        },
+    )
+    monkeypatch.setattr(
+        feed.remote_db,
+        "toggle_item_admin_feedback_remote",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+
+    result = asyncio.run(feed.post_feedback(FakeRequest()))
+
+    assert result == {"ok": True, "active": True, "data_backend": "supabase"}
+    assert calls[0]["action"] == "should_drop"
+    assert calls[0]["reason"] == "这条应排除"
+
+
+def test_remote_should_drop_toggle_replaces_opposite_admin_label(monkeypatch):
+    import remote_db
+
+    class FakeConn:
+        def __init__(self):
+            self.calls = []
+            self.commits = 0
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.calls.append((normalized, params))
+            return SimpleNamespace(fetchone=lambda: None)
+
+        def commit(self):
+            self.commits += 1
+
+    fake = FakeConn()
+
+    @contextmanager
+    def fake_connect():
+        yield fake
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+
+    active = remote_db.toggle_item_admin_feedback_remote(
+        item_id="item-1",
+        action="should_drop",
+        reason="排除",
+    )
+
+    assert active is True
+    assert fake.commits == 1
+    sql = " ".join(call[0] for call in fake.calls)
+    assert "type IN ('should_feature', 'should_drop')" in sql
+    assert "action IN ('should_feature', 'should_drop')" in sql
+    inserts = [call for call in fake.calls if call[0].startswith("INSERT INTO")]
+    assert inserts[0][1][1] == "should_drop"
+    assert inserts[1][1][5] == "should_drop"
+
+
+def test_should_feature_feedback_rejects_non_admin_before_write(monkeypatch):
+    import routes.feed as feed
+
+    class FakeRequest:
+        state = SimpleNamespace(
+            user={"id": "regular-user", "role": "user"},
+            legacy_authenticated=False,
+        )
+
+        async def json(self):
+            return {"item_id": "remote-item", "type": "should_feature"}
+
+    monkeypatch.setattr(
+        feed.remote_db,
+        "app_state_to_remote",
+        lambda: pytest.fail("authorization must run before backend access"),
+    )
+
+    response = asyncio.run(feed.post_feedback(FakeRequest()))
+
+    assert response.status_code == 403
+    assert json.loads(response.body) == {"error": "Admin access required"}
+
+
+def test_admin_should_feature_feedback_keeps_remote_toggle_idempotent(monkeypatch):
+    import routes.feed as feed
+
+    class FakeRequest:
+        state = SimpleNamespace(
+            user={"id": "admin-user", "role": "admin"},
+            legacy_authenticated=False,
+        )
+
+        async def json(self):
+            return {
+                "item_id": "remote-item",
+                "type": "should_feature",
+                "text": "  我想看这条  ",
+            }
+
+    active_values = iter((True, False))
+    reasons = []
+    monkeypatch.setattr(feed.remote_db, "app_state_to_remote", lambda: True)
+    monkeypatch.setattr(feed.remote_db, "app_state_backend", lambda: "supabase")
+    monkeypatch.setattr(
+        feed.remote_db,
+        "get_feedback_item_context_remote",
+        lambda item_id: {
+            "id": item_id,
+            "user_id": None,
+            "platform": "twitter",
+            "title": "T",
+            "author_name": "A",
+            "url": "https://x",
+        },
+    )
+    monkeypatch.setattr(
+        feed.remote_db,
+        "toggle_item_should_feature_remote",
+        lambda **kwargs: reasons.append(kwargs["reason"]) or next(active_values),
+    )
+
+    activated = asyncio.run(feed.post_feedback(FakeRequest()))
+    deactivated = asyncio.run(feed.post_feedback(FakeRequest()))
+
+    assert activated["active"] is True
+    assert deactivated["active"] is False
+    assert reasons == ["我想看这条", "我想看这条"]
+
+
+@pytest.mark.parametrize("text", [None, 123, ["note"], "x" * 501])
+def test_should_feature_feedback_validates_text(monkeypatch, text):
+    import routes.feed as feed
+
+    class FakeRequest:
+        state = SimpleNamespace(
+            user={"id": "admin-user", "role": "admin"},
+            legacy_authenticated=False,
+        )
+
+        async def json(self):
+            return {
+                "item_id": "remote-item",
+                "type": "should_feature",
+                "text": text,
+            }
+
+    monkeypatch.setattr(
+        feed.remote_db,
+        "app_state_to_remote",
+        lambda: pytest.fail("invalid text must be rejected before backend access"),
+    )
+
+    response = asyncio.run(feed.post_feedback(FakeRequest()))
+
+    assert response.status_code == 400
+
+
+def test_remote_should_feature_toggle_deletes_both_feedback_copies(monkeypatch):
+    import remote_db
+
+    class FakeCursor:
+        def fetchone(self):
+            return {"exists": 1}
+
+    class FakeConn:
+        def __init__(self):
+            self.calls = []
+            self.commits = 0
+
+        def execute(self, sql, params=None):
+            self.calls.append((" ".join(sql.split()), params))
+            return FakeCursor()
+
+        def commit(self):
+            self.commits += 1
+
+    fake = FakeConn()
+
+    @contextmanager
+    def fake_connect():
+        yield fake
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+
+    active = remote_db.toggle_item_should_feature_remote(item_id="item-1")
+
+    assert active is False
+    assert fake.commits == 1
+    sql = " ".join(call[0] for call in fake.calls)
+    assert "DELETE FROM remote_poc.feedback" in sql
+    assert "DELETE FROM remote_poc.item_feedback" in sql
+
+
+def test_remote_should_feature_toggle_inserts_both_feedback_copies_with_text(monkeypatch):
+    import remote_db
+
+    class FakeCursor:
+        def fetchone(self):
+            return None
+
+    class FakeConn:
+        def __init__(self):
+            self.calls = []
+            self.commits = 0
+
+        def execute(self, sql, params=None):
+            self.calls.append((" ".join(sql.split()), params))
+            return FakeCursor()
+
+        def commit(self):
+            self.commits += 1
+
+    fake = FakeConn()
+
+    @contextmanager
+    def fake_connect():
+        yield fake
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+
+    active = remote_db.toggle_item_should_feature_remote(
+        item_id="item-1",
+        platform="twitter",
+        title="T",
+        author="A",
+        url="https://x",
+        reason="我想看这条",
+    )
+
+    assert active is True
+    assert fake.commits == 1
+    inserts = [call for call in fake.calls if call[0].startswith("INSERT INTO")]
+    assert len(inserts) == 2
+    assert "INSERT INTO remote_poc.feedback" in inserts[0][0]
+    assert inserts[0][1] == ("item-1", "should_feature", None, "我想看这条")
+    assert "INSERT INTO remote_poc.item_feedback" in inserts[1][0]
+    assert inserts[1][1][5] == "should_feature"
+    assert inserts[1][1][6] == "我想看这条"
+
+
+def test_local_should_feature_feedback_toggles_both_feedback_copies(
+    monkeypatch, tmp_path
+):
+    import routes.feed as feed
+
+    monkeypatch.setattr(feed.remote_db, "app_state_to_remote", lambda: False)
+    monkeypatch.setattr(feed.db, "DB_PATH", str(tmp_path / "feed.db"))
+    monkeypatch.setattr(
+        feed.feedback_store,
+        "FB_DB_PATH",
+        str(tmp_path / "feedback.db"),
+    )
+
+    conn = feed.db.get_conn()
+    conn.execute(
+        """INSERT INTO items (id, platform, source, title, url, fetched_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+        ("local-item", "twitter", "test", "Local", "https://example.com/local"),
+    )
+    conn.commit()
+    conn.close()
+
+    class FakeRequest:
+        state = SimpleNamespace(user=None, legacy_authenticated=True)
+
+        async def json(self):
+            return {
+                "item_id": "local-item",
+                "type": "should_feature",
+                "text": "本地也想看",
+            }
+
+    activated = asyncio.run(feed.post_feedback(FakeRequest()))
+    deactivated = asyncio.run(feed.post_feedback(FakeRequest()))
+
+    assert activated == {"ok": True, "active": True}
+    assert deactivated == {"ok": True, "active": False}
+
+    conn = feed.db.get_conn()
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM feedback WHERE item_id=? AND type='should_feature'",
+        ("local-item",),
+    ).fetchone()["n"] == 0
+    conn.close()
+
+    fb_conn = feed.feedback_store.get_conn()
+    assert feed.feedback_store.get_all_item_feedback(fb_conn) == []
+    fb_conn.close()
+
+
 def test_remote_embedding_writer_updates_pgvector(monkeypatch):
     import remote_db
 
@@ -1525,10 +1903,14 @@ def test_highlights_verdict_filter_requires_included_item_when_enabled(monkeypat
 
     sql = " ".join(remote_db._highlights_verdict_cluster_filter("remote_poc", "c").split())
 
+    # perf-v27 P1: 过滤改读簇级预计算表 highlight_cluster_decisions(PK join,0.02s),
+    # 不再对每簇现场做 cluster_items JOIN items 的 EXISTS(BF-0711-1 事故根因,24-93s)
     assert "EXISTS" in sql
-    assert "remote_poc.cluster_items" in sql
-    assert "remote_poc.items" in sql
-    assert "highlight_include_in_highlights IS TRUE" in sql
+    assert "remote_poc.highlight_cluster_decisions" in sql
+    assert "cluster_verdict IN ('featured', 'positive_borderline')" in sql
+    assert "remote_poc.cluster_items" not in sql
+    assert "remote_poc.items" not in sql
+    assert "highlight_include_in_highlights" not in sql
     assert "last_doc_at" not in sql
 
 
@@ -1543,7 +1925,8 @@ def test_highlights_verdict_filter_recent_days_keeps_older_clusters(monkeypatch)
     assert "COALESCE(c.last_doc_at, c.first_doc_at, c.last_updated_at, now())" in sql
     assert "< now() - (3::int * interval '1 day')" in sql
     assert "OR EXISTS" in sql
-    assert "highlight_include_in_highlights IS TRUE" in sql
+    assert "remote_poc.highlight_cluster_decisions" in sql
+    assert "cluster_verdict IN ('featured', 'positive_borderline')" in sql
 
 
 def test_write_highlight_verdict_remote_updates_item_fields(monkeypatch):
@@ -2610,6 +2993,75 @@ def test_refresh_highlights_read_model_builds_versioned_scopes(monkeypatch):
     assert fake.rollbacks == 0
 
 
+def test_refresh_highlights_read_model_syncs_decisions_before_scope_materialization(monkeypatch):
+    """perf-v27 P1: verdict_filter 改读 highlight_cluster_decisions 后,全量重建里
+    decisions 同步必须先于 scope 物化——否则本轮新打分的簇会被旧决策行漏掉一个周期。"""
+    import remote_db
+    from contextlib import contextmanager
+
+    class FakeCursor:
+        def __init__(self, row=None, rows=None):
+            self.row = row
+            self.rows = [] if rows is None else rows
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeConn:
+        def __init__(self):
+            self.sqls = []
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.sqls.append(normalized)
+            if "SELECT count(*) AS n FROM remote_poc.highlights_scope_items" in normalized:
+                return FakeCursor(row={"n": 6})
+            if "SELECT count(*) AS n FROM remote_poc.highlights_scopes" in normalized:
+                return FakeCursor(row={"n": 3})
+            return FakeCursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    fake = FakeConn()
+
+    @contextmanager
+    def fake_connect():
+        yield fake
+
+    monkeypatch.setenv("INFO2ACTION_HIGHLIGHTS_READ_MODEL", "1")
+    monkeypatch.setenv("INFO2ACTION_HIGHLIGHTS_READ_MODEL_STALE_FALLBACK", "0")
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+    monkeypatch.setattr(remote_db, "clear_feed_cache_keys", lambda: 0)
+
+    result = remote_db.refresh_highlights_read_model(window_days=30, min_github_stars=50)
+    assert result["ok"] is True
+
+    decisions_idx = next(
+        i for i, sql in enumerate(fake.sqls)
+        if "INSERT INTO remote_poc.highlight_cluster_decisions" in sql
+    )
+    scopes_idx = next(
+        i for i, sql in enumerate(fake.sqls)
+        if "INSERT INTO remote_poc.highlights_scopes" in sql
+    )
+    scope_items_idx = next(
+        i for i, sql in enumerate(fake.sqls)
+        if "INSERT INTO remote_poc.highlights_scope_items" in sql
+    )
+    assert decisions_idx < scopes_idx, (
+        f"decisions 同步(#{decisions_idx})必须先于 scopes 物化(#{scopes_idx})"
+    )
+    assert decisions_idx < scope_items_idx
+
+
 def test_refresh_highlights_read_model_skips_unchanged_highlight_cluster_decisions(monkeypatch):
     import remote_db
 
@@ -3638,7 +4090,7 @@ def test_fetch_events_highlights_read_model_cursor_pins_complete_version(monkeyp
             if "FROM remote_poc.highlights_scope_items" in normalized:
                 assert params["version_id"] == old_version
                 assert params["rank_after"] == 20
-                assert "ORDER BY highlights_scope_items.sort_at DESC NULLS LAST" in normalized
+                assert "ORDER BY h.sort_at DESC NULLS LAST" in normalized
                 assert "OFFSET %(rank_after)s" in normalized
                 assert "AND rank > %(rank_after)s" not in normalized
                 return FakeCursor(rows=[
@@ -3927,6 +4379,14 @@ def test_remote_cluster_detail_and_bundle_use_member_cover_fallback(monkeypatch)
                     "merged_into": None,
                     "is_visible_in_feed": True,
                 })
+            if "FROM remote_poc.cluster_status" in normalized:
+                return FakeCursor(row={
+                    "clicked_at": None,
+                    "starred_at": None,
+                    "last_seen_version": 0,
+                    "feedback_kind": "should_feature",
+                    "feedback_note": "需要更多上下文",
+                })
             return FakeCursor(rows=[])
 
     @contextmanager
@@ -3937,13 +4397,132 @@ def test_remote_cluster_detail_and_bundle_use_member_cover_fallback(monkeypatch)
     monkeypatch.setattr(remote_db, "_cache_get_copy", lambda key: None)
     monkeypatch.setattr(remote_db, "_cache_set_copy", lambda key, value: value)
 
-    assert remote_db.cluster_detail(cluster_id=8)["cover_url"] == "/images/events/member-cover.jpg"
-    assert remote_db.cluster_bundle(cluster_id=8)["cluster"]["cover_url"] == "/images/events/member-cover.jpg"
+    detail = remote_db.cluster_detail(cluster_id=8, user_id="user-1")
+    bundle = remote_db.cluster_bundle(cluster_id=8, user_id="user-1")
+    assert detail["cover_url"] == "/images/events/member-cover.jpg"
+    assert bundle["cluster"]["cover_url"] == "/images/events/member-cover.jpg"
+    assert detail["viewer_status"]["feedback_note"] == "需要更多上下文"
+    assert bundle["cluster"]["viewer_status"]["feedback_note"] == "需要更多上下文"
 
     cluster_selects = [sql for sql in calls if "FROM remote_poc.clusters c" in sql]
     assert len(cluster_selects) == 2
     assert all("COALESCE(NULLIF(c.cover_url, ''), detail_cover.cover_url) AS cover_url" in sql for sql in cluster_selects)
     assert all("LEFT JOIN LATERAL" in sql for sql in cluster_selects)
+    status_selects = [sql for sql in calls if "FROM remote_poc.cluster_status" in sql]
+    assert len(status_selects) == 2
+    assert all("feedback_note" in sql for sql in status_selects)
+
+
+def test_remote_cluster_feedback_persists_note(monkeypatch):
+    import remote_db
+
+    statements = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            statements.append((normalized, params or {}))
+            if "SELECT 1 FROM remote_poc.clusters" in normalized:
+                self.row = {"exists": 1}
+            elif "SELECT feedback_kind" in normalized:
+                self.row = {"feedback_kind": None}
+            else:
+                self.row = None
+            return self
+
+        def fetchone(self):
+            return self.row
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            pass
+
+    @contextmanager
+    def fake_connect():
+        yield FakeConn()
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(remote_db, "status_backend", lambda: "supabase_poc")
+
+    result = remote_db.set_cluster_feedback(
+        cluster_id=8,
+        user_id="user-1",
+        kind="should_feature",
+        note="需要更多上下文",
+    )
+
+    insert_sql, insert_params = next(
+        statement for statement in statements
+        if "INSERT INTO remote_poc.cluster_status" in statement[0]
+    )
+    assert "feedback_note" in insert_sql
+    assert "feedback_note = excluded.feedback_note" in insert_sql
+    assert insert_params["note"] == "需要更多上下文"
+    assert result["feedback_note"] == "需要更多上下文"
+
+
+def test_remote_cluster_feedback_revoke_clears_note(monkeypatch):
+    import remote_db
+
+    statements = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            statements.append((normalized, params or {}))
+            if "SELECT 1 FROM remote_poc.clusters" in normalized:
+                self.row = {"exists": 1}
+            elif "SELECT feedback_kind" in normalized:
+                self.row = {"feedback_kind": "should_feature"}
+            else:
+                self.row = None
+            return self
+
+        def fetchone(self):
+            return self.row
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            pass
+
+    @contextmanager
+    def fake_connect():
+        yield FakeConn()
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(remote_db, "status_backend", lambda: "supabase_poc")
+
+    result = remote_db.set_cluster_feedback(
+        cluster_id=8,
+        user_id="user-1",
+        kind="should_feature",
+        note=None,
+    )
+
+    update_sql, _ = next(
+        statement for statement in statements
+        if "UPDATE remote_poc.cluster_status" in statement[0]
+    )
+    assert "feedback_note = NULL" in update_sql
+    assert result["feedback_note"] is None
 
 
 def test_cluster_detail_dispatches_to_remote_backend(monkeypatch):
@@ -4438,7 +5017,7 @@ def test_feed_platforms_dispatches_to_remote_backend(monkeypatch):
 
     assert result["sections"]["reddit"][0]["id"] == "r1"
     assert calls == {
-        "per_platform": 50,
+        "per_platform": 20,
         "search": None,
         "user_id": None,
         "public_only": True,
@@ -4714,16 +5293,6 @@ def test_remote_db_pressure_fails_closed_on_probe_error(monkeypatch):
     assert result["pressure"] is True
     assert result["reasons"] == ["pressure_probe_failed"]
     assert "statement timeout" in result["error"]
-
-
-def test_cache_prewarm_interval_defaults_to_stable_600s(monkeypatch):
-    import app
-
-    monkeypatch.delenv("INFO2ACTION_CACHE_PREWARM_INTERVAL_SEC", raising=False)
-    assert app._cache_prewarm_interval_sec() == 600
-
-    monkeypatch.setenv("INFO2ACTION_CACHE_PREWARM_INTERVAL_SEC", "90")
-    assert app._cache_prewarm_interval_sec() == 90
 
 
 def test_remote_cache_prewarm_skips_all_when_remote_db_pressure(monkeypatch):
@@ -5010,6 +5579,49 @@ def _mk_cluster_row(cluster_id, first_doc_at):
         "cover_url": None,
         "live_version": 1,
     }
+
+
+def test_search_recommend_remote_events_exposes_why_read(monkeypatch):
+    import remote_db
+
+    class FakeCursor:
+        def __init__(self, *, row=None, rows=None):
+            self.row = row
+            self.rows = [] if rows is None else rows
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            if normalized.startswith("SELECT id, platform"):
+                return FakeCursor(rows=[])
+            if normalized.startswith("SELECT count(*) AS n") and "items" in normalized:
+                return FakeCursor(row={"n": 0})
+            if normalized.startswith("SELECT c.id") and "clusters c" in normalized:
+                row = _mk_cluster_row(7, "2026-07-16T00:00:00+00:00")
+                if "c.why_read" in normalized:
+                    row["why_read"] = "搜索结果中的必读理由"
+                return FakeCursor(rows=[row])
+            if normalized.startswith("SELECT count(*) AS n") and "clusters c" in normalized:
+                return FakeCursor(row={"n": 1})
+            return FakeCursor(rows=[])
+
+    @contextmanager
+    def fake_connect():
+        yield FakeConn()
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    monkeypatch.setattr(remote_db, "_fetch_event_source_metadata", lambda *a, **k: {})
+
+    result = remote_db.search_recommend_remote(q="why-read")
+
+    assert "why_read" in result["events"][0]
+    assert result["events"][0]["why_read"] == "搜索结果中的必读理由"
 
 
 def test_context_search_events_query_is_title_first(monkeypatch):

@@ -232,7 +232,12 @@ export function ClusterLeftPanel({ sources }: ClusterLeftPanelProps) {
                 style={{ transition: 'max-height 250ms ease-in-out, opacity 250ms ease-in-out' }}
               >
                 {loading ? (
-                  <div className="text-warm-500">加载中…</div>
+                  // v24.0 §21.6: 裸「加载中…」文本 → 与正文同宽的骨架行
+                  <div className="space-y-2.5" data-testid="cluster-expand-loading" aria-label="加载中">
+                    <div className="h-4 w-11/12 animate-skeleton rounded bg-muted" />
+                    <div className="h-4 w-4/5 animate-skeleton rounded bg-muted" />
+                    <div className="h-4 w-3/5 animate-skeleton rounded bg-muted" />
+                  </div>
                 ) : error ? (
                   <div className="text-warm-500">{error}</div>
                 ) : item ? (
@@ -256,10 +261,10 @@ export function ClusterLeftPanel({ sources }: ClusterLeftPanelProps) {
             type="button"
             aria-label="收起当前展开全文"
             onClick={() => collapseItem(floatingCollapseId)}
-            className="flex items-center gap-1.5 px-5 py-2 text-sm font-medium text-foreground bg-card border border-border hover:border-warm-400 shadow-subtle hover:shadow-medium rounded-full transition-all cursor-pointer"
+            className="flex cursor-pointer items-center gap-1.5 rounded-[4px] border border-border bg-card px-5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:border-[var(--brand-border)] hover:text-foreground"
           >
             收起
-            <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+            <ChevronUp className="w-3.5 h-3.5" />
           </button>
         </div>
       )}

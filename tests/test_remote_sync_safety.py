@@ -456,7 +456,8 @@ def test_remote_fetch_run_item_upsert_skips_noop_conflict_updates():
 def test_info_card_items_upsert_skips_noop_updates():
     import remote_db
 
-    source = inspect.getsource(remote_db.refresh_info_read_model_delta_in_place)
+    # BF-0710-1 起 delta SQL 落在单轮事务函数 _refresh_info_read_model_delta_round
+    source = inspect.getsource(remote_db._refresh_info_read_model_delta_round)
 
     assert "ON CONFLICT (version_id, item_id) DO UPDATE SET" in source
     assert "info_card_items.card_json IS DISTINCT FROM excluded.card_json" in source
@@ -466,7 +467,7 @@ def test_info_card_items_upsert_skips_noop_updates():
 def test_info_scope_items_delta_refresh_does_not_replace_whole_scopes():
     import remote_db
 
-    source = inspect.getsource(remote_db.refresh_info_read_model_delta_in_place)
+    source = inspect.getsource(remote_db._refresh_info_read_model_delta_round)
 
     assert "CREATE TEMP TABLE info_read_model_existing_delta_scope_rows" in source
     assert "delete_obsolete_scope_items" in source

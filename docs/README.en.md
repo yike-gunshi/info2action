@@ -37,6 +37,7 @@ Checking Twitter, WeChat, Reddit, Discord, RSS and YouTube every day means readi
 - **Video understanding** — subtitles first, Doubao ASR fallback, segment-level bilingual captions
 - **Multi-user** — open browsing without login; invite-based registration with email verification unlocks personalization, stars, history and actions
 - **Dual storage** — local SQLite for single-machine use; Supabase Postgres + Storage (pgvector recall, remote read models) for multi-user production
+- **Admin console** — curation-funnel panorama (per-cluster ledger of every item's score, veto reason and display verdict across the ingest→score→cluster→gate→display pipeline, with one-click manual override that feeds a golden replay set) plus per-run fetch reconciliation (ingest / AI-enrich / publish counts, stage timings, per-source drill-down)
 
 ## 🚀 Quick Start
 

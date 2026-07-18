@@ -33,6 +33,8 @@ export interface L1PillBarProps {
   selectedCategory: string | null
   /** 切换 pill 回调, 传 null 表示选中「全部」 */
   onSelect: (category: string | null) => void
+  /** v24 §21.3: 嵌入板块眉同行时覆盖外框样式 */
+  className?: string
 }
 
 export function L1PillBar({
@@ -43,6 +45,7 @@ export function L1PillBar({
   categoryOrder,
   selectedCategory,
   onSelect,
+  className,
 }: L1PillBarProps) {
   // BF-0512-5: 排序按 categoryOrder（推荐页 L1 顺序）；缺省回退到 cnt DESC
   // 用户决策：所有遵守 L1 分类的频道 pill 排序应跟推荐页一致，避免心智跳跃
@@ -94,6 +97,7 @@ export function L1PillBar({
       ]}
       activeKey={selectedCategory}
       onSelect={onSelect}
+      className={className}
       data-testid={`info-section-pill-bar-${platform}`}
     />
   )

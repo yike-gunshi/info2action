@@ -16,10 +16,8 @@ cp config/config.json config/config.json.qa-bak
 python3 - <<'PYEOF'
 import json
 cfg = json.load(open('config/config.json'))
-# Twitter: 30 each feed, 不跑 search 分关键词
-cfg['twitter']['following_count'] = 30
-cfg['twitter']['for_you_count'] = 30
-cfg['twitter']['search']['extra_keywords'] = []
+# X: sources 注册表中的每个账号最多取 30 条
+cfg['twitter']['user_posts_count'] = 30
 # 小红书禁用
 cfg['xiaohongshu']['enabled'] = False
 # Bilibili: 仅 hot 30，关 UP / rank / search
@@ -46,9 +44,8 @@ trap 'echo "[trap] restoring config"; cp config/config.json.qa-bak config/config
 mkdir -p data/sources/twitter data/sources/bilibili data/sources/lingowhale
 
 echo ""
-echo "=== Twitter ==="
-twitter feed -t following -n 30 --json -o data/sources/twitter/1-following-feed.json 2>&1 | tail -3 || echo "  twitter following FAILED"
-twitter feed -t for-you   -n 30 --json -o data/sources/twitter/2-for-you-feed.json   2>&1 | tail -3 || echo "  twitter for-you FAILED"
+echo "=== X（sources 注册表全量账号） ==="
+python3 src/fetch_x_users.py 2>&1 | tail -10 || echo "  X registry fetch FAILED"
 
 echo ""
 echo "=== Bilibili (hot 30) ==="

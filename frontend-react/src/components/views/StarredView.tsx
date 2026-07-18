@@ -2,7 +2,6 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { Bookmark } from 'lucide-react'
 import { fetchLibrary } from '../../lib/api'
 import { InfoCard } from '../feed/InfoCard'
-import { Masonry } from '../feed/Masonry'
 import { useDetailStore } from '../../store/detailStore'
 import { useClusterDetailStore } from '../../store/clusterDetailStore'
 import type { LibraryEntry } from '../../lib/types'
@@ -121,9 +120,13 @@ export function StarredView() {
     return (
       <div className="px-4 py-4">
         {header}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {/* v24 §21.7: 骨架跟随行骨架（不再是三列卡片块） */}
+        <div className="flex flex-col divide-y divide-border/60">
           {Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="h-48 rounded-[4px] bg-muted animate-skeleton" />
+            <div key={i} className="py-3.5">
+              <div className="h-5 w-3/5 rounded-[4px] bg-muted animate-skeleton" />
+              <div className="mt-2 h-4 w-4/5 rounded-[4px] bg-muted animate-skeleton" />
+            </div>
           ))}
         </div>
       </div>
@@ -172,29 +175,34 @@ export function StarredView() {
         onSelect={setPlatformFilter}
       />
 
+      {/* v24.1: InfoCard 回白卡（跟随信息页回滚）——卡片加 py-3 呼吸位；
+          事件条目保持 §21.2 标准条行样式，行间 hairline 由列表容器分隔 */}
       {groups.map((group) => (
         <div key={group.label} className="mb-6">
           <LibraryDateSectionHeader label={group.label} count={group.items.length} />
-          <Masonry
-            items={group.items}
-            renderItem={(item, i) => (
+          <div className="flex flex-col divide-y divide-border/60">
+            {group.items.map((item, i) => (
               item.type === 'item'
-                ? <InfoCard item={item.item} delay={Math.min(i, 19) * 30} showReadState={false} />
-                : <EventLibraryCard entry={item} delay={Math.min(i, 19) * 30} />
-            )}
-          />
+                ? (
+                  <div key={item.id} className="py-3">
+                    <InfoCard item={item.item} delay={Math.min(i, 19) * 30} showReadState={false} />
+                  </div>
+                )
+                : <EventLibraryCard key={item.id} entry={item} delay={Math.min(i, 19) * 30} />
+            ))}
+          </div>
         </div>
       ))}
 
-      {/* Load more button */}
+      {/* Load more button — v24 §21.6: hairline 边框，去阴影胶囊 */}
       {hasMore && (
         <div className="flex justify-center mt-6">
           <button
             onClick={loadMore}
-            className="flex items-center gap-1.5 px-5 py-2 text-sm font-medium text-foreground bg-card border border-border hover:border-warm-400 shadow-subtle hover:shadow-medium rounded-full transition-all cursor-pointer"
+            className="flex cursor-pointer items-center gap-1.5 rounded-[4px] border border-border bg-card px-5 py-2 text-sm font-medium text-muted-foreground transition-colors hover:border-[var(--brand-border)] hover:text-foreground"
           >
             加载更多
-            <span className="text-xs text-muted-foreground">已加载 {items.length} / {total}</span>
+            <span className="font-mono text-xs">已加载 {items.length} / {total}</span>
           </button>
         </div>
       )}

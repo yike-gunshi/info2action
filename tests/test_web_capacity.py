@@ -93,7 +93,9 @@ def test_threadpool_tokens_parse(monkeypatch):
 
 def test_limiter_default_limits(monkeypatch):
     monkeypatch.delenv('RATELIMIT_DEFAULT', raising=False)
-    assert app_mod._limiter_default_limits() == ['100/minute']
+    # 稳定性加固(2026-07-10): 注册 SlowAPIMiddleware 后 default_limits 才真正生效;
+    # 默认从 100/min 放宽到 600/min 作为"防洪水"底线,避免运营商级 NAT 误伤真实用户。
+    assert app_mod._limiter_default_limits() == ['600/minute']
     monkeypatch.setenv('RATELIMIT_DEFAULT', '200/minute')
     assert app_mod._limiter_default_limits() == ['200/minute']
 

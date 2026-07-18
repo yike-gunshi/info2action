@@ -324,22 +324,18 @@ def _expand_x_article(tweet_id):
 
 
 def ingest_twitter(conn, *, timeline_only=False):
-    """Ingest all Twitter JSON files."""
-    mapping = {
-        '1-following-feed.json': 'following',
-        '2-for-you-feed.json': 'for_you',
-    }
-    if not timeline_only:
-        mapping.update({
-            '4-bookmarks.json': 'bookmarks',
-        })
-        # v16.0: keyword search is retired. Keep historical search files on disk,
-        # but do not ingest them into new fetch runs.
-        for path in sorted(glob.glob(source_path('twitter', 'x-user-*.json'))):
-            fname = os.path.basename(path)
-            handle = fname[len('x-user-'):-len('.json')]
-            if handle:
-                mapping[fname] = f'user:{handle}'
+    """Ingest X files produced from the sources registry."""
+    source_index = _source_index_for(conn)
+    if source_index is None:
+        print("  ⚠️  X registry unavailable; skip X ingest")
+        return 0
+    registered_handles = set(source_index.get('x_by_handle') or {})
+    mapping = {}
+    for path in sorted(glob.glob(source_path('twitter', 'x-user-*.json'))):
+        fname = os.path.basename(path)
+        handle = fname[len('x-user-'):-len('.json')]
+        if handle in registered_handles:
+            mapping[fname] = f'user:{handle}'
     total = 0
     video_tasks: list[tuple[str, str]] = []  # v12.3 N4: (tid, mp4_url) for inline ffmpeg poster
     for fname, source in mapping.items():
@@ -2032,7 +2028,7 @@ def main():
     parser.add_argument(
         '--only-twitter-timeline',
         action='store_true',
-        help='only ingest Twitter following and for-you files; skip searches/bookmarks and all other platforms',
+        help='only ingest X registry user files; skip all other platforms',
     )
     parser.add_argument(
         '--skip-link-enrichment',

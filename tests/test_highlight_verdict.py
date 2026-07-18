@@ -108,10 +108,89 @@ def test_invalid_ai_relevance_is_dropped_from_diagnostic_field():
     assert result["highlight_ai_relevant"] is None
 
 
+def test_veto_marketing_forces_drop_even_if_llm_said_featured():
+    result = highlight_verdict.normalize_verdict_result(
+        _raw(veto="marketing", reason="产品新版本发布，功能强大")
+    )
+
+    assert result["highlight_verdict"] == "drop"
+    assert result["cluster_verdict"] == "drop"
+    assert result["highlight_include_in_highlights"] is False
+    assert result["highlight_veto"] == "marketing"
+    assert result["highlight_scores"]["veto"] == "marketing"
+
+
+def test_veto_flamewar_forces_drop_on_borderline():
+    result = highlight_verdict.normalize_verdict_result(
+        _raw(
+            verdict="borderline",
+            value_path="substantive",
+            uncertainty="thin_detail",
+            veto="flamewar",
+        )
+    )
+
+    assert result["cluster_verdict"] == "drop"
+    assert result["highlight_include_in_highlights"] is False
+    assert result["highlight_veto"] == "flamewar"
+
+
+def test_veto_none_keeps_original_verdict():
+    result = highlight_verdict.normalize_verdict_result(_raw(veto="none"))
+
+    assert result["cluster_verdict"] == "featured"
+    assert result["highlight_include_in_highlights"] is True
+    assert result["highlight_veto"] == "none"
+    assert result["highlight_scores"]["veto"] == "none"
+
+
+def test_missing_veto_field_is_backward_compatible():
+    result = highlight_verdict.normalize_verdict_result(_raw())
+
+    assert result["cluster_verdict"] == "featured"
+    assert result["highlight_include_in_highlights"] is True
+    assert result["highlight_veto"] is None
+    assert "veto" not in result["highlight_scores"]
+
+
+def test_invalid_veto_value_treated_as_absent():
+    result = highlight_verdict.normalize_verdict_result(_raw(veto="totally_bogus"))
+
+    assert result["cluster_verdict"] == "featured"
+    assert result["highlight_include_in_highlights"] is True
+    assert result["highlight_veto"] is None
+    assert "veto" not in result["highlight_scores"]
+
+
+def test_pending_result_carries_veto_key():
+    result = highlight_verdict.normalize_verdict_result("not json at all {{{")
+
+    assert result["cluster_verdict"] == "pending"
+    assert result["highlight_veto"] is None
+
+
+def test_prompt_v3_8_has_veto_dimension():
+    prompt = highlight_verdict.load_system_prompt()
+
+    assert highlight_verdict.PROMPT_VERSION == "item_verdict_v3_8_veto_dimension_2026_07_10"
+    assert "veto" in prompt
+    assert "marketing" in prompt
+    assert "rumor_unverified" in prompt
+    assert "flamewar" in prompt
+    assert "engagement_bait" in prompt
+    assert highlight_verdict.VALID_VETOES == {
+        "none",
+        "marketing",
+        "rumor_unverified",
+        "flamewar",
+        "engagement_bait",
+    }
+
+
 def test_prompt_keeps_v3_7_ai_audience_scope_anchors():
     prompt = highlight_verdict.load_system_prompt()
 
-    assert highlight_verdict.PROMPT_VERSION == "item_verdict_v3_7_2_ai_toolchain_scope_2026_06_17"
+    assert "item_verdict_v3_8" in highlight_verdict.PROMPT_VERSION
     assert "AI 投资" in prompt
     assert "AI 相关 = AI 受众相关" in prompt
     assert "GitHub/repo/开源教程" in prompt

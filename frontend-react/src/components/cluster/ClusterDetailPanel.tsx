@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { CSSProperties, MouseEvent } from 'react'
-import { Bookmark, ChevronLeft, ChevronRight, ExternalLink, Share2, X } from 'lucide-react'
+import { Bookmark, ChevronLeft, ChevronRight, ExternalLink, EyeOff, Share2, ThumbsDown, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useClusterDetailStore } from '../../store/clusterDetailStore'
 import type { ClusterDetail, ClusterSource } from '../../lib/types'
-import { cn, eventPlatformName, platformClass, stripMd } from '../../lib/utils'
+import { cn, eventPlatformName, platformClass, safeExternalUrl, stripMd } from '../../lib/utils'
 import { parseClusterBreakdownSections, parseClusterSummary } from '../../lib/cluster-summary-parser'
 import { renderMarkdownInline, renderMarkdownLite } from '../../lib/markdown-lite'
 import { proxiedImageUrl } from '../../lib/media'
@@ -126,16 +126,6 @@ function eventMetaDateTime(value?: string | null): string | null {
     minute: '2-digit',
     hour12: false,
   }).format(date).replace(/\//g, '-')
-}
-
-function safeExternalUrl(value?: string | null): string | null {
-  if (!value) return null
-  try {
-    const url = new URL(value)
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
-  } catch {
-    return null
-  }
 }
 
 function paragraphLines(text: string): string[] {
@@ -453,10 +443,12 @@ export function ClusterDetailPanel() {
   const error = useClusterDetailStore((s) => s.error)
   const closeModal = useClusterDetailStore((s) => s.closeModal)
   const toggleClusterStar = useClusterDetailStore((s) => s.toggleClusterStar)
+  const submitClusterFeedback = useClusterDetailStore((s) => s.submitClusterFeedback)
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
   const [lightboxImages, setLightboxImages] = useState<string[]>([])
   const [failedMediaUrls, setFailedMediaUrls] = useState<string[]>([])
   const [starPending, setStarPending] = useState(false)
+  const [feedbackPending, setFeedbackPending] = useState(false)
   const [isClosing, setIsClosing] = useState(false)
 
   // D8: 关闭走 180ms 出场动画再真正卸载,对齐信息弹窗 DetailPanel(此前事件弹窗直接消失)。
@@ -558,6 +550,22 @@ export function ClusterDetailPanel() {
     }
   }, [cluster])
 
+  // v25.0 F-D(DESIGN.md 22.3): 质量反馈——同 kind 再点=撤销,失败回滚+toast,未登录走 requireAuth
+  const handleFeedback = useCallback(async (kind: 'irrelevant' | 'low_quality') => {
+    if (!cluster || feedbackPending) return
+    if (!requireAuth('反馈', { onLoginClick: handleClose })) return
+    const wasActive = cluster.viewer_status?.feedback_kind === kind
+    setFeedbackPending(true)
+    try {
+      await submitClusterFeedback(cluster.id, kind)
+      toast.success(wasActive ? '已撤销反馈' : '已收到反馈')
+    } catch {
+      toast.error('反馈失败，请重试')
+    } finally {
+      setFeedbackPending(false)
+    }
+  }, [cluster, feedbackPending, handleClose, submitClusterFeedback])
+
   if (modalState === 'closed') return null
 
   const markMediaFailed = (url: string) => {
@@ -584,6 +592,7 @@ export function ClusterDetailPanel() {
   const metaTime = eventMetaDateTime(cluster?.first_doc_at)
   const metaSourceCount = cluster?.unique_source_count ?? sources.length
   const isStarred = !!cluster?.viewer_status?.starred_at
+  const feedbackKind = cluster?.viewer_status?.feedback_kind ?? null
   const bottomActionClass = 'flex h-12 w-full items-center justify-center gap-1.5 text-[13px] font-medium text-[var(--modal-text-muted)] transition-colors hover:bg-[var(--modal-hover)] hover:text-[var(--modal-text)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-inset disabled:cursor-not-allowed disabled:opacity-60'
   const lightboxIndex = lightboxSrc ? lightboxImages.indexOf(lightboxSrc) : -1
   const hasLightboxNavigation = lightboxImages.length > 1 && lightboxIndex >= 0
@@ -610,9 +619,16 @@ export function ClusterDetailPanel() {
         style={paperSurfaceStyle}
         onClick={(e) => e.stopPropagation()}
       >
+        {/* v24.0 §21.6: 裸「加载中…」文本 → modal-token 骨架(对齐 ActionModalLoading 样板) */}
         {modalState === 'loading' && (
-          <div className="flex min-h-[220px] items-center justify-center p-6">
-            <div className="text-sm text-muted-foreground">加载中…</div>
+          <div className="min-h-[220px] px-4 py-5 sm:px-10" data-testid="cluster-modal-loading" aria-label="加载中">
+            <div className="h-6 w-3/4 animate-skeleton rounded bg-[var(--modal-hover)]" />
+            <div className="mt-3 h-4 w-1/2 animate-skeleton rounded bg-[var(--modal-hover)]" />
+            <div className="mt-6 space-y-3">
+              <div className="h-4 w-full animate-skeleton rounded bg-[var(--modal-hover)]" />
+              <div className="h-4 w-11/12 animate-skeleton rounded bg-[var(--modal-hover)]" />
+              <div className="h-4 w-4/5 animate-skeleton rounded bg-[var(--modal-hover)]" />
+            </div>
           </div>
         )}
 
@@ -700,7 +716,9 @@ export function ClusterDetailPanel() {
               </div>
             </header>
 
-            <div className="flex-1 overflow-y-auto px-4 pb-7 pt-0 sm:px-10 sm:pb-8">
+            {/* bf-0711 #2: overscroll-contain 阻断滚动链——弹窗滚到边界时不再把滚轮/触摸
+                滚动传导到背景精选页(配合 LatestEvents 弹窗打开时禁用下拉刷新监听)。 */}
+            <div className="flex-1 overflow-y-auto overscroll-contain px-4 pb-7 pt-0 sm:px-10 sm:pb-8">
               <ClusterMediaBlock
                 urls={mediaUrls}
                 onOpen={openLightbox}
@@ -730,6 +748,44 @@ export function ClusterDetailPanel() {
               >
                 <ClusterActionZone clusterId={cluster.id} showExistingActions />
               </section>
+
+              {/* v25.0 F-D → bf-0711 #1: 质量反馈从底部主操作栏下沉到正文底部轻量文字链接,
+                  事件级语义不变(同 kind 再点=撤销)。不与 收藏/跳转/分享 主操作并列。 */}
+              <div
+                data-testid="cluster-feedback-inline"
+                className="mt-5 flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1 border-t border-[var(--modal-divider)] pt-4 text-[12px] text-[var(--modal-text-faint)]"
+              >
+                <span>这条对你没用？</span>
+                <button
+                  type="button"
+                  onClick={() => handleFeedback('irrelevant')}
+                  disabled={feedbackPending}
+                  aria-pressed={feedbackKind === 'irrelevant'}
+                  data-testid="cluster-feedback-irrelevant"
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded-[4px] px-1.5 py-0.5 transition-colors hover:text-[var(--modal-text)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] disabled:cursor-not-allowed disabled:opacity-60',
+                    feedbackKind === 'irrelevant' && 'text-[var(--brand)]',
+                  )}
+                >
+                  <EyeOff className="h-3 w-3" />
+                  {feedbackKind === 'irrelevant' ? '✓ 不感兴趣' : '不感兴趣'}
+                </button>
+                <span className="text-[var(--modal-text-subtle)]" aria-hidden="true">·</span>
+                <button
+                  type="button"
+                  onClick={() => handleFeedback('low_quality')}
+                  disabled={feedbackPending}
+                  aria-pressed={feedbackKind === 'low_quality'}
+                  data-testid="cluster-feedback-low-quality"
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded-[4px] px-1.5 py-0.5 transition-colors hover:text-[var(--modal-text)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] disabled:cursor-not-allowed disabled:opacity-60',
+                    feedbackKind === 'low_quality' && 'text-[var(--brand)]',
+                  )}
+                >
+                  <ThumbsDown className="h-3 w-3" />
+                  {feedbackKind === 'low_quality' ? '✓ 质量差' : '质量差'}
+                </button>
+              </div>
             </div>
 
             <div

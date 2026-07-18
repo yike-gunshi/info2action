@@ -28,6 +28,7 @@ sys.path.insert(0, str(BASE))
 
 import db  # noqa: E402
 import ingest  # noqa: E402
+import fetch_x_users  # noqa: E402
 import ai_provider_guard  # noqa: E402
 from clustering import visibility_policy  # noqa: E402
 from env_utils import load_project_env  # noqa: E402
@@ -406,66 +407,24 @@ def _twitter_row(
 def fetch_twitter(ctx: BackfillContext) -> None:
     stats = SourceStats()
     rows: list[dict[str, Any]] = []
-    since = _since_date(ctx.since)
-    until = _twitter_until_date(ctx.until)
     max_tweets = int(ctx.args.twitter_max)
 
-    search_types = ["latest", "top"]
-    for query in _search_queries(ctx, "twitter"):
-        for search_type in search_types:
-            cmd = [
-                "twitter",
-                "search",
-                query,
-                "-t",
-                search_type,
-                "--since",
-                since,
-                "--until",
-                until,
-                "-n",
-                str(max_tweets),
-                "--json",
-            ]
-            payload, err = _run_json_command(cmd, timeout=ctx.args.twitter_timeout)
-            if err:
-                stats.errors.append(f"search:{query}:{search_type}: {err}")
-                continue
-            for item in _items_from_payload(payload):
-                row = _twitter_row(
-                    item,
-                    f"search:{query}:{search_type}",
-                    expand_articles=ctx.args.expand_x_articles,
-                )
-                if row:
-                    rows.append(row)
-            time.sleep(ctx.args.twitter_delay)
-
-    for feed_type in ("following", "for-you"):
-        cmd = ["twitter", "feed", "-t", feed_type, "-n", str(ctx.args.feed_max), "--json"]
+    for source in fetch_x_users._active_x_sources(ctx.conn):
+        handle = source["source_key"]
+        cmd = ["twitter", "user-posts", handle, "-n", str(max_tweets), "--json"]
         payload, err = _run_json_command(cmd, timeout=ctx.args.twitter_timeout)
         if err:
-            stats.errors.append(f"feed:{feed_type}: {err}")
+            stats.errors.append(f"user:{handle}: {err}")
             continue
         for item in _items_from_payload(payload):
             row = _twitter_row(
                 item,
-                feed_type.replace("-", "_"),
+                f"user:{handle}",
                 expand_articles=ctx.args.expand_x_articles,
             )
             if row:
                 rows.append(row)
-    payload, err = _run_json_command(
-        ["twitter", "bookmarks", "-n", str(ctx.args.feed_max), "--json"],
-        timeout=ctx.args.twitter_timeout,
-    )
-    if err:
-        stats.notes.append(f"bookmarks unavailable: {err}")
-    else:
-        for item in _items_from_payload(payload):
-            row = _twitter_row(item, "bookmarks", expand_articles=ctx.args.expand_x_articles)
-            if row:
-                rows.append(row)
+        time.sleep(ctx.args.twitter_delay)
 
     _upsert_source_rows(ctx, "twitter", rows, stats)
 

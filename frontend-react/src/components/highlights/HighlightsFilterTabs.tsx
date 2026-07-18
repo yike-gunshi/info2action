@@ -35,7 +35,7 @@ export function HighlightsFilterTabs() {
       className="sticky top-[var(--highlights-l2-top)] z-50 min-w-0 overflow-x-auto bg-background scrollbar-hide"
       data-testid="highlights-filter-tabs"
     >
-      <div className="mx-auto flex h-10 w-full min-w-0 items-center justify-start gap-6 border-b border-border/70 sm:justify-center sm:gap-8" data-testid="highlights-filter-tabs-inner">
+      <div className="mx-auto flex h-10 w-full min-w-0 items-center justify-start gap-6 border-b border-border/70 sm:gap-8" data-testid="highlights-filter-tabs-inner">
         <button
           type="button"
           role="tab"

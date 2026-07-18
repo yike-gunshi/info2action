@@ -73,12 +73,13 @@ describe('ItemLeftPanel', () => {
     )
 
     expect(screen.queryByRole('heading', { level: 1 })).not.toBeInTheDocument()
+    // v24.0 §21.5-①: 墨色走 modal-text 语义 token(亮色等值原硬编码,暗色自动切米白墨)
     expect(screen.getByTestId('item-left-body-text')).toHaveClass(
       'font-event-title',
       'text-[16px]',
       'leading-[1.82]',
       'tracking-[0]',
-      'text-[#3F3A34]',
+      'text-[var(--modal-text-soft)]',
     )
   })
 

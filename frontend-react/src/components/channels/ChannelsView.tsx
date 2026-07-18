@@ -1,10 +1,8 @@
-import { useState, useMemo, useRef, useEffect, useLayoutEffect } from 'react'
-import { ChevronDown, ChevronUp } from 'lucide-react'
+import { useState, useMemo, useRef, useEffect } from 'react'
 import { cn, platformName } from '../../lib/utils'
 import { usePlatformSections, useFeedStore } from '../../store/feedStore'
 import { useUIStore } from '../../store/uiStore'
-import { InfoCard } from '../feed/InfoCard'
-import { Masonry } from '../feed/Masonry'
+import { SectionFront } from '../feed/SectionFront'
 import { L1PillBar } from './L1PillBar'
 import { InfoSectionPillBar, scrollInfoSectionToTop } from '../shared/InfoSectionPillBar'
 import { fetchFeedPlatformMore, fetchLingowhaleGroups } from '../../lib/api'
@@ -128,16 +126,17 @@ function formatSourceName(source: string, platform: string): string {
 }
 
 function ChannelsSkeleton({ embedded = false }: { embedded?: boolean }) {
+  // v24.1: 骨架回瀑布流卡片同形（三列卡片块）
   return (
-    <div className={cn(embedded ? 'py-0' : 'max-w-[1200px] mx-auto px-4 py-4')} data-testid="channels-skeleton">
+    <div className={cn(embedded ? 'py-0' : 'max-w-[1168px] mx-auto px-4 py-4')} data-testid="channels-skeleton">
       <div className="mb-4 space-y-2">
         {[1, 2, 3].map((i) => (
           <div key={i} className="h-6 bg-muted rounded animate-skeleton" style={{ width: `${68 + i * 9}%` }} />
         ))}
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {Array.from({ length: 9 }).map((_, i) => (
-          <div key={i} className="h-48 bg-muted rounded-lg animate-skeleton" />
+          <div key={i} className="h-48 animate-skeleton rounded-[4px] bg-muted" />
         ))}
       </div>
     </div>
@@ -146,7 +145,7 @@ function ChannelsSkeleton({ embedded = false }: { embedded?: boolean }) {
 
 function ChannelsEmptyState({ embedded = false, message }: { embedded?: boolean; message: string }) {
   return (
-    <div className={cn(embedded ? 'py-12' : 'max-w-[1200px] mx-auto px-4 py-12', 'text-center')}>
+    <div className={cn(embedded ? 'py-12' : 'max-w-[1168px] mx-auto px-4 py-12', 'text-center')}>
       <p className="text-sm text-muted-foreground">{message}</p>
     </div>
   )
@@ -216,7 +215,7 @@ export function ChannelsView({ embedded = false }: { embedded?: boolean } = {}) 
   }
 
   return (
-    <div className={cn(embedded ? 'py-0' : 'max-w-[1200px] mx-auto px-4 py-4')}>
+    <div className={cn(embedded ? 'py-0' : 'max-w-[1168px] mx-auto px-4 py-4')}>
       {sorted.map((section) => (
         <PlatformSection
           key={section.key}
@@ -227,8 +226,6 @@ export function ChannelsView({ embedded = false }: { embedded?: boolean } = {}) 
     </div>
   )
 }
-
-const COLLAPSED_MAX = 800
 
 function PlatformSection({ section, showHeader = true }: { section: FeedSectionType; showHeader?: boolean }) {
   const platform = section.key
@@ -245,6 +242,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   const expandedKey = useUIStore((s) => s.expandedKey)
   const setExpandedKey = useUIStore((s) => s.setExpandedKey)
   const [sourceFilter, setSourceFilter] = useState<string | null>(null)
+  // v24.1: 展开态可见条数上限（折叠恒 BATCH，瀑布流机制回滚）
   const [showCount, setShowCount] = useState(BATCH)
   // BF-0418-9 结构性修复：pill 切换走服务端拉该 source 的数据
   // 避免"某 source 数据被 fetched_at 更新的其他 source 挤出前 50 条客户端 filter 找不到"
@@ -370,54 +368,11 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   const sectionKey = `ch-${platform}`
   const isExpanded = expandedKey === sectionKey
 
-  // Refs for measurement + collapse button
-  const sectionRef = useRef<HTMLDivElement>(null)
-  const masonryInnerRef = useRef<HTMLDivElement>(null)
-  const [shortestColHeight, setShortestColHeight] = useState<number | null>(null)
-  const [sectionVisible, setSectionVisible] = useState(false)
+  // SectionFront 进入视口（IO 懒渲染激活）后才允许后台预取
   const [hasEnteredViewport, setHasEnteredViewport] = useState(false)
 
-  useEffect(() => {
-    const el = sectionRef.current
-    if (!el || hasEnteredViewport) return
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) {
-          setHasEnteredViewport(true)
-          observer.disconnect()
-        }
-      },
-      { rootMargin: '400px 0px' },
-    )
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [hasEnteredViewport])
-
-  // Measure shortest column height — this becomes the clip line
-  useLayoutEffect(() => {
-    if (!masonryInnerRef.current) return
-    const container = masonryInnerRef.current.querySelector('[data-testid="masonry-columns"]')
-    if (!container || container.children.length === 0) return
-    const colHeights = Array.from(container.children).map((c) => (c as HTMLElement).offsetHeight)
-    const shortest = Math.min(...colHeights)
-    setShortestColHeight(shortest)
-  })
-
-  // Show collapse button only when scrolling through expanded cards,
-  // hide when reaching "展开更多" area or scrolling past the section
-  useEffect(() => {
-    if (!isExpanded || !masonryInnerRef.current) {
-      setSectionVisible(false)
-      return
-    }
-    const check = () => {
-      const rect = masonryInnerRef.current!.getBoundingClientRect()
-      setSectionVisible(rect.top < window.innerHeight && rect.bottom > window.innerHeight)
-    }
-    check()
-    window.addEventListener('scroll', check, { passive: true })
-    return () => window.removeEventListener('scroll', check)
-  }, [isExpanded])
+  /** BF-0512-7 滚动补偿要读 section 顶部位置（SectionFront 拥有 DOM 根）。 */
+  const sectionTop = () => document.getElementById(`s-${platform}`)?.getBoundingClientRect().top ?? 0
 
   // Source counts from server (full distribution, not just loaded 50)
   const sources = useMemo(() => {
@@ -490,7 +445,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     }
     // BF-0512-7 rev3: 切 pill 防页面跳动 — 记录 section 顶部在视口位置，
     // 数据更新后用 scrollBy 补回差值（masonry 高度变化导致后续 section 位移）
-    const beforeTop = sectionRef.current?.getBoundingClientRect().top ?? 0
+    const beforeTop = sectionTop()
 
     const cached = readCachedFilterPage(undefined, undefined, selectedCategory)
     if (cached) {
@@ -499,7 +454,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       setCategoryCursor(cached.nextCursor ?? null)
       setCategoryLoading(false)
       requestAnimationFrame(() => requestAnimationFrame(() => {
-        const afterTop = sectionRef.current?.getBoundingClientRect().top ?? 0
+        const afterTop = sectionTop()
         const diff = afterTop - beforeTop
         if (Math.abs(diff) > 1) {
           window.scrollBy({ top: diff, behavior: 'instant' as ScrollBehavior })
@@ -518,10 +473,10 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
         setCategoryItems(r.items)
         setCategoryTotal(r.total ?? r.items.length)
         setCategoryCursor(r.next_cursor ?? null)
-        // 双 rAF 等 React render + Masonry layout 完成后修正 scroll
+        // 双 rAF 等 React render + SectionFront 版面完成后修正 scroll
         requestAnimationFrame(() => requestAnimationFrame(() => {
           if (cancelled) return
-          const afterTop = sectionRef.current?.getBoundingClientRect().top ?? 0
+          const afterTop = sectionTop()
           const diff = afterTop - beforeTop
           if (Math.abs(diff) > 1) {
             window.scrollBy({ top: diff, behavior: 'instant' as ScrollBehavior })
@@ -564,8 +519,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   }, [items, sourceFilter, sourceItems, groupFilter, groupItems, isL1Dimension, selectedCategory, categoryItems, platform])
 
   const limit = isExpanded ? showCount : BATCH
-  // FE-1(B7): 已读态改由 InfoCard 逐卡订阅 clickedAtById[id],section 级
-  // memo 不再依赖整个 clickedAtById——点一张卡只重渲染那张卡。
+  // FE-1(B7) 语义保留：已读态由 InfoCard 逐卡订阅，section 级 memo 不依赖 clickedAtById。
   const visibleItems = useMemo(
     () => filteredItems.slice(0, limit),
     [filteredItems, limit],
@@ -584,16 +538,6 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   const remaining = Math.max(effectiveTotal - visibleItems.length, 0)
   const isFilterLoading = (sourceFilter && sourceLoading) || (groupFilter && groupLoading)
 
-  // Clip height: when hasMore, cut at shortest column so ALL columns have content past the line
-  const clipMaxHeight = hasMore && shortestColHeight != null && shortestColHeight > 100
-    ? (isExpanded
-      ? shortestColHeight - 40
-      : Math.min(shortestColHeight - 40, COLLAPSED_MAX))
-    : hasMore
-      ? COLLAPSED_MAX
-      : undefined
-
-  const prevVisibleCountRef = useRef(0)
   const loadingMoreRef = useRef(false)
   const loadMoreRequestSeqRef = useRef(0)
   const prefetchedRef = useRef<{ scopeKey: string; offset: number; page: PlatformPage } | null>(null)
@@ -619,10 +563,6 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     prefetchRef.current = null
     setPlatformCursor(null)
   }, [loadMoreScopeKey])
-
-  useEffect(() => {
-    prevVisibleCountRef.current = visibleItems.length
-  }, [visibleItems.length])
 
   useEffect(() => {
     if (!hasEnteredViewport) return
@@ -857,145 +797,83 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       }))
   })()
 
+  // 板块眉同行右侧 L2（「按来源」视角：platform 当分类，复用同一 SectionFront）
+  // BF-0419-10/BF-0512-3: 公众号订阅分组 pills 兼容路径保留（当前 PLATFORM_ORDER
+  // 下 lingowhale 走 L1 维度，此分支不可达，仅为 pre-v18.2 配置兜底）
+  const pillBar = (platform === 'lingowhale' && !isL1Dimension && lwGroups !== null) ? (
+    <InfoSectionPillBar
+      sectionKey={platform}
+      items={[
+        { key: null, label: '全部' },
+        ...lwGroups.map((g) => ({
+          key: g.name,
+          label: g.name,
+          title: `${g.channels.length} 个频道,${g.item_count} 篇内容（hover tooltip 见 cnt；BF-0512-7 跟推荐页一致 pill 纯文本）`,
+        })),
+      ]}
+      activeKey={groupFilter}
+      onSelect={handleGroupSelect}
+      nestedRows={selectedLingowhaleChannels.length > 0 ? [{
+        prefix: `↳ ${groupFilter}:`,
+        items: selectedLingowhaleChannels,
+        activeKey: sourceFilter,
+        onSelect: handleLingowhaleChannelSelect,
+        ariaLabel: `${groupFilter} 频道筛选`,
+      }] : undefined}
+      className="mb-0 w-auto max-w-full border-b-0"
+      data-testid="info-section-pill-bar-lingowhale"
+    />
+  ) : isL1Dimension ? (
+    /* v18.2: L1 维度 pill (所有可见来源 section)，「全部」首位由 L1PillBar 内部实现 */
+    <L1PillBar
+      platform={platform}
+      categoryCounts={platformCategoryCounts}
+      categoryLabels={categoryLabels}
+      categoryOrder={categoryOrder}
+      selectedCategory={selectedCategory}
+      onSelect={handleCategorySelect}
+      className="mb-0 w-auto max-w-full border-b-0"
+    />
+  ) : (sources.size > 1 && platform !== 'lingowhale') ? (
+    /* Source pills 仅作兼容兜底；当前 PLATFORM_ORDER 内来源均使用 L1 pill。 */
+    <InfoSectionPillBar
+      sectionKey={platform}
+      items={[
+        { key: null, label: '全部' },
+        ...Array.from(sources.entries()).map(([source]) => ({
+          key: source,
+          label: formatSourceName(source, platform),
+        })),
+      ]}
+      activeKey={sourceFilter}
+      onSelect={handleSourceSelect}
+      className="mb-0 w-auto max-w-full border-b-0"
+      data-testid={`info-section-pill-bar-${platform}`}
+    />
+  ) : undefined
+
   return (
-    <div ref={sectionRef} id={`s-${platform}`} className="mb-8" style={{ scrollMarginTop: '120px' }}>
-      {/* Header */}
-      {showHeader && (
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-[22px] font-bold text-foreground">
-            {platformName(platform)}
-            {/* BF-0512-7: 切 pill 后数字联动（用 effectiveTotal），跟推荐页 FeedSection.tsx:235 一致 */}
-            <span className="text-sm font-normal text-muted-foreground ml-2">
-              {effectiveTotal} 条
-            </span>
-          </h2>
-        </div>
-      )}
-
-      {/* BF-0419-10: 公众号订阅分组 pills(detail_json.group),覆盖 source pills */}
-      {/* BF-0512-3: 公众号 pill bar — 即便 lwGroups=[] 也渲染「全部」pill,
-           满足 PRD §4.9.6 全局规则「每 section 第一个 pill = 「全部」默认选中」。
-           lwGroups 加载失败/为空时（凭证过期、ECS 首次部署、数据迁移期），
-           用户至少能看到「全部」pill 切换 UI;有数据后 group pill 自动加进来 */}
-      {platform === 'lingowhale' && !isL1Dimension && lwGroups !== null && (
-        <InfoSectionPillBar
-          sectionKey={platform}
-          items={[
-            { key: null, label: '全部' },
-            ...lwGroups.map((g) => ({
-              key: g.name,
-              label: g.name,
-              title: `${g.channels.length} 个频道,${g.item_count} 篇内容（hover tooltip 见 cnt；BF-0512-7 跟推荐页一致 pill 纯文本）`,
-            })),
-          ]}
-          activeKey={groupFilter}
-          onSelect={handleGroupSelect}
-          nestedRows={selectedLingowhaleChannels.length > 0 ? [{
-            prefix: `↳ ${groupFilter}:`,
-            items: selectedLingowhaleChannels,
-            activeKey: sourceFilter,
-            onSelect: handleLingowhaleChannelSelect,
-            ariaLabel: `${groupFilter} 频道筛选`,
-          }] : undefined}
-          data-testid="info-section-pill-bar-lingowhale"
-        />
-      )}
-          {/* BF-0512-3 第二轮: 删「未分组」独立 pill 渲染。
-              PRD §4.9.5 S5 + 决策稿 §4.5: 「未分组」内容并入「全部」pill,
-              不独立成 pill。BF-0419-11 时代加的「未分组」button 在 v16.0
-              新决策下移除。lwUngrouped 数据仍 fetch（API 返 ungrouped_count
-              用于「全部」pill 的总计算），但不渲染独立 button */}
-          {/* BF-0512-7 rev2: 删「加载中...」字样（pill 后突兀），切 pill 时靠数据占位 */}
-
-      {/* v18.2: L1 维度 pill (所有可见来源 section)
-          强制「全部」首位, L1PillBar 内部已实现 */}
-      {isL1Dimension && (
-        <L1PillBar
-          platform={platform}
-          categoryCounts={platformCategoryCounts}
-          categoryLabels={categoryLabels}
-          categoryOrder={categoryOrder}
-          selectedCategory={selectedCategory}
-          onSelect={handleCategorySelect}
-        />
-      )}
-
-      {/* Source pills 仅作兼容兜底；当前 PLATFORM_ORDER 内来源均使用 L1 pill。 */}
-      {sources.size > 1 && platform !== 'lingowhale' && !isL1Dimension && (
-        <InfoSectionPillBar
-          sectionKey={platform}
-          items={[
-            { key: null, label: '全部' },
-            ...Array.from(sources.entries()).map(([source]) => ({
-              key: source,
-              label: formatSourceName(source, platform),
-            })),
-          ]}
-          activeKey={sourceFilter}
-          onSelect={handleSourceSelect}
-          data-testid={`info-section-pill-bar-${platform}`}
-        />
-      )}
-
-      {/* Masonry with horizontal clip line + gradient mask */}
-      <div
-        className={cn(
-          'relative transition-opacity duration-150',
-          hasMore && 'overflow-hidden',
-          isFilterLoading && 'opacity-80',
-        )}
-        aria-busy={isFilterLoading || undefined}
-        style={clipMaxHeight != null ? { maxHeight: `${clipMaxHeight}px` } : undefined}
-      >
-        <div ref={masonryInnerRef}>
-          <Masonry
-            items={visibleItems}
-            renderItem={(item, i) => (
-              <InfoCard key={item.id} item={item} delay={Math.min(i, 19) * 30} />
-            )}
-          />
-        </div>
-
-        {/* Gradient mask — horizontal cut across all columns */}
-        {hasMore && clipMaxHeight != null && (
-          <div className="absolute bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-background to-transparent pointer-events-none" />
-        )}
-      </div>
-
-      {/* Expand / Load more button */}
-      {hasMore && (
-        <div className="flex justify-center mt-4">
-          <button
-            onClick={handleLoadMore}
-            className="flex items-center gap-1.5 px-5 py-2 text-sm font-medium text-foreground bg-card border border-border hover:border-warm-400 shadow-subtle hover:shadow-medium rounded-full transition-all cursor-pointer"
-          >
-            展开更多
-            {remaining > 0 && <span className="text-xs text-muted-foreground">还有 {remaining} 条</span>}
-            <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
-          </button>
-        </div>
-      )}
-
-      {/* Fixed collapse button — only visible when section is in viewport */}
-      {isExpanded && sectionVisible && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[90]">
-          <button
-            onClick={() => {
-              const el = document.getElementById(`s-${platform}`)
-              const rect = el?.getBoundingClientRect()
-              if (rect && rect.top < 0) {
-                scrollInfoSectionToTop(platform)
-              }
-              setExpandedKey(null)
-              setShowCount(BATCH)
-            }}
-            className="flex items-center gap-1.5 px-5 py-2 text-sm font-medium text-foreground bg-card border border-border hover:border-warm-400 shadow-subtle hover:shadow-medium rounded-full transition-all cursor-pointer"
-          >
-            收起
-            <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
-          </button>
-        </div>
-      )}
-    </div>
+    <SectionFront
+      sectionKey={platform}
+      label={showHeader ? platformName(platform) : undefined}
+      /* BF-0512-7: 切 pill 后数字联动（用 effectiveTotal），跟「按类型」FeedSection 一致 */
+      count={showHeader ? effectiveTotal : undefined}
+      items={visibleItems}
+      hasMore={hasMore}
+      remaining={remaining}
+      isExpanded={isExpanded}
+      onLoadMore={handleLoadMore}
+      onCollapse={() => {
+        const rect = document.getElementById(`s-${platform}`)?.getBoundingClientRect()
+        if (rect && rect.top < 0) {
+          scrollInfoSectionToTop(platform)
+        }
+        setExpandedKey(null)
+        setShowCount(BATCH)
+      }}
+      onBecameVisible={() => setHasEnteredViewport(true)}
+      pillBar={pillBar}
+      filterLoading={Boolean(isFilterLoading)}
+    />
   )
 }

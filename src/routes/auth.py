@@ -1,4 +1,5 @@
 """Authentication endpoints: register, login, logout, refresh, me, verify-email, password-reset."""
+import functools
 import logging
 import os
 import secrets
@@ -408,7 +409,7 @@ async def verify_email(request: Request):
         return JSONResponse({'error': '请输入邮箱和验证码'}, status_code=400)
 
     if remote_db.app_state_to_remote():
-        user = remote_db.get_user_by_email_remote(email)
+        user = await run_in_threadpool(remote_db.get_user_by_email_remote, email)
         if not user:
             return JSONResponse({'error': '用户不存在'}, status_code=404)
         if user.get('email_verified'):
@@ -419,18 +420,24 @@ async def verify_email(request: Request):
             expires = datetime.fromisoformat(user['verification_code_expires'].replace('Z', '+00:00'))
             if expires < datetime.now(timezone.utc):
                 return JSONResponse({'error': '验证码已过期，请重新发送'}, status_code=400)
-        remote_db.update_user_remote(
-            user['id'],
-            email_verified=1,
-            verification_code=None,
-            verification_code_expires=None,
+        await run_in_threadpool(
+            functools.partial(
+                remote_db.update_user_remote,
+                user['id'],
+                email_verified=1,
+                verification_code=None,
+                verification_code_expires=None,
+            )
         )
-        profile = remote_db.upsert_user_profile_remote(
-            user['id'],
-            onboarding_completed=False,
+        profile = await run_in_threadpool(
+            functools.partial(
+                remote_db.upsert_user_profile_remote,
+                user['id'],
+                onboarding_completed=False,
+            )
         )
         onboarding_completed = bool(profile and profile.get('onboarding_completed'))
-        access_token, refresh_token = _issue_tokens(user['id'], user['role'])
+        access_token, refresh_token = await run_in_threadpool(_issue_tokens, user['id'], user['role'])
         response = JSONResponse({
             'ok': True,
             'user': {
@@ -444,48 +451,51 @@ async def verify_email(request: Request):
         })
         return _set_auth_cookies(response, access_token, refresh_token)
 
-    conn = db.get_conn()
-    try:
-        user = db.get_user_by_email(conn, email)
-        if not user:
-            return JSONResponse({'error': '用户不存在'}, status_code=404)
+    def _verify_local_blocking():
+        conn = db.get_conn()
+        try:
+            user = db.get_user_by_email(conn, email)
+            if not user:
+                return JSONResponse({'error': '用户不存在'}, status_code=404)
 
-        if user.get('email_verified'):
-            return JSONResponse({'error': '邮箱已验证'}, status_code=400)
+            if user.get('email_verified'):
+                return JSONResponse({'error': '邮箱已验证'}, status_code=400)
 
-        if user.get('verification_code') != code:
-            return JSONResponse({'error': '验证码错误'}, status_code=400)
+            if user.get('verification_code') != code:
+                return JSONResponse({'error': '验证码错误'}, status_code=400)
 
-        if user.get('verification_code_expires'):
-            expires = datetime.fromisoformat(user['verification_code_expires'])
-            if expires < datetime.now(timezone.utc):
-                return JSONResponse({'error': '验证码已过期，请重新发送'}, status_code=400)
+            if user.get('verification_code_expires'):
+                expires = datetime.fromisoformat(user['verification_code_expires'])
+                if expires < datetime.now(timezone.utc):
+                    return JSONResponse({'error': '验证码已过期，请重新发送'}, status_code=400)
 
-        # Mark verified, clear code
-        db.update_user(conn, user['id'],
-                       email_verified=1,
-                       verification_code=None,
-                       verification_code_expires=None)
+            # Mark verified, clear code
+            db.update_user(conn, user['id'],
+                           email_verified=1,
+                           verification_code=None,
+                           verification_code_expires=None)
 
-        # Auto-login
-        profile = db.upsert_user_profile(conn, user['id'], onboarding_completed=False)
-        onboarding_completed = bool(profile and profile.get('onboarding_completed'))
+            # Auto-login
+            profile = db.upsert_user_profile(conn, user['id'], onboarding_completed=False)
+            onboarding_completed = bool(profile and profile.get('onboarding_completed'))
 
-        access_token, refresh_token = _issue_tokens(user['id'], user['role'])
-        response = JSONResponse({
-            'ok': True,
-            'user': {
-                'id': user['id'],
-                'username': user['username'],
-                'email': user['email'],
-                'role': user['role'],
-                'has_discord_token': bool(user.get('discord_bot_token_enc')),
-                'onboarding_completed': onboarding_completed,
-            }
-        })
-        return _set_auth_cookies(response, access_token, refresh_token)
-    finally:
-        conn.close()
+            access_token, refresh_token = _issue_tokens(user['id'], user['role'])
+            response = JSONResponse({
+                'ok': True,
+                'user': {
+                    'id': user['id'],
+                    'username': user['username'],
+                    'email': user['email'],
+                    'role': user['role'],
+                    'has_discord_token': bool(user.get('discord_bot_token_enc')),
+                    'onboarding_completed': onboarding_completed,
+                }
+            })
+            return _set_auth_cookies(response, access_token, refresh_token)
+        finally:
+            conn.close()
+
+    return await run_in_threadpool(_verify_local_blocking)
 
 
 @router.post("/api/auth/resend-code")
@@ -499,42 +509,48 @@ async def resend_code(request: Request):
         return JSONResponse({'error': '请输入邮箱地址'}, status_code=400)
 
     if remote_db.app_state_to_remote():
-        user = remote_db.get_user_by_email_remote(email)
+        user = await run_in_threadpool(remote_db.get_user_by_email_remote, email)
         if not user:
             return JSONResponse({'error': '用户不存在'}, status_code=404)
         if user.get('email_verified'):
             return JSONResponse({'error': '邮箱已验证'}, status_code=400)
         code = _generate_verification_code()
         expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-        remote_db.update_user_remote(
-            user['id'],
-            verification_code=code,
-            verification_code_expires=expires,
+        await run_in_threadpool(
+            functools.partial(
+                remote_db.update_user_remote,
+                user['id'],
+                verification_code=code,
+                verification_code_expires=expires,
+            )
         )
-        send_verification_code(email, code, user.get('username', ''))
+        await run_in_threadpool(send_verification_code, email, code, user.get('username', ''))
         return JSONResponse({'ok': True, 'message': '验证码已重新发送'})
 
-    conn = db.get_conn()
-    try:
-        user = db.get_user_by_email(conn, email)
-        if not user:
-            return JSONResponse({'error': '用户不存在'}, status_code=404)
+    def _resend_local_blocking():
+        conn = db.get_conn()
+        try:
+            user = db.get_user_by_email(conn, email)
+            if not user:
+                return JSONResponse({'error': '用户不存在'}, status_code=404)
 
-        if user.get('email_verified'):
-            return JSONResponse({'error': '邮箱已验证'}, status_code=400)
+            if user.get('email_verified'):
+                return JSONResponse({'error': '邮箱已验证'}, status_code=400)
 
-        # Generate new code
-        code = _generate_verification_code()
-        expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-        db.update_user(conn, user['id'],
-                       verification_code=code,
-                       verification_code_expires=expires)
+            # Generate new code
+            code = _generate_verification_code()
+            expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+            db.update_user(conn, user['id'],
+                           verification_code=code,
+                           verification_code_expires=expires)
 
-        send_verification_code(email, code, user.get('username', ''))
+            send_verification_code(email, code, user.get('username', ''))
 
-        return JSONResponse({'ok': True, 'message': '验证码已重新发送'})
-    finally:
-        conn.close()
+            return JSONResponse({'ok': True, 'message': '验证码已重新发送'})
+        finally:
+            conn.close()
+
+    return await run_in_threadpool(_resend_local_blocking)
 
 
 @router.post("/api/auth/forgot-password")
@@ -549,50 +565,56 @@ async def forgot_password(request: Request):
 
     if remote_db.app_state_to_remote():
         try:
-            user = remote_db.get_user_by_email_remote(email)
+            user = await run_in_threadpool(remote_db.get_user_by_email_remote, email)
             if not user:
                 return JSONResponse({'ok': True, 'message': '如果该邮箱已注册，你将收到重置链接'})
             token = secrets.token_urlsafe(32)
             expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
-            remote_db.update_user_remote(
-                user['id'],
-                reset_token=token,
-                reset_token_expires=expires,
+            await run_in_threadpool(
+                functools.partial(
+                    remote_db.update_user_remote,
+                    user['id'],
+                    reset_token=token,
+                    reset_token_expires=expires,
+                )
             )
             base_url = os.environ.get('APP_BASE_URL', 'http://localhost:8080')
             reset_url = f"{base_url}/#reset-password?token={token}"
-            send_password_reset(email, reset_url, user.get('username', ''))
+            await run_in_threadpool(send_password_reset, email, reset_url, user.get('username', ''))
             return JSONResponse({'ok': True, 'message': '如果该邮箱已注册，你将收到重置链接'})
         except Exception as e:
             logger.error(f"Forgot password error: {e}", exc_info=True)
             return JSONResponse({'error': '发送失败，请稍后重试'}, status_code=500)
 
-    conn = db.get_conn()
-    try:
-        user = db.get_user_by_email(conn, email)
-        if not user:
-            # Don't reveal whether email exists
+    def _forgot_local_blocking():
+        conn = db.get_conn()
+        try:
+            user = db.get_user_by_email(conn, email)
+            if not user:
+                # Don't reveal whether email exists
+                return JSONResponse({'ok': True, 'message': '如果该邮箱已注册，你将收到重置链接'})
+
+            # Generate secure token
+            token = secrets.token_urlsafe(32)
+            expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+            db.update_user(conn, user['id'],
+                           reset_token=token,
+                           reset_token_expires=expires)
+
+            # Build reset URL — use server-configured base URL, NOT request Origin header
+            # (Origin can be spoofed, leading to token theft via phishing link)
+            base_url = os.environ.get('APP_BASE_URL', 'http://localhost:8080')
+            reset_url = f"{base_url}/#reset-password?token={token}"
+            send_password_reset(email, reset_url, user.get('username', ''))
+
             return JSONResponse({'ok': True, 'message': '如果该邮箱已注册，你将收到重置链接'})
+        except Exception as e:
+            logger.error(f"Forgot password error: {e}", exc_info=True)
+            return JSONResponse({'error': '发送失败，请稍后重试'}, status_code=500)
+        finally:
+            conn.close()
 
-        # Generate secure token
-        token = secrets.token_urlsafe(32)
-        expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
-        db.update_user(conn, user['id'],
-                       reset_token=token,
-                       reset_token_expires=expires)
-
-        # Build reset URL — use server-configured base URL, NOT request Origin header
-        # (Origin can be spoofed, leading to token theft via phishing link)
-        base_url = os.environ.get('APP_BASE_URL', 'http://localhost:8080')
-        reset_url = f"{base_url}/#reset-password?token={token}"
-        send_password_reset(email, reset_url, user.get('username', ''))
-
-        return JSONResponse({'ok': True, 'message': '如果该邮箱已注册，你将收到重置链接'})
-    except Exception as e:
-        logger.error(f"Forgot password error: {e}", exc_info=True)
-        return JSONResponse({'error': '发送失败，请稍后重试'}, status_code=500)
-    finally:
-        conn.close()
+    return await run_in_threadpool(_forgot_local_blocking)
 
 
 @router.post("/api/auth/reset-password")
@@ -674,13 +696,16 @@ async def logout(request: Request):
     user = get_current_user(request)
     if user:
         if remote_db.app_state_to_remote():
-            remote_db.delete_user_sessions_remote(user['id'])
+            await run_in_threadpool(remote_db.delete_user_sessions_remote, user['id'])
         else:
-            conn = db.get_conn()
-            try:
-                db.delete_user_sessions(conn, user['id'])
-            finally:
-                conn.close()
+            def _logout_local_blocking():
+                conn = db.get_conn()
+                try:
+                    db.delete_user_sessions(conn, user['id'])
+                finally:
+                    conn.close()
+
+            await run_in_threadpool(_logout_local_blocking)
 
     response = JSONResponse({'ok': True})
     return _clear_auth_cookies(response)
@@ -749,13 +774,19 @@ async def refresh(request: Request):
             'iat': now,
         }
         # BE-1: 每用户每 30 分钟必发的静默续期,远程往返离开事件循环
-        user = await run_in_threadpool(
-            remote_db.refresh_access_session_remote,
-            refresh_jti=payload['jti'],
-            user_id=payload['sub'],
-            access_jti=new_jti,
-            access_expires_at=(now + ACCESS_TOKEN_EXPIRY).isoformat(),
-        )
+        try:
+            user = await run_in_threadpool(
+                remote_db.refresh_access_session_remote,
+                refresh_jti=payload['jti'],
+                user_id=payload['sub'],
+                access_jti=new_jti,
+                access_expires_at=(now + ACCESS_TOKEN_EXPIRY).isoformat(),
+            )
+        except remote_db.RemoteDBError as exc:
+            # BF-0708-1: 数据库瞬断不是"登录已失效"。返回 503 并保留 cookie,
+            # 让前端知道这是服务端故障、可以稍后重试,而不是把用户登出。
+            logger.warning('refresh: remote db unavailable: %s', exc)
+            return JSONResponse({'error': '服务暂时不可用,请稍后重试'}, status_code=503)
         if not user:
             response = JSONResponse({'error': '登录已失效'}, status_code=401)
             return _clear_auth_cookies(response)

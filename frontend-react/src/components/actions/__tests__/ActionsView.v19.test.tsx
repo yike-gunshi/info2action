@@ -169,6 +169,14 @@ describe('ActionsView v19 visual constraints', () => {
     expect(within(lanes[1]).getByRole('heading', { name: '执行中' })).toBeInTheDocument()
     expect(within(lanes[2]).getByRole('heading', { name: '已完成' })).toBeInTheDocument()
     expect(screen.getByText('暂无已完成行动')).toBeInTheDocument()
+    // v24 (21.4): 泳道成为拖放目标——读屏 aria-label 报泳道名与计数,静息态无高亮标记
+    expect(lanes[0]).toHaveAttribute('aria-label', '待处理泳道，共 2 条')
+    expect(lanes[1]).toHaveAttribute('aria-label', '执行中泳道，共 1 条')
+    expect(lanes[2]).toHaveAttribute('aria-label', '已完成泳道，共 0 条')
+    for (const lane of lanes) {
+      expect(lane).not.toHaveAttribute('data-drop-target')
+      expect(lane.className).not.toContain('bg-[var(--brand-soft)]')
+    }
   })
 
   it('shows lane-shaped skeletons while loading data', async () => {
@@ -196,6 +204,13 @@ describe('ActionsView v19 visual constraints', () => {
       expect(card.className).not.toContain('shadow-subtle')
       expect(card.className).not.toContain('hover:-translate')
       expect(card.className).not.toContain('rounded-lg')
+      // v24 (21.4): 卡片可拖拽——grab 光标、禁选中、触屏 manipulation、键盘可达 + 中文角色描述
+      expect(card.className).toContain('cursor-grab')
+      expect(card.className).toContain('select-none')
+      expect(card.className).toContain('touch-manipulation')
+      expect(card).toHaveAttribute('data-drag-state', 'idle')
+      expect(card).toHaveAttribute('tabindex', '0')
+      expect(card).toHaveAttribute('aria-roledescription', '可拖拽的行动卡片')
     }
 
     // BF-0706-6: 卡片删除 类型/方向/优先级/状态 徽章(状态与列头重复,优先级下线)

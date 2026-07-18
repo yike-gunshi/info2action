@@ -430,7 +430,7 @@ class TestClusterDetail:
         assert r.status_code == 200
         b = r.json()
         for k in ('id', 'ai_title', 'ai_summary', 'ai_key_points', 'doc_count',
-                  'platforms', 'first_doc_at', 'live_version'):
+                  'platforms', 'first_doc_at', 'live_version', 'why_read'):
             assert k in b
 
     def test_detail_and_bundle_cover_fall_back_to_member_item_cover(self, clusters_env):
@@ -456,6 +456,7 @@ class TestClusterDetail:
         bundle = c.get(f'/api/clusters/{cid}/bundle')
         assert bundle.status_code == 200
         assert bundle.json()['cluster']['cover_url'] == '/images/events/member-cover.jpg'
+        assert 'why_read' in bundle.json()['cluster']
 
     def test_not_found_returns_404(self, clusters_env):
         c = _client(clusters_env['app'])
@@ -500,6 +501,8 @@ class TestClusterDetail:
             'clicked_at': '2026-05-25T01:00:00Z',
             'last_seen_version': 3,
             'starred_at': '2026-05-25T01:10:00Z',
+            'feedback_kind': None,  # v25.0 F-D
+            'feedback_note': None,
         }
 
 
@@ -567,6 +570,156 @@ class TestClusterClick:
                 "SELECT COUNT(*) AS n FROM item_status WHERE clicked_at IS NOT NULL"
             ).fetchone()['n']
             assert members == 0
+        finally:
+            conn.close()
+
+
+class TestClusterFeedback:
+    """v25.0 F-D — cluster 级质量反馈：只落库不改排序，幂等可撤销。"""
+
+    def test_anonymous_feedback_requires_login_and_does_not_write(self, clusters_env):
+        cid = clusters_env['clusters'][0]
+        c = TestClient(clusters_env['app'])
+        r = c.post(f'/api/clusters/{cid}/feedback', json={'kind': 'low_quality'})
+        assert r.status_code == 401
+
+        conn = db_mod.get_conn()
+        try:
+            cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM cluster_status WHERE cluster_id=?",
+                (cid,),
+            ).fetchone()['n']
+            assert cnt == 0
+        finally:
+            conn.close()
+
+    def test_invalid_kind_rejected(self, clusters_env):
+        cid = clusters_env['clusters'][0]
+        c = _client(clusters_env['app'])
+        r = c.post(f'/api/clusters/{cid}/feedback', json={'kind': 'meh'})
+        assert r.status_code == 400
+
+    @pytest.mark.parametrize('note', [501 * '字', 123, ['reason']])
+    def test_invalid_feedback_note_rejected(self, clusters_env, note):
+        cid = clusters_env['clusters'][0]
+        c = _client(clusters_env['app'])
+        r = c.post(
+            f'/api/clusters/{cid}/feedback',
+            json={'kind': 'should_feature', 'note': note},
+        )
+        assert r.status_code == 400
+
+    def test_missing_cluster_404(self, clusters_env):
+        c = _client(clusters_env['app'])
+        r = c.post('/api/clusters/999999/feedback', json={'kind': 'irrelevant'})
+        assert r.status_code == 404
+
+    @pytest.mark.parametrize('kind', ['low_quality', 'should_feature'])
+    def test_feedback_writes_then_same_kind_revokes(self, clusters_env, kind):
+        cid = clusters_env['clusters'][0]
+        c = _client(clusters_env['app'])
+
+        first = c.post(f'/api/clusters/{cid}/feedback', json={'kind': kind})
+        assert first.status_code == 200
+        assert first.json()['ok'] is True
+        assert first.json()['feedback_kind'] == kind
+
+        conn = db_mod.get_conn()
+        try:
+            row = conn.execute(
+                "SELECT feedback_kind, feedback_at, feedback_note, starred_at FROM cluster_status "
+                "WHERE user_id=? AND cluster_id=?",
+                (clusters_env['user_id'], cid),
+            ).fetchone()
+            assert row is not None
+            assert row['feedback_kind'] == kind
+            assert row['feedback_at'] is not None
+            assert row['feedback_note'] is None
+            assert row['starred_at'] is None
+        finally:
+            conn.close()
+
+        # 再点同 kind = 撤销
+        second = c.post(f'/api/clusters/{cid}/feedback', json={'kind': kind})
+        assert second.status_code == 200
+        assert second.json()['feedback_kind'] is None
+
+        conn = db_mod.get_conn()
+        try:
+            row = conn.execute(
+                "SELECT feedback_kind FROM cluster_status WHERE user_id=? AND cluster_id=?",
+                (clusters_env['user_id'], cid),
+            ).fetchone()
+            assert row['feedback_kind'] is None
+        finally:
+            conn.close()
+
+    def test_feedback_note_is_trimmed_exposed_and_cleared_on_revoke(self, clusters_env):
+        cid = clusters_env['clusters'][0]
+        c = _client(clusters_env['app'])
+
+        first = c.post(
+            f'/api/clusters/{cid}/feedback',
+            json={'kind': 'should_feature', 'note': '  这条补充了关键上下文  '},
+        )
+        assert first.status_code == 200
+        assert first.json()['feedback_note'] == '这条补充了关键上下文'
+
+        conn = db_mod.get_conn()
+        try:
+            row = conn.execute(
+                "SELECT feedback_kind, feedback_note FROM cluster_status "
+                "WHERE user_id=? AND cluster_id=?",
+                (clusters_env['user_id'], cid),
+            ).fetchone()
+            assert row['feedback_kind'] == 'should_feature'
+            assert row['feedback_note'] == '这条补充了关键上下文'
+        finally:
+            conn.close()
+
+        detail = c.get(f'/api/clusters/{cid}')
+        assert detail.status_code == 200
+        assert detail.json()['viewer_status']['feedback_note'] == '这条补充了关键上下文'
+
+        revoked = c.post(
+            f'/api/clusters/{cid}/feedback',
+            json={'kind': 'should_feature'},
+        )
+        assert revoked.status_code == 200
+        assert revoked.json() == {
+            'ok': True,
+            'feedback_kind': None,
+            'feedback_note': None,
+        }
+
+        conn = db_mod.get_conn()
+        try:
+            row = conn.execute(
+                "SELECT feedback_kind, feedback_note FROM cluster_status "
+                "WHERE user_id=? AND cluster_id=?",
+                (clusters_env['user_id'], cid),
+            ).fetchone()
+            assert row['feedback_kind'] is None
+            assert row['feedback_note'] is None
+        finally:
+            conn.close()
+
+    def test_feedback_switch_kind_updates_no_duplicate_rows(self, clusters_env):
+        cid = clusters_env['clusters'][0]
+        c = _client(clusters_env['app'])
+
+        c.post(f'/api/clusters/{cid}/feedback', json={'kind': 'irrelevant'})
+        r = c.post(f'/api/clusters/{cid}/feedback', json={'kind': 'low_quality'})
+        assert r.status_code == 200
+        assert r.json()['feedback_kind'] == 'low_quality'
+
+        conn = db_mod.get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM cluster_status WHERE user_id=? AND cluster_id=?",
+                (clusters_env['user_id'], cid),
+            ).fetchone()['n']
+            assert rows == 1
         finally:
             conn.close()
 
@@ -645,6 +798,7 @@ class TestClusterStarAndLibrary:
         cluster_entry = body['entries'][0]
         assert cluster_entry['id'] == f'cluster:{cid}'
         assert cluster_entry['cluster']['id'] == cid
+        assert 'why_read' in cluster_entry['cluster']
         assert cluster_entry['cluster']['viewer_status']['clicked_at'] == '2026-05-25T01:00:00Z'
         assert body['entries'][1]['item']['id'] == 'itm_1'
 
@@ -844,6 +998,7 @@ class TestSearchContext:
         assert r.status_code == 200
         b = r.json()
         assert 'events' in b
+        assert b['events'] and 'why_read' in b['events'][0]
         assert 'docs' in b
         assert 'events_total' in b
         assert 'docs_total' in b

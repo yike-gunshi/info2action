@@ -14,7 +14,7 @@ class StatusRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     item_id: str
-    type: str  # 'positive', 'irrelevant', 'low_quality', 'text'
+    type: str  # 'positive', 'irrelevant', 'low_quality', 'text', 'should_feature'
     topic: Optional[str] = None
     text: Optional[str] = None
 

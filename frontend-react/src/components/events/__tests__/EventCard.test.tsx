@@ -51,8 +51,9 @@ describe('EventCard', () => {
     expect(summary).toHaveAttribute('data-testid', 'event-summary')
     expect(summary).not.toHaveTextContent('AI 速览')
     expect(summary).not.toHaveTextContent('✦')
-    expect(summary?.className).toContain('line-clamp-2')
-    expect(summary?.className).toContain('sm:line-clamp-3')
+    expect(summary?.className).toContain('line-clamp-3')
+    expect(summary?.className).not.toContain('line-clamp-2')
+    expect(summary?.className).not.toContain('sm:line-clamp-3')
     expect(summary?.className).toContain('font-event-title')
     expect(summary?.className).toContain('text-[16px]')
     expect(summary?.className).toContain('leading-[1.58]')
@@ -71,6 +72,51 @@ describe('EventCard', () => {
     expect(time.className).toContain('mt-[8px]')
     expect(screen.getByRole('heading', { level: 3 }).className).toContain('leading-[1.32]')
     expect(screen.queryByText(/小时前|分钟前|天前/)).not.toBeInTheDocument()
+  })
+
+  it('why_read 非空时替换现有 summary 正文位', () => {
+    render(
+      <EventCard
+        cluster={makeCluster({
+          ai_summary: '这是旧的摘要节选。',
+          why_read: '发布节奏提前，可能改变下半年模型选型。',
+        })}
+        onSelect={() => {}}
+      />,
+    )
+
+    const summary = screen.getByTestId('event-summary')
+    expect(summary).toHaveTextContent('发布节奏提前，可能改变下半年模型选型。')
+    expect(summary).not.toHaveTextContent('这是旧的摘要节选。')
+  })
+
+  it.each([null, undefined])('why_read=%s 时回退现有 summaryText', (whyRead) => {
+    render(
+      <EventCard
+        cluster={makeCluster({
+          ai_summary: '**OpenAI** 仍按原计划发布模型。',
+          why_read: whyRead,
+        })}
+        onSelect={() => {}}
+      />,
+    )
+
+    const summary = screen.getByTestId('event-summary')
+    expect(summary).toHaveTextContent('OpenAI 仍按原计划发布模型。')
+    expect(summary.querySelector('strong')).toBeNull()
+  })
+
+  it('保留 display_score 数据时卡片时间栏也不渲染分数', () => {
+    const props = {
+      cluster: makeCluster({ display_score: 87 }),
+      onSelect: () => {},
+      showDisplayScore: true,
+    }
+    render(
+      <EventCard {...props} />,
+    )
+
+    expect(screen.queryByTestId('event-display-score')).toBeNull()
   })
 
   it('最新事件摘要只显示速览部分,不露出【全文拆解】内容', () => {
@@ -202,8 +248,8 @@ describe('EventCard', () => {
     const card = screen.getByTestId('event-card')
     expect(card).toHaveAttribute('data-has-media', 'false')
     expect(card.style.minHeight).toBe('')
-    expect(card.className).toContain('sm:grid-cols-[72px_minmax(0,1fr)]')
-    expect(card.className).toContain('lg:grid-cols-[80px_minmax(0,1fr)]')
+    expect(card.className).toContain('sm:grid-cols-[52px_minmax(0,1fr)]')
+    expect(card.className).toContain('lg:grid-cols-[56px_minmax(0,1fr)]')
     expect(card.className).toContain('grid-cols-1')
     expect(card.className).not.toContain('_200px')
     expect(screen.getByTestId('event-content').className).not.toContain('min-h-[128px]')
@@ -217,8 +263,8 @@ describe('EventCard', () => {
     expect(screen.queryByLabelText('事件占位图')).toBeNull()
     expect(screen.queryByTestId('event-media-slot')).toBeNull()
     expect(card).toHaveAttribute('data-has-media', 'false')
-    expect(card.className).toContain('sm:grid-cols-[72px_minmax(0,1fr)]')
-    expect(card.className).toContain('lg:grid-cols-[80px_minmax(0,1fr)]')
+    expect(card.className).toContain('sm:grid-cols-[52px_minmax(0,1fr)]')
+    expect(card.className).toContain('lg:grid-cols-[56px_minmax(0,1fr)]')
     expect(card.className).toContain('grid-cols-1')
     expect(card.className).not.toContain('_200px')
     expect(card.style.minHeight).toBe('')
@@ -291,7 +337,7 @@ describe('EventCard', () => {
     const card = screen.getByTestId('event-card')
     const thumb = screen.getByTestId('event-media-thumb')
 
-    expect(card.className).toContain('lg:grid-cols-[80px_minmax(0,1fr)_200px]')
+    expect(card.className).toContain('lg:grid-cols-[56px_minmax(0,1fr)_200px]')
     expect(thumb.className).toContain('aspect-[5/3]')
     expect(thumb.className).toContain('h-full')
     expect(thumb.className).toContain('w-full')

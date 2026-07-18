@@ -38,6 +38,58 @@ class TestItemFeedback:
         rows = fs.get_all_item_feedback(fb_conn)
         assert len(rows) == 3
 
+    def test_set_should_feature_is_idempotent_and_supports_text(self, fb_conn):
+        fs.set_item_feedback(
+            fb_conn,
+            'item-1',
+            'should_feature',
+            active=True,
+            title='Test',
+            reason='这条有关键上下文',
+        )
+        fs.set_item_feedback(
+            fb_conn,
+            'item-1',
+            'should_feature',
+            active=True,
+            title='Test',
+            reason='更新后的判断',
+        )
+
+        rows = fs.get_all_item_feedback(fb_conn)
+        assert len(rows) == 1
+        assert rows[0]['action'] == 'should_feature'
+        assert rows[0]['reason'] == '更新后的判断'
+
+        fs.set_item_feedback(
+            fb_conn,
+            'item-1',
+            'should_feature',
+            active=False,
+        )
+        assert fs.get_all_item_feedback(fb_conn) == []
+
+    def test_set_should_drop_is_idempotent_and_supports_text(self, fb_conn):
+        fs.set_item_feedback(
+            fb_conn,
+            'item-1',
+            'should_drop',
+            active=True,
+            reason='排除营销内容',
+        )
+        fs.set_item_feedback(
+            fb_conn,
+            'item-1',
+            'should_drop',
+            active=True,
+            reason='排除互动诱饵',
+        )
+
+        rows = fs.get_all_item_feedback(fb_conn)
+        assert len(rows) == 1
+        assert rows[0]['action'] == 'should_drop'
+        assert rows[0]['reason'] == '排除互动诱饵'
+
 
 class TestSystemFeedback:
     def test_record_system_feedback(self, fb_conn):

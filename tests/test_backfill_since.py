@@ -384,6 +384,58 @@ def test_search_queries_use_curated_topic_queries_not_all_keywords():
     assert queries == ["claude", "MCP protocol", "Claude Code Cursor 开发"]
 
 
+def test_fetch_twitter_backfill_uses_registry_users_only(monkeypatch):
+    commands = []
+    captured = {}
+    monkeypatch.setattr(
+        bf,
+        "fetch_x_users",
+        types.SimpleNamespace(
+            _active_x_sources=lambda conn: [
+                {"id": 1, "source_key": "openai"},
+                {"id": 2, "source_key": "karpathy"},
+            ]
+        ),
+        raising=False,
+    )
+
+    def fake_run_json_command(cmd, timeout):
+        commands.append(cmd)
+        handle = cmd[2]
+        return ([{"id": f"{handle}-1", "text": "hello", "author": {"screenName": handle}, "metrics": {}}], None)
+
+    monkeypatch.setattr(bf, "_run_json_command", fake_run_json_command)
+    monkeypatch.setattr(
+        bf,
+        "_upsert_source_rows",
+        lambda ctx, platform, rows, stats: captured.update(platform=platform, rows=rows),
+    )
+    monkeypatch.setattr(bf.time, "sleep", lambda _seconds: None)
+    ctx = types.SimpleNamespace(
+        conn=object(),
+        config={},
+        topics={},
+        since=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        until=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        args=types.SimpleNamespace(
+            twitter_max=20,
+            twitter_timeout=60,
+            twitter_delay=0,
+            feed_max=20,
+            expand_x_articles=False,
+        ),
+    )
+
+    bf.fetch_twitter(ctx)
+
+    assert commands == [
+        ["twitter", "user-posts", "openai", "-n", "20", "--json"],
+        ["twitter", "user-posts", "karpathy", "-n", "20", "--json"],
+    ]
+    assert captured["platform"] == "twitter"
+    assert [row["source"] for row in captured["rows"]] == ["user:openai", "user:karpathy"]
+
+
 def test_twitter_row_skips_x_article_expansion_by_default(monkeypatch):
     monkeypatch.setattr(
         bf.ingest,

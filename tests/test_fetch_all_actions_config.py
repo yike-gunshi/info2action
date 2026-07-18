@@ -34,8 +34,7 @@ def test_fetch_all_respects_per_run_data_dir():
 
     assert 'DATA_DIR="${INFO2ACTION_DATA_DIR:-$BASE/data}"' in text
     assert 'SOURCE_DIR="${INFO2ACTION_SOURCE_DIR:-$DATA_DIR/sources}"' in text
-    assert "$SOURCE_DIR/twitter/1-following-feed.json" in text
-    assert "$SOURCE_DIR/twitter/2-for-you-feed.json" in text
+    assert "fetch_x_users.py" in text
 
 
 def test_fetch_all_runs_x_user_channel():

@@ -30,7 +30,7 @@ def test_normalize_current_feed_entry_uses_channel_metadata():
     assert entry["surface_url"] == "https://example.com/cover.png"
 
 
-def test_fetch_subscription_feed_scans_priority_channels_before_legacy_all(monkeypatch):
+def test_fetch_subscription_feed_scans_registered_priority_channels_only(monkeypatch):
     calls = []
     groups_info = [
         {
@@ -74,18 +74,19 @@ def test_fetch_subscription_feed_scans_priority_channels_before_legacy_all(monke
             )
         return ([], 1, "empty")
 
-    monkeypatch.setattr(lw, "_priority_group_names", lambda: ["每日查看"])
+    monkeypatch.setenv("INFO2ACTION_LINGOWHALE_REGISTRY_ONLY", "0")
     monkeypatch.setattr(lw, "_priority_channel_ids", lambda: ["target"])
+    monkeypatch.setattr(lw, "_registry_lingowhale_channel_map", lambda: {"target": 1})
     monkeypatch.setattr(lw, "_fetch_subscription_feed_from_endpoint", fake_fetch)
+    monkeypatch.setattr(lw, "_record_lingowhale_result", lambda source_id, *, ok, error=None: None)
     monkeypatch.setattr(lw.time, "sleep", lambda _: None)
 
     entries = lw.fetch_subscription_feed(groups_info)
 
-    assert [entry["entry_id"] for entry in entries] == ["new", "old"]
+    assert [entry["entry_id"] for entry in entries] == ["new"]
     assert calls[0][0] == lw.FEED_ENDPOINTS[0]
     assert calls[0][1] == ("target",)
-    assert calls[-1][0] == lw.FEED_ENDPOINTS[1]
-    assert calls[-1][1] == ("all",)
+    assert all(call[0] == lw.FEED_ENDPOINTS[0] for call in calls)
 
 
 def test_priority_channel_ids_are_included_even_when_group_snapshot_misses_them():

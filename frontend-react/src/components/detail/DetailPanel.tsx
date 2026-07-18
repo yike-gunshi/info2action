@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import type { CSSProperties } from 'react'
-import { X, ExternalLink, ArrowLeft, ChevronDown, Share2, Bookmark, ImageOff, Ban, CalendarDays, CheckCircle2, RotateCcw, Send, Copy } from 'lucide-react'
+import { X, ExternalLink, ArrowLeft, ChevronDown, Share2, Bookmark, ImageOff, Ban, CalendarDays, CheckCircle2, RotateCcw, Send, Copy, TriangleAlert } from 'lucide-react'
 import { toast } from 'sonner'
 import { useDetailStore } from '../../store/detailStore'
 import { useClusterDetailStore } from '../../store/clusterDetailStore'
@@ -674,21 +674,25 @@ function DetailContent({
         <SummaryUpdatedBadge onExpired={clearSummaryBadge} />
       )}
 
-      {/* 3b. v12.2: failed_summary 降级 banner */}
+      {/* 3b. v12.2: failed_summary 降级 banner
+          v24.0 §21.6: emoji ⚠️ → lucide TriangleAlert;硬编码琥珀 → score 语义 token */}
       {isSummaryFailed && (
         <div
           role="alert"
-          className="flex items-center justify-between gap-2 px-3 py-2 mb-2 rounded-lg text-[13px]"
+          className="mb-2 flex items-center justify-between gap-2 rounded-[4px] px-3 py-2 text-[13px]"
           style={{
-            background: 'rgb(251 191 36 / 0.1)',
-            border: '1px solid rgb(251 191 36 / 0.4)',
-            color: 'rgb(180 83 9)',
+            background: 'var(--score-high-bg)',
+            border: '1px solid color-mix(in srgb, var(--score-high) 32%, transparent)',
+            color: 'var(--score-high)',
           }}
         >
-          <span>⚠️ 转写已就绪,摘要暂未更新</span>
+          <span className="flex items-center gap-1.5">
+            <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            转写已就绪,摘要暂未更新
+          </span>
           <button
             onClick={() => retrySummary(item.id)}
-            className="text-primary hover:underline text-sm font-medium"
+            className="text-sm font-medium text-[var(--brand)] hover:underline"
           >
             重试摘要
           </button>
