@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import enrich_items  # noqa: E402
+import highlight_score_v26  # noqa: E402
 import highlight_verdict  # noqa: E402
 import remote_db  # noqa: E402
 
@@ -64,6 +65,31 @@ def _process_item(item: dict, *, api_key: str, api_base: str, model: str, dry_ru
         return item["id"], "error"
 
 
+def _process_item_v26(
+    item: dict,
+    *,
+    api_key: str,
+    api_base: str,
+    model: str,
+    threshold: float,
+    dry_run: bool,
+    gate,
+) -> tuple[str, str]:
+    try:
+        result = enrich_items.enrich_highlight_score_v26_for_item(
+            item,
+            api_key,
+            api_base,
+            model,
+            threshold=threshold,
+            dry_run=dry_run,
+            rate_gate=gate,
+        )
+        return item["id"], (result or {}).get("cluster_verdict", "scored")
+    except Exception:
+        return item["id"], "error"
+
+
 def _run_bounded(items: list[dict], workers: int, fn) -> list[tuple[str, str]]:
     total = len(items)
     if workers <= 1:
@@ -110,6 +136,7 @@ def main() -> int:
     parser.add_argument("--window-end", default=None)
     parser.add_argument("--window-require-published-at", action="store_true")
     parser.add_argument("--rescore-version-mismatch", action="store_true")
+    parser.add_argument("--scorer", choices=("v38", "v26"), default="v38")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -120,6 +147,16 @@ def main() -> int:
     if not api_key:
         print("ERROR: No MiniMax API key configured", flush=True)
         return 1
+    threshold = None
+    if args.scorer == "v26":
+        try:
+            _, threshold = enrich_items.resolve_highlight_scorer_config()
+        except ValueError as exc:
+            print(f"ERROR: {exc}", flush=True)
+            return 1
+        if threshold is None:
+            print("ERROR: --scorer v26 requires INFO2ACTION_HIGHLIGHT_V26_THRESHOLD", flush=True)
+            return 1
     ids = [item_id.strip() for item_id in args.ids.split(",") if item_id.strip()] or None
     window_start = args.window_start
     if args.window_days and not window_start:
@@ -131,7 +168,11 @@ def main() -> int:
         window_end=args.window_end,
         require_published_at=args.window_require_published_at,
         rescore_prompt_version=(
-            highlight_verdict.PROMPT_VERSION
+            (
+                highlight_score_v26.PROMPT_VERSION
+                if args.scorer == "v26"
+                else highlight_verdict.PROMPT_VERSION
+            )
             if args.rescore_version_mismatch
             else None
         ),
@@ -140,17 +181,29 @@ def main() -> int:
     if not items:
         return 0
     gate = enrich_items.MiniMaxRateLimitGate(min_interval=0.8 if args.workers > 1 else 0.0)
-    results = _run_bounded(
-        items,
-        max(1, int(args.workers or 1)),
-        lambda item: _process_item(
+    if args.scorer == "v26":
+        process_item = lambda item: _process_item_v26(
+            item,
+            api_key=api_key,
+            api_base=api_base,
+            model=model,
+            threshold=threshold,
+            dry_run=args.dry_run,
+            gate=gate,
+        )
+    else:
+        process_item = lambda item: _process_item(
             item,
             api_key=api_key,
             api_base=api_base,
             model=model,
             dry_run=args.dry_run,
             gate=gate,
-        ),
+        )
+    results = _run_bounded(
+        items,
+        max(1, int(args.workers or 1)),
+        process_item,
     )
     counts: dict[str, int] = {}
     for _, verdict in results:

@@ -895,6 +895,38 @@ def test_recall_top_k_clusters_remote_keeps_window_without_item_time(monkeypatch
     assert " <=> " not in sql
 
 
+def test_recall_clusters_by_member_item_ids_remote_uses_explicit_reference(monkeypatch):
+    import remote_db
+
+    monkeypatch.setattr(remote_db, "remote_schema", lambda: "remote_poc")
+
+    class FakeCursor:
+        def fetchall(self):
+            return []
+
+    class FakeConn:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params=None):
+            self.calls.append((" ".join(sql.split()), params))
+            return FakeCursor()
+
+    fake = FakeConn()
+    remote_db.recall_clusters_by_member_item_ids_remote(
+        fake,
+        ["2079610838143623371"],
+        [1.0, 0.0, 0.0],
+    )
+
+    sql, params = fake.calls[0]
+    assert "JOIN remote_poc.clusters c ON c.id = ci.cluster_id" in sql
+    assert "ci.item_id = ANY(%s)" in sql
+    assert "OPERATOR(extensions.<=>)" in sql
+    assert "cosine" not in sql.lower().split("where", 1)[1]
+    assert params[1] == ["2079610838143623371"]
+
+
 def test_embedding_backend_can_enable_supabase(monkeypatch):
     import remote_db
 
@@ -2920,7 +2952,7 @@ def test_remote_events_snapshot_key_bumped_for_cover_payload():
         categories=[],
     )
 
-    assert key.startswith("events:v4:")
+    assert key.startswith("events:v5:")
     assert "tz=-480" in key
 
 
@@ -4562,7 +4594,13 @@ def test_cluster_sources_dispatches_to_remote_backend(monkeypatch):
     result = asyncio.run(clusters.cluster_sources(_request(), 8, page=3, limit=4))
 
     assert result["sources"][0]["item_id"] == "remote_item"
-    assert calls == {"cluster_id": 8, "page": 3, "limit": 4, "public_only": True}
+    assert calls == {
+        "cluster_id": 8,
+        "page": 3,
+        "limit": 4,
+        "public_only": True,
+        "user_id": None,
+    }
 
 
 def test_cluster_bundle_dispatches_to_remote_backend(monkeypatch):
@@ -4653,6 +4691,51 @@ def test_remote_cluster_source_queries_filter_manual_items_for_public_requests(m
     ]
     assert len(source_queries) == 2
     assert all("i.platform != 'manual'" in sql for sql in source_queries)
+    assert all("i.user_id IS NULL" in sql for sql in source_queries)
+
+
+def test_remote_cluster_sources_scope_private_media_to_current_user(monkeypatch):
+    import remote_db
+
+    class FakeCursor:
+        def __init__(self, row=None, rows=None):
+            self.row = row
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeConn:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.calls.append((normalized, params or {}))
+            if normalized.startswith("SELECT 1 FROM remote_poc.clusters"):
+                return FakeCursor(row={"ok": 1})
+            return FakeCursor(rows=[])
+
+    fake = FakeConn()
+
+    @contextmanager
+    def fake_connect():
+        yield fake
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    remote_db.cluster_sources(cluster_id=8, user_id="user-1")
+
+    source_sql, source_params = next(
+        (sql, params)
+        for sql, params in fake.calls
+        if sql.startswith("SELECT i.id AS item_id")
+    )
+    assert "i.user_id IS NULL" in source_sql
+    assert "i.user_id = %(manual_owner_user_id)s" in source_sql
+    assert source_params["manual_owner_user_id"] == "user-1"
 
 
 def test_cluster_seen_dispatches_to_remote_backend(monkeypatch):
@@ -4671,6 +4754,115 @@ def test_cluster_seen_dispatches_to_remote_backend(monkeypatch):
 
     assert result == {"cluster_id": 9, "last_seen_version": 3}
     assert calls == {"cluster_id": 9, "user_id": "u1"}
+
+
+def test_v30_status_and_progress_routes_dispatch_to_remote(monkeypatch):
+    import routes.clusters as clusters
+
+    class JsonRequest:
+        state = SimpleNamespace(user={"id": "u1"}, legacy_authenticated=False)
+
+        def __init__(self, payload=None):
+            self.payload = payload
+
+        async def json(self):
+            return self.payload
+
+    calls = []
+    monkeypatch.setattr(clusters.remote_db, "status_write_to_remote", lambda: True)
+    monkeypatch.setattr(clusters.remote_db, "events_read_from_remote", lambda: True)
+    monkeypatch.setattr(
+        clusters.remote_db,
+        "get_cluster_statuses",
+        lambda **kwargs: calls.append(("statuses", kwargs)) or [{
+            "cluster_id": 8, "clicked_at": None, "last_seen_version": None,
+        }],
+    )
+    monkeypatch.setattr(
+        clusters.remote_db,
+        "save_highlights_reading_progress",
+        lambda **kwargs: calls.append(("save", kwargs)) or {
+            "cluster_id": 8, "resolved_cluster_id": 8, "resolution": "exact",
+        },
+    )
+    monkeypatch.setattr(
+        clusters.remote_db,
+        "get_highlights_reading_progress",
+        lambda **kwargs: calls.append(("get", kwargs)) or {
+            "cluster_id": 8, "resolved_cluster_id": 8, "resolution": "exact",
+        },
+    )
+
+    statuses = asyncio.run(clusters.cluster_status_batch(JsonRequest({"cluster_ids": [8]})))
+    saved = asyncio.run(clusters.put_highlights_reading_progress(JsonRequest({"cluster_id": 8})))
+    loaded = asyncio.run(clusters.get_highlights_reading_progress(JsonRequest()))
+
+    assert statuses["statuses"][0]["cluster_id"] == 8
+    assert saved["progress"]["resolution"] == "exact"
+    assert loaded["progress"]["resolved_cluster_id"] == 8
+    assert calls == [
+        ("statuses", {"user_id": "u1", "cluster_ids": [8]}),
+        ("save", {"user_id": "u1", "cluster_id": 8}),
+        ("get", {"user_id": "u1"}),
+    ]
+
+
+def test_remote_reading_progress_returns_read_model_cursor_and_nearest_anchor(monkeypatch):
+    import remote_db
+
+    statements = []
+
+    class FakeCursor:
+        def __init__(self, row=None, rows=None):
+            self.row = row
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            statements.append((normalized, params or {}))
+            if "FROM remote_poc.reading_progress" in normalized:
+                return FakeCursor(row={
+                    "cluster_id": 8,
+                    "anchor_sort_at": "2026-07-23T10:00:00+00:00",
+                    "updated_at": "2026-07-23T11:00:00+00:00",
+                })
+            if "FROM remote_poc.highlights_read_model_state" in normalized:
+                return FakeCursor(row={
+                    "cluster_id": 7,
+                    "sort_at": "2026-07-23T09:00:00+00:00",
+                    "rank": 25,
+                    "version_id": "11111111-1111-1111-1111-111111111111",
+                    "scope_key": "all",
+                })
+            return FakeCursor()
+
+    @contextmanager
+    def fake_connect():
+        yield FakeConn()
+
+    monkeypatch.setattr(remote_db, "connect", fake_connect)
+    result = remote_db.get_highlights_reading_progress(user_id="u1")
+
+    resume_sql, resume_params = next((sql, params) for sql, params in statements
+                                     if "FROM remote_poc.highlights_read_model_state" in sql)
+    assert "row_number() OVER" in resume_sql
+    assert "AND h.sort_at < %(published_before)s" in resume_sql
+    assert resume_params["published_before"] == remote_db.highlights_published_before()
+    assert result["cluster_id"] == 8
+    assert result["resolved_cluster_id"] == 7
+    assert result["resolution"] == "nearest_older"
+    assert result["cursor"] == {
+        "version_id": "11111111-1111-1111-1111-111111111111",
+        "scope_key": "all",
+        "rank_after": 20,
+    }
 
 
 def test_context_search_dispatches_to_remote_without_sqlite(monkeypatch):

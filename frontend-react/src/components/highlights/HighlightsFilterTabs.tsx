@@ -1,10 +1,11 @@
 import { useMemo } from 'react'
+import type { ReactNode } from 'react'
 import { cn } from '../../lib/utils'
 import { eventCategoryOptionsFromClassification } from '../../lib/eventCategories'
 import { useEventsStore } from '../../store/eventsStore'
 import { useFeedStore } from '../../store/feedStore'
 
-export function HighlightsFilterTabs() {
+export function HighlightsFilterTabs({ dateControl }: { dateControl?: ReactNode }) {
   const classification = useFeedStore((s) => s.classification)
   const selectedCategories = useEventsStore((s) => s.filters.categories)
   const setFilters = useEventsStore((s) => s.setFilters)
@@ -29,12 +30,11 @@ export function HighlightsFilterTabs() {
   )
 
   return (
-    <nav
-      aria-label="精选分类筛选"
-      role="tablist"
-      className="sticky top-[var(--highlights-l2-top)] z-50 min-w-0 overflow-x-auto bg-background scrollbar-hide"
+    <div
+      className="highlights-filter-row sticky top-[var(--highlights-l2-top)] z-50 flex min-w-0 bg-background"
       data-testid="highlights-filter-tabs"
     >
+      <nav aria-label="精选分类筛选" role="tablist" className="min-w-0 flex-1 overflow-x-auto scrollbar-hide">
       <div className="mx-auto flex h-10 w-full min-w-0 items-center justify-start gap-6 border-b border-border/70 sm:gap-8" data-testid="highlights-filter-tabs-inner">
         <button
           type="button"
@@ -63,6 +63,8 @@ export function HighlightsFilterTabs() {
           )
         })}
       </div>
-    </nav>
+      </nav>
+      {dateControl}
+    </div>
   )
 }

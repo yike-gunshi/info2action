@@ -173,6 +173,28 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
 
 
+_RETRY_DISABLED_WARNED: set[str] = set()
+
+
+def _retry_limit_env(name: str, default: int) -> int:
+    """跨轮补救预算,置零时留痕(BF-0804-1)。
+
+    预算为 0 会让 `if retry_limit > 0` 整段补救路径被跳过:掉队条目拿不到
+    embedding,超出回溯窗口后永久退出候选集,既不报错也不出现在任何告警里。
+    生产曾这样静默丢掉 7 天 649 条已判 featured 的内容,所以关闭状态必须
+    可见,不能看起来和"本轮没有落单条目"一样。
+    """
+    limit = _positive_int_env(name, default)
+    if limit == 0 and name not in _RETRY_DISABLED_WARNED:
+        _RETRY_DISABLED_WARNED.add(name)
+        logger.warning(
+            '%s=0: cross-run retry disabled; stragglers are dropped for good once '
+            'they fall out of the lookback window', name,
+        )
+        _log_event('cluster_retry_disabled', setting=name, default=default)
+    return limit
+
+
 def _positive_float_env(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
@@ -622,7 +644,7 @@ def _embed_pending_items(conn, provider, batch_size: int = _EMBED_BATCH,
         tuple(params),
     ).fetchall()
     if run_id is not None:
-        retry_limit = _positive_int_env(
+        retry_limit = _retry_limit_env(
             "INFO2ACTION_CLUSTER_ITEM_RETRY_LIMIT",
             _CLUSTER_ITEM_RETRY_LIMIT_DEFAULT,
         )
@@ -772,7 +794,7 @@ def _embed_pending_items_remote(
             tuple(params),
         ).fetchall()
         if run_id is not None:
-            retry_limit = _positive_int_env(
+            retry_limit = _retry_limit_env(
                 "INFO2ACTION_CLUSTER_ITEM_RETRY_LIMIT",
                 _CLUSTER_ITEM_RETRY_LIMIT_DEFAULT,
             )
@@ -983,6 +1005,117 @@ def _recall_top_k_clusters(
         })
     scored.sort(key=lambda c: c['cosine'], reverse=True)
     return scored[: max(0, int(k))]
+
+
+def _detail_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _quoted_item_references(item: Any) -> list[str]:
+    keys = item.keys() if hasattr(item, 'keys') else []
+    detail = _detail_json_dict(item['detail_json'] if 'detail_json' in keys else None)
+    quoted = detail.get('quotedTweet')
+    if not isinstance(quoted, dict):
+        return []
+    candidates = [str(quoted.get('id') or '').strip()]
+    quoted_url = str(quoted.get('url') or '').strip()
+    match = re.search(r'/status/(\d+)', quoted_url)
+    if match:
+        candidates.append(match.group(1))
+    return list(dict.fromkeys(value for value in candidates if value))
+
+
+def _order_pending_items_by_references(items: list[Any]) -> list[Any]:
+    """Place quoted source items before their commentary within one batch."""
+    by_id = {
+        str(item['id']): item
+        for item in items
+        if hasattr(item, 'keys') and 'id' in item.keys()
+    }
+    ordered: list[Any] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def _visit(item: Any) -> None:
+        item_id = str(item['id'])
+        if item_id in visited or item_id in visiting:
+            return
+        visiting.add(item_id)
+        for referenced_item_id in _quoted_item_references(item):
+            referenced_item = by_id.get(referenced_item_id)
+            if referenced_item is not None:
+                _visit(referenced_item)
+        visiting.remove(item_id)
+        visited.add(item_id)
+        ordered.append(item)
+
+    for item in items:
+        _visit(item)
+    return ordered
+
+
+def _recall_explicit_reference_clusters(
+    conn,
+    item: Any,
+    new_vec: np.ndarray,
+) -> list[dict]:
+    referenced_item_ids = _quoted_item_references(item)
+    if not referenced_item_ids:
+        return []
+    if remote_db.cluster_to_remote():
+        return remote_db.recall_clusters_by_member_item_ids_remote(
+            None, referenced_item_ids, new_vec,
+        )
+
+    placeholders = ', '.join(['?'] * len(referenced_item_ids))
+    rows = conn.execute(
+        f"""SELECT c.id, c.representative_vector, c.doc_count, c.live_version,
+                   c.first_doc_at, c.last_doc_at, c.last_updated_at,
+                   c.ai_title, c.ai_summary, c.ai_key_points,
+                   ci.item_id AS referenced_item_id
+              FROM cluster_items ci
+              JOIN clusters c ON c.id = ci.cluster_id
+             WHERE ci.item_id IN ({placeholders})
+               AND c.representative_vector IS NOT NULL
+               AND c.archived = 0
+               AND c.merged_into IS NULL
+             ORDER BY c.id, ci.item_id""",
+        tuple(referenced_item_ids),
+    ).fetchall()
+    candidates: list[dict] = []
+    seen_cluster_ids: set[int] = set()
+    for row in rows:
+        cluster_id = int(row['id'])
+        if cluster_id in seen_cluster_ids:
+            continue
+        seen_cluster_ids.add(cluster_id)
+        cluster_vec = vu.unpack_blob(row['representative_vector'])
+        if cluster_vec is None:
+            continue
+        candidates.append({
+            'cluster_id': cluster_id,
+            'representative_vector': cluster_vec,
+            'cosine': float(vu.cosine_similarity(new_vec, cluster_vec)),
+            'doc_count': row['doc_count'],
+            'live_version': row['live_version'],
+            'first_doc_at': row['first_doc_at'],
+            'last_doc_at': row['last_doc_at'],
+            'last_updated_at': row['last_updated_at'],
+            'ai_title': row['ai_title'],
+            'ai_summary': row['ai_summary'],
+            'ai_key_points': row['ai_key_points'],
+            'referenced_item_id': row['referenced_item_id'],
+            'recall_band': 'explicit_reference',
+        })
+    return candidates
 
 
 _ENTITY_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]{2,}")
@@ -1623,7 +1756,7 @@ def _clusters_requiring_summary(
         ).fetchall()
         ids = [row['id'] for row in rows]
 
-    retry_limit = _positive_int_env(
+    retry_limit = _retry_limit_env(
         "INFO2ACTION_CLUSTER_SUMMARY_RETRY_LIMIT",
         _CLUSTER_SUMMARY_RETRY_LIMIT_DEFAULT,
     )
@@ -1859,7 +1992,7 @@ def _clusters_requiring_summary_remote(
             ).fetchall()
             ids = [int(row['id']) for row in rows]
 
-        retry_limit = _positive_int_env(
+        retry_limit = _retry_limit_env(
             "INFO2ACTION_CLUSTER_SUMMARY_RETRY_LIMIT",
             _CLUSTER_SUMMARY_RETRY_LIMIT_DEFAULT,
         )
@@ -2107,13 +2240,30 @@ def _build_new_doc_block(item_row, *, max_chars: int = 4000) -> str:
         f'category: {ai_category}',
         f'content_type: {content_type}',
         f'title: {title}',
+    ]
+
+    quoted_ids = _quoted_item_references(item_row)
+    detail = _detail_json_dict(item_row['detail_json'] if 'detail_json' in keys else None)
+    quoted = detail.get('quotedTweet')
+    if isinstance(quoted, dict):
+        quoted_author = quoted.get('author') if isinstance(quoted.get('author'), dict) else {}
+        parts.extend([
+            '',
+            'quoted_original:',
+            f'item_id: {quoted_ids[0] if quoted_ids else ""}',
+            f'author: {quoted_author.get("name") or ""}',
+            f'author_handle: {quoted_author.get("screenName") or ""}',
+            f'text: {str(quoted.get("text") or "")[:1500]}',
+        ])
+
+    parts.extend([
         '',
         'summary:',
         ai_summary or '(none)',
         '',
         'key_points:',
         key_points_block or '(none)',
-    ]
+    ])
     if ai_keywords:
         parts.append('')
         parts.append(f'keywords: {ai_keywords}')
@@ -2160,6 +2310,9 @@ def _build_candidate_block(candidate: dict, *, max_summary_chars: int = 600,
         f'cosine_recall: {cosine_str}',
         f'ai_summary: {ai_summary}',
     ]
+    if candidate.get('recall_band') == 'explicit_reference':
+        parts.append('recall_relation: explicitly_quoted_source')
+        parts.append(f'referenced_item_id: {candidate.get("referenced_item_id") or ""}')
     if key_points_block:
         parts.append('ai_key_points:')
         parts.append(key_points_block)
@@ -2631,7 +2784,7 @@ def _load_pending_cluster_items(
             rows = pg_conn.execute(
                 f"""SELECT id, embedding::text AS embedding, content, ai_summary,
                           ai_key_points, ai_keywords, ai_category, content_type,
-                          title, platform, author_name, url,
+                          title, platform, author_name, url, detail_json,
                           COALESCE(published_at, fetched_at) AS published_at
                      FROM {remote_db.remote_schema()}.items
                     WHERE embedding IS NOT NULL
@@ -2644,7 +2797,7 @@ def _load_pending_cluster_items(
                 tuple(params),
             ).fetchall()
             if run_id is not None:
-                retry_limit = _positive_int_env(
+                retry_limit = _retry_limit_env(
                     "INFO2ACTION_CLUSTER_ITEM_RETRY_LIMIT",
                     _CLUSTER_ITEM_RETRY_LIMIT_DEFAULT,
                 )
@@ -2667,7 +2820,7 @@ def _load_pending_cluster_items(
                     retry_rows = pg_conn.execute(
                         f"""SELECT id, embedding::text AS embedding, content, ai_summary,
                                   ai_key_points, ai_keywords, ai_category, content_type,
-                                  title, platform, author_name, url,
+                                  title, platform, author_name, url, detail_json,
                                   COALESCE(published_at, fetched_at) AS published_at
                              FROM {remote_db.remote_schema()}.items
                             WHERE embedding IS NOT NULL
@@ -2717,7 +2870,7 @@ def _load_pending_cluster_items(
     rows = conn.execute(
         """SELECT id, embedding, content, ai_summary, ai_key_points,
                   ai_keywords, ai_category, content_type,
-                  title, platform, author_name, url,
+                  title, platform, author_name, url, detail_json,
                   COALESCE(published_at, fetched_at) AS published_at
            FROM items
            WHERE embedding IS NOT NULL AND cluster_id IS NULL
@@ -2737,7 +2890,7 @@ def _load_pending_cluster_items(
         tuple(params),
     ).fetchall()
     if run_id is not None:
-        retry_limit = _positive_int_env(
+        retry_limit = _retry_limit_env(
             "INFO2ACTION_CLUSTER_ITEM_RETRY_LIMIT",
             _CLUSTER_ITEM_RETRY_LIMIT_DEFAULT,
         )
@@ -2760,7 +2913,7 @@ def _load_pending_cluster_items(
             retry_rows = conn.execute(
                 """SELECT id, embedding, content, ai_summary, ai_key_points,
                           ai_keywords, ai_category, content_type,
-                          title, platform, author_name, url,
+                          title, platform, author_name, url, detail_json,
                           COALESCE(published_at, fetched_at) AS published_at
                    FROM items
                    WHERE embedding IS NOT NULL AND cluster_id IS NULL
@@ -2893,8 +3046,10 @@ def run_pipeline(
         require_published_at=require_published_at,
         feed_candidates_only=feed_candidates_only,
     )
+    pending = _order_pending_items_by_references(pending)
     _record_timing('load_pending_items', started)
     stats['pending_items'] = len(pending)
+    pending_item_ids = {str(item['id']) for item in pending}
 
     bumped_clusters: set[int] = set()
     recall_cosine_min = _recall_floor(
@@ -3036,6 +3191,14 @@ def run_pipeline(
 
     try:
         for item in pending:
+            referenced_pending_item_ids = (
+                set(_quoted_item_references(item)) & pending_item_ids
+            )
+            while referenced_pending_item_ids and any(
+                str(in_flight_item['id']) in referenced_pending_item_ids
+                for in_flight_item, _vec, _candidates, _future in in_flight
+            ):
+                _drain_oldest()
             new_vec = vu.unpack_blob(item['embedding'])
             if new_vec is None:
                 continue
@@ -3067,6 +3230,29 @@ def run_pipeline(
                 shadow_cosine_min=shadow_cosine_min,
                 gray_max_temporal_hours=gray_max_temporal_hours,
             )
+            explicit_reference_candidates = _recall_explicit_reference_clusters(
+                conn, item, new_vec,
+            )
+            if explicit_reference_candidates:
+                regular_by_id = {int(c['cluster_id']): c for c in candidates}
+                merged_candidates = []
+                for explicit in explicit_reference_candidates:
+                    cluster_id = int(explicit['cluster_id'])
+                    candidate = regular_by_id.pop(cluster_id, explicit)
+                    candidate['recall_band'] = 'explicit_reference'
+                    candidate['referenced_item_id'] = explicit.get('referenced_item_id')
+                    merged_candidates.append(candidate)
+                merged_candidates.extend(
+                    candidate for candidate in candidates
+                    if int(candidate['cluster_id']) in regular_by_id
+                )
+                candidates = merged_candidates
+                _log_event(
+                    'stage1_explicit_reference_candidates',
+                    item_id=item['id'],
+                    candidate_cluster_ids=[c['cluster_id'] for c in explicit_reference_candidates],
+                    referenced_item_ids=[c.get('referenced_item_id') for c in explicit_reference_candidates],
+                )
             candidates = candidates[: max(0, int(top_k))]
             if shadow_candidates:
                 _log_event(

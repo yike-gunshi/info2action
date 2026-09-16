@@ -49,6 +49,21 @@ const fullSummary: AdminConsoleSummary = {
   },
 }
 
+const trafficSummary: AdminConsoleSummary = {
+  ...fullSummary,
+  traffic: {
+    available: true,
+    source: 'cloudflare',
+    generated_at: '2026-07-25T22:00:00+08:00',
+    uv_avg_7d: 139,
+    uv_avg_30d: 113,
+    pv_7d: 6400,
+    pv_30d: 31339,
+    uv_trend_30d: Array.from({ length: 30 }, (_, i) => ({ date: `2026-07-0${(i % 9) + 1}`, value: 80 + i })),
+    pv_trend_30d: Array.from({ length: 30 }, (_, i) => ({ date: `2026-07-0${(i % 9) + 1}`, value: 300 + i * 10 })),
+  },
+}
+
 describe('OverviewTab', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -70,6 +85,33 @@ describe('OverviewTab', () => {
     expect(screen.getByText(/未知/)).toBeInTheDocument()
     // 异常摘要
     expect(screen.getByText(/xiaohongshu 最近抓取 26h 前/)).toBeInTheDocument()
+  })
+
+  it('站点流量：traffic available 渲染 UV/PV 卡与含未注册口径', async () => {
+    vi.mocked(getAdminConsoleSummary).mockResolvedValue(trafficSummary)
+    render(<OverviewTab reloadSignal={0} onOpenRuns={() => {}} />)
+
+    expect(await screen.findByText('站点流量')).toBeInTheDocument()
+    expect(screen.getByText('日均 UV · 7 日')).toBeInTheDocument()
+    expect(screen.getByText('日均 UV · 30 日')).toBeInTheDocument()
+    expect(screen.getByText('页面浏览 · 7 日')).toBeInTheDocument()
+    // 日均UV(7日)=139
+    expect(screen.getByText('139')).toBeInTheDocument()
+    // 必须标明含未注册访客（这是本功能的意义所在）
+    expect(screen.getAllByText(/含未注册访客/).length).toBeGreaterThanOrEqual(1)
+    // 独立访客趋势面板
+    expect(screen.getByText('独立访客 · 30 日')).toBeInTheDocument()
+  })
+
+  it('站点流量降级：未配置 CF 时显示提示而非报错', async () => {
+    vi.mocked(getAdminConsoleSummary).mockResolvedValue({
+      ...fullSummary,
+      traffic: { available: false, reason: 'not_configured' },
+    })
+    render(<OverviewTab reloadSignal={0} onOpenRuns={() => {}} />)
+
+    expect(await screen.findByText('站点流量')).toBeInTheDocument()
+    expect(screen.getByText(/未配置 CF_API_TOKEN/)).toBeInTheDocument()
   })
 
   it('降级态：available:false 显示需连接远程数据源', async () => {

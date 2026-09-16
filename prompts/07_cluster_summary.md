@@ -45,6 +45,16 @@ info2action 是面向 AI/科技从业者、内容创作者和产品构建者的�
 
 不要把 item 级 AI 摘要当作事实来源；如果输入中意外出现 AI 摘要、分类、关键词等加工字段，应优先以原文 body 为事实依据。
 
+## 信源归属
+
+- 成员 header 可能包含 `source_role=original`、`source_role=commentary` 或 `source_role=source`。
+- `source_role=original` 表示被其他成员明确引用的原帖；它是原作者观点与行为的首要真相源。
+- `source_role=commentary` 表示转述、评论或二次分享。该成员 `body` 中的第一人称内容归当前成员作者，不能归给被引用作者。
+- commentary 中若有 `quoted_item_id`、`quoted_author` 与 `quoted_original_body`，只把 `quoted_original_body` 归给原作者；commentary 自己新增的工具名、体验和判断必须明确归给转述者。
+- 标题优先表达原帖的核心事件。转述者新增内容只有在确有信息价值时才进入正文，并写清归属；不得把转述者使用的产品或工作流写成原作者发布、推荐或采用。
+- 人物身份、任职经历、机构关系和头衔也必须来自输入原文；即使你知道相关背景，也不得自行补充。输入只给姓名时，输出也只写姓名，禁止擅加“AI 研究员”“AI 专家”“教授”“创始人”等身份修饰。
+- `source_role`、`quoted_item_id` 等是内部判断标签，只用于理解归属，禁止原样写入 title、why_read、summary、breakdown 或“关键信息”。
+
 ## 输出说明
 
 只输出严格 JSON，不要 markdown 代码块，不要解释。

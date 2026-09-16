@@ -1,5 +1,8 @@
 from datetime import datetime
+import pathlib
 import time
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def test_seconds_until_next_half_hour_targets_wall_clock_ticks():
@@ -85,3 +88,56 @@ def test_scheduler_skips_tick_when_fetch_already_running():
     scheduler.stop()
 
     assert calls == []
+
+
+def test_global_fetch_poll_seconds_defaults_and_reads_env(monkeypatch):
+    from backend_fetch_scheduler import global_fetch_poll_seconds
+
+    monkeypatch.delenv("INFO2ACTION_BACKEND_FETCH_POLL_SECONDS", raising=False)
+    assert global_fetch_poll_seconds() == 30.0
+
+    monkeypatch.setenv("INFO2ACTION_BACKEND_FETCH_POLL_SECONDS", "45")
+    assert global_fetch_poll_seconds() == 45.0
+
+    # 非法值回退默认，避免打错配置把调度器卡死
+    monkeypatch.setenv("INFO2ACTION_BACKEND_FETCH_POLL_SECONDS", "abc")
+    assert global_fetch_poll_seconds() == 30.0
+    monkeypatch.setenv("INFO2ACTION_BACKEND_FETCH_POLL_SECONDS", "0")
+    assert global_fetch_poll_seconds() == 30.0
+
+
+def test_scheduler_retries_after_skip_instead_of_dropping_the_slot():
+    """上一轮超时不再吞掉下一轮:should_start 一转 true 就起,不等下一个墙钟刻度。"""
+    from backend_fetch_scheduler import BackendFetchScheduler
+
+    calls = []
+    running = {"value": True}
+    probes = {"count": 0}
+
+    def _should_start():
+        probes["count"] += 1
+        # 第一次轮询时上一轮还在跑,第二次才结束
+        if probes["count"] >= 2:
+            running["value"] = False
+        return not running["value"]
+
+    scheduler = BackendFetchScheduler(
+        lambda source: calls.append(source) or {"ok": True},
+        should_start=_should_start,
+        sleep_until_next_tick=lambda: 0.01,
+    )
+
+    scheduler.start()
+    time.sleep(2.5)
+    scheduler.stop()
+
+    assert calls, "上一轮结束后调度器应当补起下一轮,而不是丢弃这个槽位"
+    assert probes["count"] >= 2
+
+
+def test_app_global_fetch_scheduler_polls_instead_of_aligning_wall_clock():
+    """全局抓取改为轮询式:墙钟对齐会让超时的一轮吞掉下一个刻度。"""
+    text = (ROOT / "src" / "app.py").read_text()
+
+    assert "global_fetch_poll_seconds" in text
+    assert "seconds_until_next_interval(fetch_tick_minutes)" not in text

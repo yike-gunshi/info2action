@@ -14,7 +14,7 @@ from prompt_loader import load_prompt
 
 
 PROMPT_FILE = "14_item_verdict_v3_1.md"
-PROMPT_VERSION = "item_verdict_v3_8_veto_dimension_2026_07_10"
+PROMPT_VERSION = "item_verdict_v3_9_0_reach_gate_2026_08_01"
 
 VALID_VERDICTS = {"featured", "borderline", "drop"}
 VALID_VALUE_PATHS = {"substantive", "major_event", "lead_value", "none"}
@@ -142,8 +142,26 @@ def normalize_verdict_result(raw: str | dict[str, Any]) -> dict[str, Any]:
     scores: dict[str, Any] = {key: _coerce_score(scores_raw.get(key)) for key in VALID_SCORE_KEYS}
     if veto is not None:
         scores["veto"] = veto  # 寄生 highlight_scores jsonb 落库，复盘查 ->>'veto'
+    reach_value = None
+    reach_raw = obj.get("reach")
+    if not isinstance(reach_raw, bool):
+        try:
+            reach_number = float(reach_raw)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if reach_number in (1.0, 2.0, 3.0):
+                reach_value = int(reach_number)
+    if reach_value is not None:
+        scores["reach"] = reach_value
     cluster_verdict = _cluster_verdict(verdict, value_path, uncertainty)
     include = cluster_verdict in {"featured", "positive_borderline"}
+    reason = str(obj.get("reason") or "").strip()[:1000]
+    if reach_value == 1 and include:
+        verdict = "drop"
+        cluster_verdict = "drop"
+        include = False
+        reason = f"[reach_guard] {reason}"
     spam = obj.get("spam")
     try:
         spam_value = max(1, min(3, int(round(float(spam)))))
@@ -158,7 +176,7 @@ def normalize_verdict_result(raw: str | dict[str, Any]) -> dict[str, Any]:
         "highlight_value_path": value_path,
         "highlight_uncertainty": uncertainty,
         "highlight_include_in_highlights": include,
-        "highlight_reason": str(obj.get("reason") or "").strip()[:1000],
+        "highlight_reason": reason,
         "highlight_scores": scores,
         "highlight_veto": veto,
         "highlight_ai_relevant": ai_relevant,

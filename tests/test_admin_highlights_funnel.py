@@ -132,6 +132,30 @@ def _panorama_row(**overrides):
     return row
 
 
+@pytest.mark.parametrize(
+    ("scores", "expected"),
+    [
+        ({"v26": {"reach": 1}}, 1),
+        ({"v26": {"reach": "2"}}, 2),
+        ({"v26": {"reach": 3.0}}, 3),
+        ({"v26": {}}, None),
+        ({"v26": {"reach": "wide"}}, None),
+    ],
+)
+def test_admin_highlights_payloads_normalize_reach(scores, expected):
+    member = dict(_panorama_row()["members"][0], highlight_scores=scores)
+
+    cluster_payload = remote_db._admin_highlights_cluster_payload(
+        _panorama_row(members=[member])
+    )
+    item_payload = remote_db._admin_highlights_item_payload(
+        {"id": "item-1", "highlight_scores": scores}, anomaly=False
+    )
+
+    assert cluster_payload["members"][0]["reach"] == expected
+    assert item_payload["reach"] == expected
+
+
 def test_funnel_counts_reuse_shared_display_condition_and_accept_three_days(monkeypatch):
     conn = _FunnelConn(
         counts={
@@ -765,7 +789,13 @@ def test_override_writer_bumps_cluster_before_transaction_commit(monkeypatch, ac
 
 
 def test_old_station_diff_types_and_calls_are_deleted():
-    source = open("frontend-react/src/lib/api.ts", encoding="utf-8").read()
+    # api.ts 已拆为 facade + lib/api/ 分段文件，守卫断言覆盖整个拆分结构。
+    import glob
+
+    paths = ["frontend-react/src/lib/api.ts"] + sorted(
+        glob.glob("frontend-react/src/lib/api/*.ts")
+    )
+    source = "".join(open(path, encoding="utf-8").read() for path in paths)
 
     assert "`station:${AdminHighlightsStationKey}`" not in source
     assert "`diff:${AdminHighlightsDiffKey}`" not in source

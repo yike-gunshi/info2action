@@ -16,7 +16,7 @@ DATA_DIR = os.environ.get("INFO2ACTION_DATA_DIR") or os.path.join(BASE, "data")
 LARK_CLI = (
     os.environ.get("LARK_CLI")
     or shutil.which("lark-cli")
-    or os.path.expanduser("~/claudecode_workspace/工具/lark-cli/lark-cli")
+    or os.path.expanduser("~/claudecode_workspace/项目/第三方/lark-cli/lark-cli")
 )
 LARK_DOC_IDENTITY = (os.environ.get("LARK_DOC_IDENTITY") or "bot").strip() or "bot"
 LARK_DOC_API_VERSION = (os.environ.get("LARK_DOC_API_VERSION") or "v1").strip() or "v1"

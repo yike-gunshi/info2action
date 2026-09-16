@@ -4,8 +4,8 @@
  */
 // 用户决策（2026-05-12）：频道页/推荐页 section 顺序统一
 // 前 7 项 = 用户给定优先序：X 公众号 AGI之路 GitHub Reddit RSS HN
-// 后 2 项 = 用户未列出的（B 站 / Manual）按当前活跃度拼末尾
+// Manual 作为补充来源放在末尾；B 站不在信息页展示。
 export const PLATFORM_ORDER = [
   'twitter', 'lingowhale', 'waytoagi', 'github', 'reddit', 'rss', 'hackernews',
-  'bilibili', 'manual',
+  'manual',
 ]

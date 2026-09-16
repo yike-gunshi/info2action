@@ -1051,6 +1051,62 @@ class TestMemberDocCollection:
         assert 't.co' not in header
         assert 'x.com/source' not in header
 
+    def test_collect_member_docs_separates_quoted_original_from_commentary(self, tmp_db, monkeypatch):
+        monkeypatch.setattr(sw.remote_db, 'cluster_to_remote', lambda: False)
+        cid = _seed_cluster_with_members(tmp_db, doc_count=0)
+        tmp_db.execute(
+            """INSERT INTO items (id, platform, source, fetched_at, title,
+                                  content, author_name, url)
+               VALUES (?, ?, ?, '2026-07-21T16:53:55Z', ?, ?, ?, ?)""",
+            (
+                '2079610838143623371',
+                'twitter',
+                'user:karpathy',
+                'One pattern I find useful for working with LLMs',
+                'Use voice and ramble for 10 minutes.',
+                'Andrej Karpathy',
+                'https://x.com/karpathy/status/2079610838143623371',
+            ),
+        )
+        tmp_db.execute(
+            """INSERT INTO items (id, platform, source, fetched_at, title,
+                                  content, author_name, url, detail_json)
+               VALUES (?, ?, ?, '2026-07-21T16:57:50Z', ?, ?, ?, ?, ?)""",
+            (
+                '2079611821494092225',
+                'twitter',
+                'user:MinLiBuilds',
+                '失踪人口回归，karpathy 回来了',
+                '我喜欢用豆包输入法，再让 AI 组织成我的意图。',
+                '实践哥MinLi',
+                'https://x.com/MinLiBuilds/status/2079611821494092225',
+                json.dumps({
+                    'quotedTweet': {
+                        'id': '2079610838143623371',
+                        'text': 'Use voice and ramble for 10 minutes.',
+                        'author': {'name': 'Andrej Karpathy', 'screenName': 'karpathy'},
+                    },
+                }, ensure_ascii=False),
+            ),
+        )
+        tmp_db.execute(
+            """INSERT INTO cluster_items (cluster_id, item_id, rank_in_cluster,
+                                         is_primary_source)
+               VALUES (?, '2079610838143623371', 0, 1),
+                      (?, '2079611821494092225', 1, 0)""",
+            (cid, cid),
+        )
+        tmp_db.commit()
+
+        segs = sw._collect_member_docs(tmp_db, cid, limit=5)
+        joined = '\n---\n'.join(segs)
+
+        assert 'source_role=original' in joined
+        assert 'source_role=commentary' in joined
+        assert 'quoted_item_id=2079610838143623371' in joined
+        assert 'quoted_author=Andrej Karpathy' in joined
+        assert '豆包输入法' in joined
+
 
 class TestClusterSummaryPrompt:
     def test_prompt_asks_for_dense_event_brief_not_short_abstract(self):
@@ -1073,6 +1129,18 @@ class TestClusterSummaryPrompt:
         assert '最多 1 级' in prompt
         assert '必须' in prompt and '加粗' in prompt
         assert '"key_points"' not in prompt
+
+    def test_prompt_requires_source_ownership_and_original_priority(self):
+        prompt = sw.load_prompt('07_cluster_summary.md', cluster_docs='DOCS')
+
+        assert prompt is not None
+        assert 'source_role=original' in prompt
+        assert 'source_role=commentary' in prompt
+        assert '第一人称' in prompt
+        assert '标题' in prompt and '转述者' in prompt
+        assert '人物身份' in prompt and '不得自行补充' in prompt
+        assert 'AI 研究员' in prompt
+        assert '内部判断标签' in prompt and '禁止原样写入' in prompt
 
 
 class TestCheckInvalidWarnings:

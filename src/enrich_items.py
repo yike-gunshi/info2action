@@ -36,6 +36,7 @@ import highlight_verdict
 import remote_db
 import generate_summaries
 import score_items
+import summary_evidence
 from env_utils import load_project_env
 from prompt_loader import load_prompt
 
@@ -62,7 +63,7 @@ _DEFAULT_MINIMAX_CHAT_MODEL = "MiniMax-M3"
 MINIMAX_429_MAX_RETRIES = 8
 MINIMAX_429_BASE_DELAY = 2.0
 MINIMAX_429_MAX_DELAY = 60.0
-ENRICH_RETRY_BACKLOG_LIMIT_DEFAULT = 500
+ENRICH_RETRY_BACKLOG_LIMIT_DEFAULT = 20
 ENRICH_RETRY_LOOKBACK_HOURS_DEFAULT = 72.0
 REMOTE_DB_TRANSIENT_ATTEMPTS_DEFAULT = 3
 REMOTE_DB_TRANSIENT_MAX_DELAY_SEC = 5.0
@@ -120,6 +121,21 @@ def _retry_window_start_iso() -> str | None:
     if hours <= 0:
         return None
     return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+
+def _retry_backlog_limit() -> int:
+    limit = _positive_int_env(
+        "INFO2ACTION_ENRICH_RETRY_BACKLOG_LIMIT",
+        ENRICH_RETRY_BACKLOG_LIMIT_DEFAULT,
+    )
+    if limit <= 0:
+        print(
+            "WARNING: Enrichment retry backlog disabled: "
+            "INFO2ACTION_ENRICH_RETRY_BACKLOG_LIMIT=0; "
+            "expired failures from earlier runs will not be retried",
+            flush=True,
+        )
+    return limit
 
 
 def _remote_db_transient_attempts() -> int:
@@ -789,15 +805,69 @@ def _extract_github_readme(item: dict) -> str:
     return readme
 
 
+def _detail_dict(item: dict) -> dict:
+    detail_raw = item.get("detail_json")
+    if not detail_raw:
+        return {}
+    try:
+        detail = json.loads(detail_raw) if isinstance(detail_raw, str) else detail_raw
+    except (ValueError, TypeError):
+        return {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def _quoted_tweet_section(detail: dict, *, text_limit: int | None = None) -> str:
+    quoted = detail.get("quotedTweet")
+    if not isinstance(quoted, dict):
+        return ""
+    text = quoted.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    author = quoted.get("author")
+    author_label = ""
+    if isinstance(author, dict):
+        name = str(author.get("name") or "").strip()
+        handle = str(
+            author.get("screenName")
+            or author.get("screen_name")
+            or author.get("username")
+            or ""
+        ).strip().lstrip("@")
+        if name and handle:
+            author_label = f"{name} (@{handle})"
+        else:
+            author_label = name or (f"@{handle}" if handle else "")
+
+    metadata = []
+    if author_label:
+        metadata.append(f"作者：{author_label}")
+    quoted_id = str(quoted.get("id") or "").strip()
+    if quoted_id:
+        metadata.append(f"item_id：{quoted_id}")
+    suffix = f"；{'；'.join(metadata)}" if metadata else ""
+    quoted_text = text.strip()
+    if text_limit is not None:
+        quoted_text = quoted_text[:text_limit]
+    return f"【引用原帖{suffix}】\n{quoted_text}"
+
+
+def _append_quoted_context(base: str, item: dict, detail: dict) -> str:
+    quoted_section = _quoted_tweet_section(detail)
+    if not quoted_section:
+        return base
+    current_author = str(item.get("author_name") or "未知作者").strip()
+    return f"【当前帖正文；作者：{current_author}】\n{base}\n\n{quoted_section}"
+
+
 def build_item_content(item: dict, *, content_char_limit: int = 12000) -> str:
     title = item.get("title") or ""
     content = item.get("content") or ""
     asr_text = item.get("asr_text") or ""
     enriched_text = ""
-    detail_raw = item.get("detail_json")
-    if detail_raw:
+    detail = _detail_dict(item)
+    if detail:
         try:
-            detail = json.loads(detail_raw) if isinstance(detail_raw, str) else detail_raw
             for ref in detail.get("referenced_urls", []):
                 full_text = ref.get("full_text", "")
                 if full_text and len(full_text) > 100:
@@ -819,7 +889,7 @@ def build_item_content(item: dict, *, content_char_limit: int = 12000) -> str:
             f"{meta_text}\n标题: {title}\n视频简介/正文: {content or '(无)'}\n\n"
             f"ASR transcript:\n{asr_text}"
         )
-        return body[:200000]
+        return _append_quoted_context(body[:200000], item, detail)
 
     base = f"{meta_text}\n标题: {title}\n正文: {content or ''}{enriched_text}"[:content_char_limit]
 
@@ -833,9 +903,28 @@ def build_item_content(item: dict, *, content_char_limit: int = 12000) -> str:
             item.get("id"),
             len(truncated),
         )
-        return f"{base}\n\n【完整 README】\n{truncated}"
+        return _append_quoted_context(
+            f"{base}\n\n【完整 README】\n{truncated}",
+            item,
+            detail,
+        )
 
-    return base
+    return _append_quoted_context(base, item, detail)
+
+
+def build_item_content_with_evidence(
+    item: dict,
+    *,
+    content_char_limit: int = 12000,
+) -> tuple[str, dict]:
+    """Build the LLM input and a privacy-safe manifest from the same item."""
+    content = build_item_content(item, content_char_limit=content_char_limit)
+    evidence = summary_evidence.build_item_summary_evidence(item)
+    logger.info(
+        "summary_input_evidence=%s",
+        json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+    )
+    return content, evidence
 
 
 def build_item_content_v26(item: dict) -> str:
@@ -856,12 +945,6 @@ def build_item_content_v26(item: dict) -> str:
         base_item["detail_json"] = base_detail
 
     sections = [build_item_content(base_item)]
-    quoted_tweet = detail.get("quotedTweet")
-    if isinstance(quoted_tweet, dict):
-        quoted_text = quoted_tweet.get("text")
-        if isinstance(quoted_text, str) and quoted_text.strip():
-            sections.append(f"quoted: {quoted_text.strip()}")
-
     if (item.get("platform") or "").lower() == "github":
         readme = detail.get("readme")
         if isinstance(readme, str) and readme.strip():
@@ -882,7 +965,13 @@ def _minimal_item_content(item: dict) -> str:
     content = (item.get("content") or "").strip()
     if len(content) > 280:
         content = content[:280]
-    return f"{meta_text}\n标题: {title}\n正文摘要输入: {content}".strip()
+    base = f"{meta_text}\n标题: {title}\n正文摘要输入: {content}".strip()
+    detail = _detail_dict(item)
+    quoted_section = _quoted_tweet_section(detail, text_limit=600)
+    if not quoted_section:
+        return base
+    current_author = str(item.get("author_name") or "未知作者").strip()
+    return f"【当前帖正文；作者：{current_author}】\n{base}\n\n{quoted_section}"
 
 
 def _provider_failure_fallback(item: dict, valid_category_ids: list[str]) -> dict:
@@ -929,13 +1018,10 @@ def batch_group_key(item: dict) -> str:
 
 
 def build_batch_content(items: list[dict]) -> str:
-    payload = [
-        {
-            "id": item["id"],
-            "content": build_item_content(item),
-        }
-        for item in items
-    ]
+    payload = []
+    for item in items:
+        content, _evidence = build_item_content_with_evidence(item)
+        payload.append({"id": item["id"], "content": content})
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -1233,6 +1319,15 @@ def enrich_highlight_score_v26_for_item(
             score10,
             threshold,
         )
+        if (
+            result["is_flag_bearer"]
+            and result.get("reach") == 1
+            and result.get("value_path") != "major_event"
+        ):
+            result["is_flag_bearer"] = False
+            reason = str(result.get("reason") or "")
+            if not reason.startswith("[reach_guard] "):
+                result["reason"] = f"[reach_guard] {reason}"
         if not dry_run:
             write_highlight_score_v26_current(item["id"], result, threshold)
         return result
@@ -1330,7 +1425,7 @@ def enrich_one_item(
     valid_l2_by_l1=None,
     rate_gate: MiniMaxRateLimitGate | None = None,
 ):
-    content = build_item_content(item)
+    content, _evidence = build_item_content_with_evidence(item)
     if len(re.sub(r"\s+", "", content)) < 15:
         if not dry_run:
             record_failure(item["id"], "content_too_short", retry_after=24 * 3600, increment=False)
@@ -1570,10 +1665,7 @@ def main() -> int:
             require_published_at=args.window_require_published_at,
         )
         if args.run_id is not None and ids is None:
-            retry_limit = _positive_int_env(
-                "INFO2ACTION_ENRICH_RETRY_BACKLOG_LIMIT",
-                ENRICH_RETRY_BACKLOG_LIMIT_DEFAULT,
-            )
+            retry_limit = _retry_backlog_limit()
             retry_window_start = args.window_start or _retry_window_start_iso()
             if retry_limit > 0 and retry_window_start:
                 retry_items = query_pending_enrichment_items_remote_with_retry(
@@ -1606,10 +1698,7 @@ def main() -> int:
         )
         items = [dict(row) for row in rows]
         if args.run_id is not None and ids is None:
-            retry_limit = _positive_int_env(
-                "INFO2ACTION_ENRICH_RETRY_BACKLOG_LIMIT",
-                ENRICH_RETRY_BACKLOG_LIMIT_DEFAULT,
-            )
+            retry_limit = _retry_backlog_limit()
             retry_window_start = args.window_start or _retry_window_start_iso()
             if retry_limit > 0 and retry_window_start:
                 retry_rows = query_pending_items(

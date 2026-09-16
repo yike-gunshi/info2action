@@ -78,7 +78,7 @@ describe('eventsStore.init', () => {
       page: 1,
       limit: 20,
       categories: [],
-      timezoneOffsetMinutes: expect.any(Number),
+      timezoneOffsetMinutes: -480,
     })
     expect(s.cursor).toBe(2)
     expect(s.snapshotVersion).toBe(10) // 取首发时间倒排后首条 event.id
@@ -132,13 +132,13 @@ describe('eventsStore.init', () => {
       page: 1,
       limit: 20,
       categories: [],
-      timezoneOffsetMinutes: expect.any(Number),
+      timezoneOffsetMinutes: -480,
     })
     expect(fetchEvents).toHaveBeenNthCalledWith(2, expect.objectContaining({
       page: 1,
       limit: 20,
       categories: [],
-      timezoneOffsetMinutes: expect.any(Number),
+      timezoneOffsetMinutes: -480,
       fetchedSince: expect.any(String),
     }))
     expect(useEventsStore.getState().events.map((event) => event.id)).toEqual([20])
@@ -197,7 +197,7 @@ describe('eventsStore.loadMore', () => {
       page: cursor,
       limit: 20,
       categories: [],
-      timezoneOffsetMinutes: expect.any(Number),
+      timezoneOffsetMinutes: -480,
     })
     expect(useEventsStore.getState().events.map((e) => e.id)).toEqual([2, 1])
   })
@@ -244,7 +244,7 @@ describe('eventsStore.refresh', () => {
       page: 1,
       limit: 20,
       categories: [],
-      timezoneOffsetMinutes: expect.any(Number),
+      timezoneOffsetMinutes: -480,
     })
     expect(useEventsStore.getState().refreshHint).toBe('已是最新')
   })
@@ -271,7 +271,7 @@ describe('eventsStore.setFilters', () => {
       page: 1,
       limit: 20,
       categories: ['products'],
-      timezoneOffsetMinutes: expect.any(Number),
+      timezoneOffsetMinutes: -480,
     })
 
     pending.resolve({
@@ -430,6 +430,59 @@ describe('eventsStore.searchClusters / clearSearch', () => {
 })
 
 describe('eventsStore.markSeen (v15.1 R7.1)', () => {
+  it('batch 状态用 clicked_at 判定已打开，并覆盖 last_seen_version', () => {
+    useEventsStore.setState({ events: [makeEvent(1, { has_update: true, last_seen_version: null, live_version: 4 })] })
+    useEventsStore.getState().applyReadStatuses([{ cluster_id: 1, clicked_at: '2026-07-23T12:00:00Z', last_seen_version: 4 }])
+    const event = useEventsStore.getState().events[0]
+    expect(event.clicked_at).toBe('2026-07-23T12:00:00Z')
+    expect(event.last_seen_version).toBe(4)
+    expect(event.has_update).toBe(false)
+  })
+  it('click 失败时回滚乐观已读并记录同步错误', () => {
+    useEventsStore.setState({ events: [makeEvent(1, { has_update: true, last_seen_version: 1, live_version: 2 })] })
+    useEventsStore.getState().markSeen(1)
+    useEventsStore.getState().rollbackSeen(1)
+    const state = useEventsStore.getState()
+    expect(state.events[0].last_seen_version).toBe(1)
+    expect(state.events[0].has_update).toBe(true)
+    expect(state.readSyncErrors[1]).toBe(true)
+    expect(state.readSnapshots[1]).toBeUndefined()
+  })
+
+  it('retry 成功确认后保留已读并清除同步错误和回滚快照', () => {
+    useEventsStore.setState({ events: [makeEvent(1, { has_update: true, last_seen_version: 1, live_version: 2 })] })
+    useEventsStore.getState().markSeen(1)
+    useEventsStore.getState().rollbackSeen(1)
+    useEventsStore.getState().markSeen(1)
+    useEventsStore.getState().confirmSeen(1)
+    expect(useEventsStore.getState().readSyncErrors[1]).toBeUndefined()
+    expect(useEventsStore.getState().readSnapshots[1]).toBeUndefined()
+    expect(useEventsStore.getState().events[0].last_seen_version).toBe(2)
+  })
+
+  it('已读卡片再次打开失败时不会被旧快照回滚成未读', () => {
+    useEventsStore.setState({ events: [makeEvent(1, { has_update: true, last_seen_version: 1, live_version: 2 })] })
+    useEventsStore.getState().markSeen(1)
+    useEventsStore.getState().confirmSeen(1)
+    useEventsStore.getState().markSeen(1)
+    useEventsStore.getState().rollbackSeen(1)
+
+    const event = useEventsStore.getState().events[0]
+    expect(event.last_seen_version).toBe(2)
+    expect(event.has_update).toBe(false)
+  })
+
+  it('批量旧响应不会覆盖正在写入的乐观已读状态', () => {
+    useEventsStore.setState({ events: [makeEvent(1, { has_update: true, last_seen_version: null, live_version: 2 })] })
+    useEventsStore.getState().markSeen(1)
+    useEventsStore.getState().applyReadStatuses([
+      { cluster_id: 1, clicked_at: null, last_seen_version: null },
+    ])
+
+    const event = useEventsStore.getState().events[0]
+    expect(event.last_seen_version).toBe(2)
+    expect(event.has_update).toBe(false)
+  })
   it('乐观更新 events: has_update=false + last_seen_version=live_version', () => {
     useEventsStore.setState({
       events: [
@@ -446,13 +499,12 @@ describe('eventsStore.markSeen (v15.1 R7.1)', () => {
     expect(s.events[1].last_seen_version).toBe(3)
   })
 
-  it('调用 markClusterSeen API 一次', () => {
+  it('仅更新本地已读状态，不额外调用 seen API', () => {
     useEventsStore.setState({
       events: [makeEvent(99, { live_version: 7, has_update: true })],
     })
     useEventsStore.getState().markSeen(99)
-    expect(markClusterSeen).toHaveBeenCalledTimes(1)
-    expect(markClusterSeen).toHaveBeenCalledWith(99)
+    expect(markClusterSeen).not.toHaveBeenCalled()
   })
 
   it('API 失败不抛异常（fire-and-forget swallow）', async () => {
@@ -484,10 +536,46 @@ describe('eventsStore.markSeen (v15.1 R7.1)', () => {
     expect(s.searchResults![0].last_seen_version).toBe(4)
   })
 
+  it('cluster 仅存在于 searchResults 时仍能失败回滚', () => {
+    useEventsStore.setState({
+      events: [],
+      searchResults: [
+        makeEvent(11, { live_version: 4, last_seen_version: 1, has_update: true }),
+      ],
+    })
+    useEventsStore.getState().markSeen(11)
+    useEventsStore.getState().rollbackSeen(11)
+
+    const event = useEventsStore.getState().searchResults![0]
+    expect(event.last_seen_version).toBe(1)
+    expect(event.has_update).toBe(true)
+  })
+
+  it('跨标签页已读不创建失败回滚快照', () => {
+    useEventsStore.setState({
+      events: [makeEvent(11, { live_version: 4, last_seen_version: 1, has_update: true })],
+    })
+    useEventsStore.getState().markSeen(11, false)
+
+    expect(useEventsStore.getState().events[0].last_seen_version).toBe(4)
+    expect(useEventsStore.getState().readSnapshots[11]).toBeUndefined()
+  })
+
   it('未命中 id 时不动 events', () => {
     const init = makeEvent(5, { has_update: true, last_seen_version: 0, live_version: 3 })
     useEventsStore.setState({ events: [init] })
     useEventsStore.getState().markSeen(999)
     expect(useEventsStore.getState().events[0]).toEqual(init)
+  })
+})
+
+describe('eventsStore.seekToCursor', () => {
+  it('按 cursor 拉取、按 id 合并并更新 next_cursor', async () => {
+    useEventsStore.setState({ events: [makeEvent(1)], cursor: 3 })
+    vi.mocked(fetchEvents).mockResolvedValueOnce({ enabled: true, events: [makeEvent(1), makeEvent(2)], next_cursor: 9 } as FeedEventsResponse)
+    await useEventsStore.getState().seekToCursor(7)
+    expect(fetchEvents).toHaveBeenCalledWith(expect.objectContaining({ page: 7, limit: 20, categories: [] }))
+    expect(useEventsStore.getState().events.map((event) => event.id)).toEqual([2, 1])
+    expect(useEventsStore.getState().cursor).toBe(9)
   })
 })

@@ -142,11 +142,18 @@ def connect(
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            conn = pg.connect(url, connect_timeout=30, application_name=application_name)
-            conn.execute("set statement_timeout = '30min'")
-            conn.execute("set lock_timeout = '30s'")
+            # 会话级 GUC 必须走连接 options：Supabase 的事务级连接池不会在归还
+            # 连接时重置会话状态，裸 SET 会把 read_only 泄漏给之后复用这条 server
+            # 连接的任何请求（2026-08-03 生产反馈写入随机失败即此因）。
+            options = "-c statement_timeout=1800000 -c lock_timeout=30000"
             if readonly:
-                conn.execute("set default_transaction_read_only = on")
+                options += " -c default_transaction_read_only=on"
+            conn = pg.connect(
+                url,
+                connect_timeout=30,
+                application_name=application_name,
+                options=options,
+            )
             return conn
         except pg.OperationalError as exc:
             last_exc = exc

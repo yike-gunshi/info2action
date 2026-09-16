@@ -38,7 +38,7 @@ async function flushMicrotasks() {
 
 describe('BF-0420-10: feedStore.startFetch reacts to backend result', () => {
   beforeEach(() => {
-    useFeedStore.setState({ isFetching: false, fetchProgress: null })
+    useFeedStore.setState({ isFetching: false, fetchProgress: null, platformSectionsLoaded: false })
     mockTrigger.mockReset()
     mockStatus.mockReset()
     mockFetchSections.mockReset()
@@ -56,7 +56,8 @@ describe('BF-0420-10: feedStore.startFetch reacts to backend result', () => {
     vi.useRealTimers()
   })
 
-  it('ok=true: toast.info 开始抓取 + 完成后 toast.success 带新增条数', async () => {
+  it.each([false, true])('ok=true: 完成提示带新增条数，仅刷新已加载的频道（loaded=%s）', async (platformSectionsLoaded) => {
+    useFeedStore.setState({ platformSectionsLoaded })
     mockTrigger.mockResolvedValue({ ok: true, msg: 'Global fetch: all sources' })
     mockStatus.mockResolvedValue({
       running: false,
@@ -76,7 +77,8 @@ describe('BF-0420-10: feedStore.startFetch reacts to backend result', () => {
 
     expect(mockToast.success).toHaveBeenCalledWith('抓取完成 · 新增 7 条')
     expect(useFeedStore.getState().isFetching).toBe(false)
-    expect(mockFetchPlatforms).toHaveBeenCalled()
+    expect(mockFetchSections).toHaveBeenCalledTimes(1)
+    expect(mockFetchPlatforms).toHaveBeenCalledTimes(platformSectionsLoaded ? 1 : 0)
   })
 
   it('运行中 progress 写入 store,并格式化为 阶段 · 平台 · 百分比', async () => {

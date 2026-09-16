@@ -20,6 +20,8 @@ interface EventCardProps {
   onPrefetch?: (id: number) => void
   timeLabel?: string
   isFirstInGroup?: boolean
+  readSyncError?: boolean
+  onRetry?: () => void
 }
 
 function formatEventClock(value?: string | null): string {
@@ -90,6 +92,8 @@ export const EventCard = memo(function EventCard({
   onPrefetch,
   timeLabel,
   isFirstInGroup = false,
+  readSyncError = false,
+  onRetry,
 }: EventCardProps) {
   const handleClick = () => onSelect(cluster.id, cluster)
   const handleKey = (e: React.KeyboardEvent) => {
@@ -137,14 +141,15 @@ export const EventCard = memo(function EventCard({
       data-testid="event-card"
       className={cn(
         'cv-auto-event group cursor-pointer outline-none',
-        'relative z-10 grid grid-cols-1 gap-y-2 border-b border-border/50 transition-[background-color,opacity] hover:bg-muted focus-visible:bg-muted sm:gap-y-0',
+        'relative z-10 grid gap-y-2 border-b border-border/50 transition-[background-color,opacity] hover:bg-muted focus-visible:bg-muted sm:gap-y-0',
+        showImage ? 'grid-cols-[minmax(0,1fr)_88px] gap-x-3' : 'grid-cols-1',
         'py-3.5 sm:py-4',
         gridColsClasses,
         isRead && 'opacity-60',
       )}
     >
       <div data-testid="event-card-layout" className="contents">
-        <div data-testid="event-time-column" className="self-start text-left sm:text-right">
+        <div data-testid="event-time-column" className="col-span-2 self-start text-left sm:col-span-1 sm:text-right">
           <time
             data-testid="event-time"
             dateTime={displayTime || undefined}
@@ -156,10 +161,13 @@ export const EventCard = memo(function EventCard({
 
         <div
           data-testid="event-content"
-          className="min-w-0 rounded-md py-0.5 transition-colors group-focus-visible:ring-2 group-focus-visible:ring-ring/35 sm:px-1"
+          className={cn(
+            'min-w-0 rounded-md py-0.5 transition-colors group-focus-visible:ring-2 group-focus-visible:ring-ring/35 sm:px-1',
+            isRead && 'text-muted-foreground',
+          )}
         >
-          <h3 className="flex min-w-0 items-baseline gap-2 font-event-title text-[18px] font-medium leading-[1.32] text-foreground sm:text-[20px] sm:font-semibold">
-            <span data-testid="event-title-text" className="min-w-0 line-clamp-2">
+          <h3 className="flex min-w-0 items-baseline gap-2 font-event-title text-[18px] font-medium leading-[1.42] text-foreground sm:text-[20px] sm:font-semibold sm:leading-[1.32]">
+            <span data-testid="event-title-text" className="-mb-[0.12em] min-w-0 pb-[0.12em] line-clamp-2 sm:mb-0 sm:pb-0">
               {showInlineCategory && (
                 <>
                   <span data-testid="event-category-label" className="text-[var(--brand)]">{categoryLabel}</span>
@@ -178,12 +186,18 @@ export const EventCard = memo(function EventCard({
               {summaryText}
             </p>
           )}
+          {readSyncError && (
+            <span className="mt-2 inline-flex items-center gap-1 text-[12px] text-destructive" data-testid="event-read-sync-error">
+              阅读状态未同步，可重试
+              <button type="button" aria-label="重试阅读状态同步" className="underline" onClick={(event) => { event.stopPropagation(); onRetry?.() }}>重试</button>
+            </span>
+          )}
         </div>
 
         {showImage && (
           <div
             data-testid="event-media-slot"
-            className="relative hidden min-h-0 w-[200px] justify-self-end self-stretch overflow-hidden rounded-md sm:block sm:w-[200px] lg:w-[200px]"
+            className="relative h-[56px] w-[88px] min-h-0 justify-self-end self-center overflow-hidden rounded-md sm:h-auto sm:w-[200px] sm:self-stretch lg:w-[200px]"
           >
             <EventMediaThumb
               cluster={cluster}

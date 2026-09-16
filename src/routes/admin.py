@@ -7,6 +7,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+import cf_analytics
 import db
 import remote_db
 from routes.auth import get_current_user
@@ -202,13 +203,22 @@ async def admin_console_summary(request: Request):
         return {'available': False, 'reason': 'remote_required'}
 
     try:
-        return await run_in_threadpool(remote_db.admin_console_summary_remote)
+        summary = await run_in_threadpool(remote_db.admin_console_summary_remote)
     except Exception as exc:
         return JSONResponse({
             'available': False,
             'reason': 'remote_error',
             'error': str(exc),
         }, status_code=503)
+
+    # Cloudflare 站点流量 (UV/PV, 含未注册访客)。外部 API，与 DB 解耦：
+    # 失败只置 traffic.available=False，绝不拖垮已取到的 C 端指标。
+    if isinstance(summary, dict) and summary.get('available'):
+        try:
+            summary['traffic'] = await run_in_threadpool(cf_analytics.fetch_traffic_summary)
+        except Exception as exc:  # defensive — fetch_traffic_summary is designed not to raise
+            summary['traffic'] = {'available': False, 'reason': 'cf_error', 'error': str(exc)[:200]}
+    return summary
 
 
 @router.get("/api/admin/highlights/funnel")

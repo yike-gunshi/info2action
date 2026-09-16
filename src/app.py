@@ -53,7 +53,7 @@ import db
 import remote_db
 from backend_fetch_scheduler import (
     BackendFetchScheduler, env_enabled, fetch_min_interval_seconds,
-    fetch_tick_interval_minutes, seconds_until_next_interval,
+    global_fetch_poll_seconds,
 )
 
 # ── Route imports ───────────────────────────────────────────
@@ -338,19 +338,18 @@ async def lifespan(app: FastAPI):
     if is_scheduler_leader and env_enabled('INFO2ACTION_BACKEND_HOURLY_FETCH'):
         fetch_min_interval = fetch_min_interval_seconds()
         fetch_start_with_cooldown = env_enabled('INFO2ACTION_BACKEND_FETCH_START_WITH_COOLDOWN')
-        fetch_tick_minutes = fetch_tick_interval_minutes()
+        fetch_poll_seconds = global_fetch_poll_seconds()
         fetch_scheduler = BackendFetchScheduler(
             fetch.start_global_fetch,
             should_start=lambda: not fetch.has_active_fetch_runs(),
-            sleep_until_next_tick=lambda: seconds_until_next_interval(fetch_tick_minutes),
+            sleep_until_next_tick=lambda: fetch_poll_seconds,
             min_interval_seconds=fetch_min_interval,
             start_with_cooldown=fetch_start_with_cooldown,
         )
         fetch_scheduler.start()
-        _tick_marks = ','.join(f'{m:02d}' for m in range(0, 60, fetch_tick_minutes))
         print(
             '   Backend fetch scheduler: enabled '
-            f'(minute={_tick_marks}; min_interval={fetch_min_interval / 60:.0f}m; '
+            f'(poll={fetch_poll_seconds:.0f}s; min_interval={fetch_min_interval / 60:.0f}m; '
             f'start_cooldown={fetch_start_with_cooldown})'
         )
     else:

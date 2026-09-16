@@ -31,7 +31,7 @@ def _header(req, name):
 
 
 def test_post_json_refreshes_token_and_retries_once(monkeypatch, tmp_path):
-    monkeypatch.setenv("INFO2ACTION_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("INFO2ACTION_LINGOWHALE_TOKEN_STORE", str(tmp_path / "lingowhale_tokens.json"))
     monkeypatch.setenv("LINGOWHALE_ACCESS_TOKEN", "A1")
     monkeypatch.setenv("LINGOWHALE_AUTH_TOKEN", "B1")
     monkeypatch.setenv("LINGOWHALE_BID", "b1")
@@ -90,7 +90,7 @@ def test_post_json_refreshes_token_and_retries_once(monkeypatch, tmp_path):
 
 
 def test_post_json_returns_original_token_error_when_refresh_fails(monkeypatch, tmp_path):
-    monkeypatch.setenv("INFO2ACTION_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("INFO2ACTION_LINGOWHALE_TOKEN_STORE", str(tmp_path / "lingowhale_tokens.json"))
     monkeypatch.setenv("LINGOWHALE_ACCESS_TOKEN", "A1")
     monkeypatch.setenv("LINGOWHALE_AUTH_TOKEN", "B1")
     monkeypatch.setenv("LINGOWHALE_BID", "b1")
@@ -118,7 +118,7 @@ def test_post_json_returns_original_token_error_when_refresh_fails(monkeypatch, 
 
 
 def test_current_headers_prefer_token_store_over_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("INFO2ACTION_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("INFO2ACTION_LINGOWHALE_TOKEN_STORE", str(tmp_path / "lingowhale_tokens.json"))
     monkeypatch.setenv("LINGOWHALE_ACCESS_TOKEN", "env-access")
     monkeypatch.setenv("LINGOWHALE_AUTH_TOKEN", "env-auth")
     monkeypatch.setenv("LINGOWHALE_BID", "env-bid")

@@ -9,6 +9,7 @@ const toggleClusterStar = vi.fn()
 const submitClusterFeedback = vi.fn()
 const originalClipboard = navigator.clipboard
 const originalExecCommand = document.execCommand
+const originalMatchMedia = window.matchMedia
 
 const cluster: ClusterDetail = {
   id: 42,
@@ -80,6 +81,10 @@ vi.mock('../ClusterActionZone', () => ({
   ClusterActionZone: () => null,
 }))
 
+vi.mock('../../detail/YoutubePlayer', () => ({
+  YoutubePlayer: ({ videoId }: { videoId: string }) => <div data-testid="cluster-media-youtube" data-video-id={videoId} />,
+}))
+
 describe('ClusterDetailPanel v19 rebuild', () => {
   afterEach(() => {
     cluster.ai_summary =
@@ -87,6 +92,7 @@ describe('ClusterDetailPanel v19 rebuild', () => {
       '【全文拆解】\n1. 能力边界\n- **能力边界** 是本轮讨论焦点\n2. 来源差异\n- 官博给出路线,社区补充影响范围'
     cluster.cover_url = null
     cluster.media_urls = []
+    cluster.media = []
     cluster.category = 'coding'
     cluster.platforms = ['twitter', 'rss', 'github']
     cluster.viewer_status = {
@@ -118,6 +124,10 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     Object.defineProperty(document, 'execCommand', {
       configurable: true,
       value: originalExecCommand,
+    })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: originalMatchMedia,
     })
     cleanup()
     closeModal.mockClear()
@@ -151,6 +161,206 @@ describe('ClusterDetailPanel v19 rebuild', () => {
 
     expect(screen.getByLabelText('关闭').parentElement).toHaveClass('w-8')
     expect(screen.getByLabelText('关闭').querySelector('svg')).toHaveClass('h-5', 'w-5')
+  })
+
+  it('ClusterMedia 的 MP4 按原始比例内联播放，有视频时下方仅显示独立图片条', () => {
+    cluster.media = [{ type: 'video', url: 'https://cdn.example/video.mp4', poster_url: 'https://cdn.example/poster.jpg', source_url: 'https://example.com/source' }]
+    cluster.media_urls = ['/images/a.jpg', '/images/b.jpg', '/images/c.jpg']
+
+    render(<ClusterDetailPanel />)
+
+    const video = screen.getByTestId('cluster-media-video')
+    expect(video).toHaveAttribute('controls')
+    expect(video).toHaveAttribute('playsinline')
+    expect(video).toHaveAttribute('preload', 'metadata')
+    expect(video).not.toHaveAttribute('autoplay')
+    expect(video.querySelector('source')).toHaveAttribute('src', 'https://cdn.example/video.mp4')
+    expect(video.style.aspectRatio).toBe('')
+    expect(video).toHaveStyle({ maxHeight: '56vh' })
+    expect(video.className).not.toContain('aspect-video')
+
+    const strip = screen.getByTestId('cluster-video-image-strip')
+    expect(strip).toHaveClass('overflow-x-auto', 'snap-x', 'snap-mandatory')
+    expect(screen.getAllByTestId('cluster-video-image')).toHaveLength(3)
+    expect(screen.queryByTestId('cluster-media-carousel-dot')).not.toBeInTheDocument()
+    expect(screen.queryByText(/\u5a92\u4f53\s*1\s*\/\s*4/)).not.toBeInTheDocument()
+
+    const previous = screen.getByRole('button', { name: '上一张图片' })
+    const next = screen.getByRole('button', { name: '下一张图片' })
+    expect(previous).toBeDisabled()
+    expect(next).not.toBeDisabled()
+    expect(previous).toHaveClass('h-11', 'w-11')
+    expect(next).toHaveClass('h-11', 'w-11')
+
+    const scrollTo = vi.fn()
+    Object.defineProperty(strip, 'scrollTo', { configurable: true, value: scrollTo })
+    Object.defineProperty(strip, 'offsetLeft', { configurable: true, value: 40 })
+    Object.defineProperty(strip.children[0], 'offsetLeft', { configurable: true, value: 72 })
+    Object.defineProperty(strip.children[1], 'offsetLeft', { configurable: true, value: 192 })
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn().mockReturnValue({ matches: true }),
+    })
+    fireEvent.click(next)
+    expect(scrollTo).toHaveBeenCalledWith({ left: 120, behavior: 'auto' })
+    expect(previous).not.toBeDisabled()
+    expect(next).not.toBeDisabled()
+    fireEvent.click(next)
+    expect(next).toBeDisabled()
+  })
+
+  it('Twitter 视频在事件弹窗内通过站内代理播放', () => {
+    const videoUrl = 'https://video.twimg.com/amplify_video/2092055358940577792/vid/avc1/1280x720/video.mp4'
+    cluster.media = [{
+      type: 'video',
+      url: videoUrl,
+      poster_url: '/api/media/twitter-poster/2092055394852159836.jpg',
+      source_url: 'https://x.com/alex_verem/status/2092055394852159836',
+    }]
+    sources[0].item_id = '2092055394852159836'
+    sources[0].platform = 'twitter'
+    sources[0].media = [{
+      type: 'video',
+      url: videoUrl,
+      poster_url: '/api/media/twitter-poster/2092055394852159836.jpg',
+      source_url: 'https://x.com/alex_verem/status/2092055394852159836',
+    }]
+
+    render(<ClusterDetailPanel />)
+
+    expect(screen.getByTestId('cluster-media-video').querySelector('source')).toHaveAttribute(
+      'src',
+      '/api/media/twitter-mp4/2092055394852159836',
+    )
+  })
+
+  it('图片条用首张图片作为滚动局部原点计算当前项', () => {
+    cluster.media = [{ type: 'video', url: 'https://cdn.example/video.mp4', source_url: 'https://example.com/source' }]
+    cluster.media_urls = ['/images/a.jpg', '/images/b.jpg', '/images/c.jpg']
+
+    render(<ClusterDetailPanel />)
+
+    const strip = screen.getByTestId('cluster-video-image-strip')
+    const images = screen.getAllByTestId('cluster-video-image')
+    Object.defineProperty(strip, 'offsetLeft', { configurable: true, value: 40 })
+    Object.defineProperty(images[0], 'offsetLeft', { configurable: true, value: 72 })
+    Object.defineProperty(images[1], 'offsetLeft', { configurable: true, value: 192 })
+    Object.defineProperty(images[2], 'offsetLeft', { configurable: true, value: 312 })
+    Object.defineProperty(strip, 'scrollLeft', { configurable: true, value: 65 })
+
+    fireEvent.scroll(strip)
+
+    expect(screen.getByRole('button', { name: '上一张图片' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: '下一张图片' })).not.toBeDisabled()
+  })
+
+  it('兼容旧响应：生成型视频海报不会进入图片条', () => {
+    cluster.media = [{
+      type: 'video',
+      url: 'https://cdn.example/video.mp4',
+      poster_url: '/images/cluster-poster.jpg',
+      source_url: 'https://example.com/source',
+    }]
+    cluster.cover_url = '/api/media/twitter-poster/2092055394852159836.jpg'
+    cluster.media_urls = [
+      '/images/cluster-poster.jpg',
+      '/api/media/twitter-poster/2092055394852159836.jpg',
+      '/images/other-source.jpg',
+    ]
+    sources[0].media = [{
+      type: 'embed',
+      url: 'https://example.com/embed',
+      poster_url: '/video_posters/source.jpg',
+      source_url: 'https://example.com/source-2',
+    }]
+    sources[0].media_urls = ['/video_posters/source.jpg']
+
+    render(<ClusterDetailPanel />)
+
+    expect(screen.getByTestId('cluster-media-video')).toBeInTheDocument()
+    const images = screen.getAllByTestId('cluster-video-image')
+    expect(images).toHaveLength(1)
+    expect(images[0].querySelector('img')).toHaveAttribute('src', '/images/other-source.jpg')
+    expect(screen.queryByRole('button', { name: '上一张图片' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '下一张图片' })).not.toBeInTheDocument()
+  })
+
+  it('视频下方单张独立图片可点开现有大图预览且不显示切换按钮', () => {
+    cluster.media = [{ type: 'video', url: 'https://cdn.example/video.mp4', source_url: 'https://example.com/source' }]
+    cluster.media_urls = ['/images/only.jpg']
+
+    render(<ClusterDetailPanel />)
+
+    expect(screen.queryByRole('button', { name: '上一张图片' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '下一张图片' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '查看第 1 张图片' }))
+    expect(screen.getByTestId('cluster-cover-lightbox').querySelector('img')).toHaveAttribute('src', '/images/only.jpg')
+  })
+
+  it('ClusterMedia 的 YouTube 复用现有播放器', () => {
+    cluster.media = [{ type: 'video', url: 'https://www.youtube.com/watch?v=abc123XYZ', provider: 'youtube', source_url: 'https://www.youtube.com/watch?v=abc123XYZ' }]
+
+    render(<ClusterDetailPanel />)
+
+    expect(screen.getByTestId('cluster-media-youtube')).toHaveAttribute('data-video-id', 'abc123XYZ')
+    expect(screen.queryByTestId('cluster-media-video')).not.toBeInTheDocument()
+  })
+
+  it('YouTube embed 只展示播放器，不重复展示跳转卡片', () => {
+    cluster.media = [{
+      type: 'embed',
+      url: 'https://www.youtube.com/embed/abc123XYZ',
+      provider: 'youtube',
+      source_url: 'https://www.youtube.com/watch?v=abc123XYZ',
+    }]
+
+    render(<ClusterDetailPanel />)
+
+    expect(screen.getByTestId('cluster-media-youtube')).toHaveAttribute('data-video-id', 'abc123XYZ')
+    expect(screen.queryByTestId('cluster-media-external')).not.toBeInTheDocument()
+  })
+
+  it('Reddit 官方 embed 在弹窗内播放并保留原帖跳转', () => {
+    cluster.media = [{
+      type: 'embed',
+      url: 'https://www.redditmedia.com/r/ClaudeAI/comments/1v4ol30/oversteer/?ref_source=embed&ref=share&embed=true',
+      poster_url: 'https://external-preview.redd.it/poster.jpg',
+      provider: 'reddit',
+      source_url: 'https://www.reddit.com/r/ClaudeAI/comments/1v4ol30/oversteer/',
+    }]
+
+    render(<ClusterDetailPanel />)
+
+    const frame = screen.getByTestId('cluster-media-reddit')
+    expect(frame).toHaveAttribute('src', expect.stringContaining('redditmedia.com'))
+    expect(frame).toHaveAttribute('loading', 'lazy')
+    expect(frame).toHaveAttribute('sandbox', expect.stringContaining('allow-scripts'))
+    expect(screen.getByRole('link', { name: '在 Reddit 打开原帖' })).toHaveAttribute(
+      'href',
+      'https://www.reddit.com/r/ClaudeAI/comments/1v4ol30/oversteer/',
+    )
+    expect(screen.queryByTestId('cluster-media-external')).not.toBeInTheDocument()
+  })
+
+  it('不可内嵌媒体显示海报并跳转原文', () => {
+    cluster.media = [{ type: 'embed', url: 'https://example.com/embed', poster_url: 'https://example.com/poster.jpg', source_url: 'https://example.com/original' }]
+
+    render(<ClusterDetailPanel />)
+
+    expect(screen.getByTestId('cluster-media-external')).toHaveAttribute('href', 'https://example.com/original')
+    expect(screen.getByRole('img', { name: '媒体海报' }).getAttribute('src')).toContain(encodeURIComponent('https://example.com/poster.jpg'))
+  })
+
+  it('危险协议的媒体地址不会进入播放器或外链', () => {
+    cluster.media = [
+      { type: 'video', url: 'javascript:alert(1)', source_url: 'javascript:alert(2)' },
+      { type: 'embed', url: 'data:text/html,bad', source_url: 'file:///etc/passwd' },
+    ]
+
+    render(<ClusterDetailPanel />)
+
+    expect(screen.queryByTestId('cluster-media-video')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('cluster-media-external')).not.toBeInTheDocument()
   })
 
   it('打开事件弹窗时锁定背景滚动,与信息弹窗保持一致', () => {

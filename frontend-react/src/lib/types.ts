@@ -201,6 +201,31 @@ export interface InfoReadModelCursor {
 
 export type FeedEventsCursor = number | InfoReadModelCursor | null
 
+export interface DailyDigestLink {
+  url: string
+  label: string
+}
+
+export interface DailyDigestEntry {
+  rank: number
+  cluster_id: number
+  title: string
+  source_count: number
+  links: DailyDigestLink[]
+  category?: string | null
+}
+
+export interface DailyDigest {
+  date: string
+  status: 'rolling' | 'final'
+  entries: DailyDigestEntry[]
+  updated_at: string
+}
+
+export interface DailyDigestsResponse {
+  digests: DailyDigest[]
+}
+
 /** Navigation state — v18.0 nav-merge: 6 tab → 3 tab。
  *  删 recommend / channels / starred / history（PRD §6 + §Spec-1）：
  *  - recommend + channels 合并为 info（信息 tab，复用 ChannelsView 实现）
@@ -279,6 +304,14 @@ export interface ClusterEventSourcePreview {
   source?: string | null
 }
 
+export interface ClusterMedia {
+  type: 'image' | 'video' | 'embed'
+  url: string
+  poster_url?: string
+  provider?: string
+  source_url: string
+}
+
 export interface ClusterEvent {
   id: number
   ai_title: string
@@ -299,6 +332,8 @@ export interface ClusterEvent {
   last_doc_at: string | null
   platforms: string[]
   cover_url: string | null
+  clicked_at?: string | null
+  media_kind?: ClusterMedia['type'] | null
   /** per-user：cluster_status 记录存在 AND live_version > last_seen_version；
    *  v15.1 R7.2：first-time viewer (last_seen_version=null) 永远 false */
   has_update: boolean
@@ -345,8 +380,12 @@ export interface FeedEventsResponse {
   new_since_last_fetch: number
   /** 30 天窗口内总 cluster 数（仅做指标，前端不展示） */
   total_available_within_30d: number
-  /** Timeline day counts for the full filtered result, keyed as YYYY-MM-DD in browser-local time. */
+  /** Timeline day counts for the full filtered result, keyed as YYYY-MM-DD in the requested timezone. */
   date_counts?: Record<string, number>
+  /** Present for a date seek; the anchor can be inside the returned ordinary page. */
+  date_seek?:
+    | { requested_date: string; status: 'found'; anchor_event_id: number }
+    | { requested_date: string; status: 'not_found'; anchor_event_id: null }
   read_model?: string | null
   read_model_version_id?: string | null
   scope_key?: string | null
@@ -375,6 +414,7 @@ export interface ClusterDetail {
   last_doc_at: string | null
   cover_url: string | null
   media_urls?: string[]
+  media?: ClusterMedia[]
   live_version: number
   user_last_seen_version: number | null
   viewer_status?: ClusterViewerStatus
@@ -393,6 +433,7 @@ export interface ClusterSource {
   url: string | null
   cover_url?: string | null
   media_urls?: string[]
+  media?: ClusterMedia[]
   /** 0 / 1 (后端返回 int) */
   is_primary_source: number
   /** 'official' / 'community' / null */

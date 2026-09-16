@@ -14,6 +14,18 @@ from typing import Any
 LOCAL_NAIVE_TZ = timezone(timedelta(hours=8))
 
 
+def highlights_published_before(now: datetime | None = None) -> datetime:
+    """Exclusive UTC cutoff for today's Beijing publication issue.
+
+    Use the server clock, never a client-supplied timezone or date. A future
+    source date stays stored and becomes eligible when that publication day
+    arrives; timestamps later within today remain eligible.
+    """
+    local_now = (now or datetime.now(timezone.utc)).astimezone(LOCAL_NAIVE_TZ)
+    tomorrow = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return tomorrow.astimezone(timezone.utc)
+
+
 def parse_datetime(value: Any) -> datetime | None:
     """Parse supported timestamp formats into UTC-aware datetime.
 

@@ -34,6 +34,7 @@ import db
 import ai_provider_guard
 import ai_bolding
 import remote_db
+import summary_evidence
 from clustering import visibility_policy
 from prompt_loader import load_prompt
 from time_utils import sort_key, to_utc_iso
@@ -701,12 +702,15 @@ def _looks_like_metadata(content: str) -> bool:
 
 
 def _doc_body_for_prompt(content: str | None, ai_summary: str | None,
-                         ai_key_points: str | None) -> str:
+                         ai_key_points: str | None, asr_text: str | None = None) -> str:
     raw_content = (content or '').strip()
     summary = (ai_summary or '').strip()
+    transcript = (asr_text or '').strip()
     key_points = _parse_key_points(ai_key_points)
 
     if raw_content and not _looks_like_metadata(raw_content):
+        if transcript:
+            return f"{raw_content}\n\n视频语音转写:\n{transcript}"
         return raw_content
 
     richer_parts = []
@@ -714,6 +718,8 @@ def _doc_body_for_prompt(content: str | None, ai_summary: str | None,
         richer_parts.append(summary)
     if key_points:
         richer_parts.append('关键要点:\n' + '\n'.join(f'- {p}' for p in key_points))
+    if transcript:
+        richer_parts.append('视频语音转写:\n' + transcript)
     if richer_parts:
         return '\n\n'.join(richer_parts)
     return raw_content
@@ -777,11 +783,30 @@ def _extract_resolved_urls(detail_json: Any) -> list[str]:
     return urls
 
 
+def _quoted_tweet_context(detail_json: Any) -> dict[str, str]:
+    quoted = _detail_json_value(detail_json).get('quotedTweet')
+    if not isinstance(quoted, dict):
+        return {}
+    author = quoted.get('author') if isinstance(quoted.get('author'), dict) else {}
+    quoted_id = str(quoted.get('id') or '').strip()
+    quoted_url = _detail_url_candidate(quoted.get('url'))
+    if not quoted_id and quoted_url:
+        match = re.search(r'/status/(\d+)', quoted_url)
+        if match:
+            quoted_id = match.group(1)
+    return {
+        'item_id': quoted_id,
+        'author': str(author.get('name') or '').strip(),
+        'author_handle': str(author.get('screenName') or '').strip(),
+        'text': str(quoted.get('text') or '').strip(),
+    }
+
+
 def _collect_member_rows(conn, cluster_id: int):
     if remote_db.cluster_to_remote():
         return remote_db.collect_cluster_member_rows_remote(None, cluster_id)
     return conn.execute(
-        """SELECT i.id, i.title, i.content, i.author_name, i.platform, i.url,
+        """SELECT i.id, i.title, i.content, i.asr_text, i.author_name, i.platform, i.url,
                   i.detail_json,
                   i.ai_summary, i.ai_key_points, i.ai_category,
                   i.published_at, i.fetched_at,
@@ -795,6 +820,16 @@ def _collect_member_rows(conn, cluster_id: int):
 
 def _collect_member_docs_from_rows(rows, limit: int) -> list[str]:
     """Pick newest member items, with primary/rank as tie-breakers."""
+    quoted_contexts = {
+        str(_row_get(row, 'id')): _quoted_tweet_context(_row_get(row, 'detail_json'))
+        for row in rows
+    }
+    quoted_item_ids = {
+        context['item_id']
+        for context in quoted_contexts.values()
+        if context.get('item_id')
+    }
+    effective_limit = max(0, min(int(limit), _DEFAULT_SUMMARY_MAX_DOCS))
     rows = sorted(
         rows,
         key=lambda r: (
@@ -803,7 +838,13 @@ def _collect_member_docs_from_rows(rows, limit: int) -> list[str]:
             -int(r['rank_in_cluster'] if r['rank_in_cluster'] is not None else 9999),
         ),
         reverse=True,
-    )[:limit]
+    )[:effective_limit]
+    evidence = summary_evidence.build_cluster_summary_evidence(
+        rows,
+        max_members=effective_limit,
+        singleton_fast_path=_singleton_summary_fast_path_enabled(),
+    )
+    _log_event("cluster_summary_input_evidence", evidence=evidence)
     segs = []
     for idx, r in enumerate(rows, 1):
         title = (r['title'] or '').strip()
@@ -811,21 +852,44 @@ def _collect_member_docs_from_rows(rows, limit: int) -> list[str]:
             r['content'],
             r['ai_summary'],
             r['ai_key_points'],
+            _row_get(r, 'asr_text'),
         )
         platform = r['platform']
         author = r['author_name'] or '?'
         url = (r['url'] or '').strip()
-        header_parts = [f"[{idx}] platform={platform}", f"author={author}"]
+        item_id = str(r['id'])
+        quoted_context = quoted_contexts.get(item_id) or {}
+        if item_id in quoted_item_ids:
+            source_role = 'original'
+        elif quoted_context:
+            source_role = 'commentary'
+        else:
+            source_role = 'source'
+        header_parts = [
+            f"[{idx}] platform={platform}",
+            f"author={author}",
+            f"source_role={source_role}",
+        ]
         if url:
             header_parts.append(f"url={url}")
+        if quoted_context.get('item_id'):
+            header_parts.append(f"quoted_item_id={quoted_context['item_id']}")
+        if quoted_context.get('author'):
+            header_parts.append(f"quoted_author={quoted_context['author']}")
         resolved_urls = _extract_resolved_urls(r['detail_json'])
         if resolved_urls:
             header_parts.append(f"resolved_urls={', '.join(resolved_urls[:5])}")
-        segs.append(
+        segment = (
             f"{' '.join(header_parts)}\n"
             f"title: {title}\n"
             f"body: {body}"
         )
+        if quoted_context.get('text'):
+            segment += (
+                "\nquoted_original_body: "
+                + quoted_context['text']
+            )
+        segs.append(segment)
     return segs
 
 

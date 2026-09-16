@@ -1082,6 +1082,228 @@ class TestGrayRecallCandidates:
         assert shadow_events[0]['top_cosines'] == [pytest.approx(0.67, abs=1e-5)]
 
 
+class TestReferencedSourceRecall:
+    def test_judge_prompt_defaults_exact_quoted_item_to_direct_commentary(self):
+        prompt = pl.load_prompt(
+            '10_cluster_top10_judge.md',
+            new_doc='quoted_original.item_id: 2079610838143623371',
+            candidate_clusters='referenced_item_id: 2079610838143623371',
+        )
+
+        assert prompt is not None
+        assert '完全相同' in prompt
+        assert 'relationship=direct_commentary' in prompt
+        assert '独立主体、独立动作和独立事实载荷' in prompt
+
+    def test_quoted_original_survives_long_commentary_truncation(self):
+        block = pl._build_new_doc_block({
+            'id': 'commentary',
+            'platform': 'twitter',
+            'author_name': '实践哥MinLi',
+            'published_at': '2026-07-21T16:57:50Z',
+            'title': '失踪人口回归',
+            'content': '很长的转述正文' * 2000,
+            'detail_json': json.dumps({
+                'quotedTweet': {
+                    'id': '2079610838143623371',
+                    'text': 'Use voice and ramble for 10 minutes',
+                    'author': {'name': 'Andrej Karpathy', 'screenName': 'karpathy'},
+                },
+            }),
+        })
+
+        assert len(block) == 4000
+        assert 'quoted_original:' in block
+        assert 'item_id: 2079610838143623371' in block
+        assert 'text: Use voice and ramble for 10 minutes' in block
+
+    def test_quoted_tweet_cluster_enters_judge_below_shadow_floor(self, tmp_db):
+        original_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        quoted_vec = np.array(
+            [0.62934, float(np.sqrt(1 - 0.62934 * 0.62934)), 0.0],
+            dtype=np.float32,
+        )
+        tmp_db.execute(
+            """INSERT INTO clusters (id, first_doc_at, last_doc_at, last_updated_at,
+                                     representative_vector, doc_count, live_version,
+                                     ai_title, ai_summary)
+               VALUES (1, '2026-07-21T16:53:55Z', '2026-07-21T16:53:55Z',
+                       '2026-07-21T16:53:55Z', ?, 1, 0,
+                       'Karpathy 推荐长语音絮叨', 'Karpathy 分享 LLM 长语音工作流')""",
+            (vu.pack_blob(original_vec),),
+        )
+        tmp_db.execute(
+            """INSERT INTO items (id, platform, source, fetched_at, content,
+                                  author_name, title, published_at, ai_summary,
+                                  ai_category, embedding, cluster_id, url)
+               VALUES ('2079610838143623371', 'twitter', 'user:karpathy',
+                       '2026-07-21T16:53:55Z', 'Use voice and ramble for 10 minutes',
+                       'Andrej Karpathy', 'One pattern I find useful for working with LLMs',
+                       '2026-07-21T16:53:55Z', 'Karpathy 分享长语音工作流',
+                       'tutorials', ?, 1,
+                       'https://x.com/karpathy/status/2079610838143623371')""",
+            (vu.pack_blob(original_vec),),
+        )
+        tmp_db.execute(
+            """INSERT INTO cluster_items (cluster_id, item_id, is_primary_source,
+                                          rank_in_cluster)
+               VALUES (1, '2079610838143623371', 1, 0)"""
+        )
+        tmp_db.execute(
+            """INSERT INTO items (id, platform, source, fetched_at, content,
+                                  author_name, title, published_at, ai_summary,
+                                  ai_category, embedding, detail_json, url)
+               VALUES ('2079611821494092225', 'twitter', 'user:MinLiBuilds',
+                       '2026-07-21T16:57:50Z',
+                       '失踪人口回归。我喜欢用豆包输入法，再让 AI 组织成我的意图。',
+                       '实践哥MinLi', '失踪人口回归，karpathy 回来了',
+                       '2026-07-21T16:57:50Z',
+                       '实践哥 MinLi 转述 Karpathy，并分享自己的豆包工作流',
+                       'efficiency_tools', ?, ?,
+                       'https://x.com/MinLiBuilds/status/2079611821494092225')""",
+            (
+                vu.pack_blob(quoted_vec),
+                json.dumps({
+                    'quotedTweet': {
+                        'id': '2079610838143623371',
+                        'text': 'Use voice and ramble for 10 minutes',
+                        'author': {'name': 'Andrej Karpathy', 'screenName': 'karpathy'},
+                    },
+                }),
+            ),
+        )
+        tmp_db.commit()
+
+        seen: list[tuple[dict, list[dict]]] = []
+
+        def judge_yes(item, candidates):
+            seen.append((dict(item), candidates))
+            return {'matches': [{
+                'cluster_id': 1,
+                'same_event': True,
+                'confidence': 'high',
+                'relationship': 'direct_commentary',
+                'rationale': 'new doc explicitly quotes the original post',
+            }]}
+
+        with patch.object(pl.summary_writer, 'regenerate_and_swap', return_value=True):
+            pl.run_pipeline(
+                tmp_db,
+                provider=FakeProvider({}),
+                top_k_judge=judge_yes,
+                api_key='k',
+                api_base=None,
+                model='m',
+                skip_summary=True,
+                cosine_min=0.75,
+                gray_cosine_min=0.70,
+                shadow_cosine_min=0.65,
+            )
+
+        assert seen
+        assert seen[0][0]['detail_json']
+        assert seen[0][1][0]['cluster_id'] == 1
+        assert seen[0][1][0]['recall_band'] == 'explicit_reference'
+        assert seen[0][1][0]['referenced_item_id'] == '2079610838143623371'
+        row = tmp_db.execute(
+            "SELECT cluster_id FROM items WHERE id='2079611821494092225'"
+        ).fetchone()
+        assert row['cluster_id'] == 1
+
+    def test_same_batch_original_is_processed_before_newer_commentary(self, tmp_db):
+        original_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        commentary_vec = np.array(
+            [0.62934, float(np.sqrt(1 - 0.62934 * 0.62934)), 0.0],
+            dtype=np.float32,
+        )
+        tmp_db.execute(
+            """INSERT INTO clusters (id, first_doc_at, last_doc_at, last_updated_at,
+                                     representative_vector, doc_count, live_version,
+                                     ai_title, ai_summary)
+               VALUES (1, '2026-07-21T15:00:00Z', '2026-07-21T15:00:00Z',
+                       '2026-07-21T15:00:00Z', ?, 1, 0,
+                       'Unrelated existing event', 'A different event')""",
+            (vu.pack_blob(original_vec),),
+        )
+        tmp_db.execute(
+            """INSERT INTO items (id, platform, source, fetched_at, content,
+                                  author_name, title, published_at, ai_summary,
+                                  ai_category, embedding, url)
+               VALUES ('2079610838143623371', 'twitter', 'user:karpathy',
+                       '2026-07-21T16:53:55Z', 'Use voice and ramble for 10 minutes',
+                       'Andrej Karpathy', 'One pattern I find useful for working with LLMs',
+                       '2026-07-21T16:53:55Z', 'Karpathy 分享长语音工作流',
+                       'tutorials', ?,
+                       'https://x.com/karpathy/status/2079610838143623371')""",
+            (vu.pack_blob(original_vec),),
+        )
+        tmp_db.execute(
+            """INSERT INTO items (id, platform, source, fetched_at, content,
+                                  author_name, title, published_at, ai_summary,
+                                  ai_category, embedding, detail_json, url)
+               VALUES ('2079611821494092225', 'twitter', 'user:MinLiBuilds',
+                       '2026-07-21T16:57:50Z',
+                       '失踪人口回归。我喜欢用豆包输入法，再让 AI 组织成我的意图。',
+                       '实践哥MinLi', '失踪人口回归，karpathy 回来了',
+                       '2026-07-21T16:57:50Z',
+                       '实践哥 MinLi 转述 Karpathy，并分享自己的豆包工作流',
+                       'efficiency_tools', ?, ?,
+                       'https://x.com/MinLiBuilds/status/2079611821494092225')""",
+            (
+                vu.pack_blob(commentary_vec),
+                json.dumps({
+                    'quotedTweet': {
+                        'id': '2079610838143623371',
+                        'text': 'Use voice and ramble for 10 minutes',
+                        'author': {'name': 'Andrej Karpathy', 'screenName': 'karpathy'},
+                    },
+                }),
+            ),
+        )
+        tmp_db.commit()
+
+        seen: list[tuple[dict, list[dict]]] = []
+
+        def judge_yes(item, candidates):
+            seen.append((dict(item), candidates))
+            if item['id'] == '2079610838143623371':
+                return {'matches': []}
+            return {'matches': [{
+                'cluster_id': candidates[0]['cluster_id'],
+                'same_event': True,
+                'confidence': 'high',
+                'relationship': 'direct_commentary',
+                'rationale': 'new doc explicitly quotes the original post',
+            }]}
+
+        pl.run_pipeline(
+            tmp_db,
+            provider=FakeProvider({}),
+            top_k_judge=judge_yes,
+            api_key='k',
+            api_base=None,
+            model='m',
+            skip_summary=True,
+            cosine_min=0.75,
+            gray_cosine_min=0.70,
+            shadow_cosine_min=0.65,
+            window_start='2026-07-21T16:00:00Z',
+            window_end='2026-07-21T17:00:00Z',
+        )
+
+        assert len(seen) == 2
+        assert seen[0][0]['id'] == '2079610838143623371'
+        assert seen[1][0]['id'] == '2079611821494092225'
+        assert seen[1][1][0]['recall_band'] == 'explicit_reference'
+        rows = tmp_db.execute(
+            """SELECT id, cluster_id FROM items
+                WHERE id IN ('2079610838143623371', '2079611821494092225')
+                ORDER BY id"""
+        ).fetchall()
+        assert rows[0]['cluster_id'] == rows[1]['cluster_id']
+        assert rows[0]['cluster_id'] != 1
+
+
 class TestDocCountDedup:
     def test_same_platform_same_author_does_not_double_count(self, tmp_db):
         """R7.3: Reddit thread 100 comments from same author = doc_count 1.

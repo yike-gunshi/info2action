@@ -141,6 +141,109 @@ def _client(app, login='alice@test.local') -> TestClient:
 
 
 class TestFeedEvents:
+    def test_date_seek_returns_original_page_and_continues_without_skips(self, clusters_env):
+        conn = db_mod.get_conn()
+        try:
+            conn.execute('UPDATE clusters SET is_visible_in_feed = 0')
+            for index in range(45):
+                day = '25' if index < 23 else '24'
+                stamp = f'2026-04-{day}T{15 - index % 12:02d}:00:00'
+                conn.execute(
+                    """INSERT INTO clusters (ai_title, ai_summary, doc_count,
+                        is_visible_in_feed, first_doc_at, last_doc_at,
+                        last_updated_at, published_at, live_version, platforms_json)
+                       VALUES (?, 'summary', 1, 1, ?, ?, datetime('now'), ?, 1, '[]')""",
+                    (f'date seek {index}', stamp, stamp, stamp),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        client = TestClient(clusters_env['app'])
+        pages = [client.get(f'/api/feed/events?page={page}').json() for page in (1, 2, 3)]
+        expected = [event for page in pages for event in page['events']]
+        target = expected[23]
+        seek = client.get('/api/feed/events?target_date=2026-04-24').json()
+        assert seek.get('date_seek') == {
+            'requested_date': '2026-04-24', 'status': 'found', 'anchor_event_id': target['id'],
+        }
+        assert seek['events'] == pages[1]['events']
+        assert seek['date_counts'] == pages[0]['date_counts'] == {'2026-04-25': 23, '2026-04-24': 22}
+        assert seek['next_cursor'] == 3
+        continuation = client.get(f"/api/feed/events?page={seek['next_cursor']}").json()
+        assert [event['id'] for event in seek['events'] + continuation['events']] == [
+            event['id'] for event in expected[20:]
+        ]
+        assert 'date_seek' not in pages[0]
+
+    def test_date_seek_keeps_categories_and_beijing_day_boundary(self, clusters_env):
+        conn = db_mod.get_conn()
+        try:
+            conn.execute("UPDATE clusters SET first_doc_at = '2026-04-24T16:00:00Z' WHERE id = ?", (clusters_env['clusters'][0],))
+            conn.execute("UPDATE clusters SET first_doc_at = '2026-04-24T15:59:59Z' WHERE id = ?", (clusters_env['clusters'][1],))
+            conn.commit()
+        finally:
+            conn.close()
+        client = TestClient(clusters_env['app'])
+        newer = client.get('/api/feed/events?target_date=2026-04-25&categories=products,coding').json()
+        older = client.get('/api/feed/events?target_date=2026-04-24&categories=coding').json()
+        assert newer.get('date_seek', {}).get('anchor_event_id') == clusters_env['clusters'][0]
+        assert older.get('date_seek', {}).get('anchor_event_id') == clusters_env['clusters'][1]
+        missing = client.get('/api/feed/events?target_date=2026-04-24&categories=products').json()
+        assert missing.get('date_seek') == {
+            'requested_date': '2026-04-24', 'status': 'not_found', 'anchor_event_id': None,
+        }
+        assert missing['events'] == []
+        assert missing['next_cursor'] is None
+        assert missing['date_counts'] == {'2026-04-25': 1}
+
+    @pytest.mark.parametrize('value', ['garbage', '2026-02-30', '2026-04-24T00:00:00', '0'])
+    def test_date_seek_rejects_invalid_date(self, clusters_env, value):
+        response = TestClient(clusters_env['app']).get('/api/feed/events', params={'target_date': value})
+        assert response.status_code == 422
+
+    def test_date_seek_remote_isolates_public_first_page_cache(self, clusters_env, monkeypatch):
+        import routes.clusters as route
+        from routes.public_response_cache import clear_public_response_cache
+        clear_public_response_cache()
+        calls = []
+
+        def fetch(**kwargs):
+            calls.append(kwargs)
+            result = {'enabled': True, 'events': [], 'next_cursor': None, 'date_counts': {}}
+            if kwargs.get('target_date'):
+                result['date_seek'] = {'requested_date': kwargs['target_date'], 'status': 'not_found', 'anchor_event_id': None}
+            return result
+
+        monkeypatch.setattr(route.remote_db, 'events_read_from_remote', lambda: True)
+        monkeypatch.setattr(route.remote_db, 'fetch_events', fetch)
+        client = TestClient(clusters_env['app'])
+        first = client.get('/api/feed/events')
+        seek = client.get('/api/feed/events?target_date=2026-04-24')
+        again = client.get('/api/feed/events')
+        assert len(calls) == 2
+        assert calls[1]['target_date'] == '2026-04-24'
+        assert calls[1]['timezone_offset_minutes'] == -480
+        assert seek.json()['date_seek']['status'] == 'not_found'
+        assert seek.headers['Cache-Control'] == 'no-store'
+        assert first.json() == again.json()
+        assert 'date_seek' not in again.json()
+        clear_public_response_cache()
+
+    @pytest.mark.parametrize('error_type', ['TimeoutError', 'RemoteDBTimeoutError', 'RemoteDBError'])
+    def test_date_seek_timeout_does_not_pretend_date_is_missing(self, clusters_env, monkeypatch, error_type):
+        import routes.clusters as route
+
+        def timeout(**kwargs):
+            exception = TimeoutError if error_type == 'TimeoutError' else getattr(route.remote_db, error_type)
+            raise exception('date lookup timed out')
+
+        monkeypatch.setattr(route.remote_db, 'events_read_from_remote', lambda: True)
+        monkeypatch.setattr(route.remote_db, 'fetch_events', timeout)
+        response = TestClient(clusters_env['app']).get('/api/feed/events?target_date=2026-04-24')
+        assert response.status_code == 503
+        assert response.json().get('date_seek') is None
+        assert response.headers.get('Cache-Control') == 'no-store'
+
     def test_anonymous_can_read_public_events(self, clusters_env):
         c = TestClient(clusters_env['app'])
         r = c.get('/api/feed/events')
@@ -304,10 +407,10 @@ class TestFeedEvents:
                                              published_at, live_version,
                                              platforms_json, cover_url)
                        VALUES (?, 'summary', '[]', 1, 1, 1,
-                               '2026-04-25T10:00:00Z',
-                               '2026-04-25T10:00:00Z',
-                               '2026-04-25T10:00:00Z',
-                               '2026-04-25T10:00:00Z',
+                               datetime('now'),
+                               datetime('now'),
+                               datetime('now'),
+                               datetime('now'),
                                1, '["github"]', NULL)""",
                     (title,),
                 )
@@ -318,7 +421,7 @@ class TestFeedEvents:
                                           content, author_name, published_at,
                                           ai_summary, metrics_json)
                        VALUES (?, ?, 'trending', datetime('now'), ?, 'body',
-                               'author', '2026-04-25T10:00:00Z',
+                               'author', datetime('now'),
                                'item summary', ?)""",
                     (item_id, platform, item_id, metrics),
                 )
@@ -383,9 +486,9 @@ class TestFeedEvents:
                                          live_version, platforms_json, cover_url,
                                          published_at)
                    VALUES ('旧事件新增来源', 'old update', '[]',
-                           4, 4, 1, '2026-04-20T09:00:00',
-                           '2026-05-15T09:00:00', '2026-05-15T09:00:00',
-                           3, '["x"]', NULL, '2026-05-15T09:05:00')"""
+                           4, 4, 1, datetime('now', '-5 days'),
+                           datetime('now'), datetime('now'),
+                           3, '["x"]', NULL, datetime('now'))"""
             ).lastrowid
             fresh = conn.execute(
                 """INSERT INTO clusters (ai_title, ai_summary, ai_key_points,
@@ -395,9 +498,9 @@ class TestFeedEvents:
                                          live_version, platforms_json, cover_url,
                                          published_at)
                    VALUES ('新首发事件', 'fresh', '[]',
-                           2, 2, 1, '2026-04-25T09:00:00',
-                           '2026-04-25T09:15:00', '2026-04-25T09:15:00',
-                           1, '["reddit"]', NULL, '2026-04-25T09:20:00')"""
+                           2, 2, 1, datetime('now', '-1 day'),
+                           datetime('now', '-1 day', '+15 minutes'), datetime('now', '-1 day', '+15 minutes'),
+                           1, '["reddit"]', NULL, datetime('now', '-1 day', '+20 minutes'))"""
             ).lastrowid
             conn.commit()
         finally:
@@ -505,6 +608,141 @@ class TestClusterDetail:
             'feedback_note': None,
         }
 
+    def test_bundle_normalizes_video_media_and_keeps_image_compat(self, clusters_env):
+        cid = clusters_env['clusters'][0]
+        conn = db_mod.get_conn()
+        try:
+            conn.execute(
+                """UPDATE items
+                      SET cover_url = '/images/reddit/poster.jpg',
+                          media_json = ?
+                    WHERE id = 'itm_1'""",
+                (json.dumps([{
+                    'type': 'video',
+                    'url': 'https://v.redd.it/demo/DASH_720.mp4',
+                    'poster_url': '/images/reddit/poster.jpg',
+                    'provider': 'reddit',
+                    'source_url': 'https://reddit.com/r/demo/comments/abc',
+                }]),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        body = _client(clusters_env['app']).get(f'/api/clusters/{cid}/bundle').json()
+        source = next(row for row in body['sources'] if row['item_id'] == 'itm_1')
+        assert source['media'][0] == {
+            'type': 'video',
+            'url': 'https://v.redd.it/demo/DASH_720.mp4',
+            'poster_url': '/images/reddit/poster.jpg',
+            'provider': 'reddit',
+            'source_url': 'https://reddit.com/r/demo/comments/abc',
+        }
+        assert source['media_urls'] == ['/images/reddit/poster.jpg']
+        assert body['cluster']['media'][0]['type'] == 'video'
+
+
+class TestV30ReadingState:
+    def test_batch_status_requires_login_and_limits_500(self, clusters_env):
+        anonymous = TestClient(clusters_env['app'])
+        assert anonymous.post('/api/clusters/status/batch', json={'cluster_ids': [1]}).status_code == 401
+        logged_in = _client(clusters_env['app'])
+        response = logged_in.post(
+            '/api/clusters/status/batch',
+            json={'cluster_ids': list(range(501))},
+        )
+        assert response.status_code == 400
+
+    def test_batch_status_returns_read_and_unread_rows(self, clusters_env):
+        first, second = clusters_env['clusters'][:2]
+        client = _client(clusters_env['app'])
+        assert client.post(f'/api/clusters/{first}/click').status_code == 200
+
+        response = client.post(
+            '/api/clusters/status/batch',
+            json={'cluster_ids': [first, second, first]},
+        )
+        assert response.status_code == 200
+        statuses = {row['cluster_id']: row for row in response.json()['statuses']}
+        assert statuses[first]['clicked_at'] is not None
+        assert statuses[first]['last_seen_version'] == 1
+        assert statuses[second] == {
+            'cluster_id': second,
+            'clicked_at': None,
+            'last_seen_version': None,
+        }
+
+    def test_reading_progress_put_get_and_does_not_mark_read(self, clusters_env):
+        cid = clusters_env['clusters'][0]
+        conn = db_mod.get_conn()
+        try:
+            conn.execute(
+                """UPDATE clusters
+                      SET first_doc_at=datetime('now'), last_updated_at=datetime('now'),
+                          published_at=datetime('now'), is_visible_in_feed=1
+                    WHERE id=?""",
+                (cid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        client = _client(clusters_env['app'])
+        saved = client.put('/api/reading-progress/highlights', json={'cluster_id': cid})
+        assert saved.status_code == 200
+        progress = saved.json()['progress']
+        assert progress['cluster_id'] == cid
+        assert progress['resolved_cluster_id'] == cid
+        assert progress['resolution'] == 'exact'
+
+        loaded = client.get('/api/reading-progress/highlights')
+        assert loaded.status_code == 200
+        assert loaded.json()['progress']['resolved_cluster_id'] == cid
+
+        conn = db_mod.get_conn()
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) AS n FROM cluster_status WHERE user_id=? AND cluster_id=?",
+                (clusters_env['user_id'], cid),
+            ).fetchone()['n'] == 0
+        finally:
+            conn.close()
+
+    def test_reading_progress_resolves_hidden_anchor_to_nearest_older(self, clusters_env):
+        anchor, older = clusters_env['clusters'][:2]
+        conn = db_mod.get_conn()
+        try:
+            conn.execute(
+                """UPDATE clusters SET first_doc_at=datetime('now'),
+                       last_updated_at=datetime('now'), published_at=datetime('now')
+                     WHERE id=?""",
+                (anchor,),
+            )
+            conn.execute(
+                """UPDATE clusters SET first_doc_at=datetime('now','-1 hour'),
+                       last_updated_at=datetime('now','-1 hour'),
+                       published_at=datetime('now','-1 hour'), is_visible_in_feed=1
+                     WHERE id=?""",
+                (older,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        client = _client(clusters_env['app'])
+        assert client.put('/api/reading-progress/highlights', json={'cluster_id': anchor}).status_code == 200
+        conn = db_mod.get_conn()
+        try:
+            conn.execute('UPDATE clusters SET is_visible_in_feed=0 WHERE id=?', (anchor,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        progress = client.get('/api/reading-progress/highlights').json()['progress']
+        assert progress['cluster_id'] == anchor
+        assert progress['resolved_cluster_id'] == older
+        assert progress['resolution'] == 'nearest_older'
+
 
 class TestClusterSources:
     def test_anonymous_can_read_public_cluster_sources(self, clusters_env):
@@ -523,6 +761,34 @@ class TestClusterSources:
         assert len(sources) == 3  # 3 items seeded
         # Source list is newest-first, with primary source as tie-breaker.
         assert sources[0]['item_id'] == 'itm_2'
+
+    def test_logged_in_sources_do_not_expose_another_users_private_media(self, clusters_env):
+        cid = clusters_env['clusters'][0]
+        conn = db_mod.get_conn()
+        try:
+            conn.execute(
+                """INSERT INTO items
+                     (id,user_id,platform,source,fetched_at,title,content,url,media_json)
+                   VALUES
+                     ('private-other','other-user','manual','user-submit',datetime('now'),
+                      'Private video','secret','https://example.com/private',
+                      '[{"type":"video","url":"https://cdn.example/private.mp4"}]')"""
+            )
+            conn.execute(
+                """INSERT INTO cluster_items(cluster_id,item_id,rank_in_cluster,is_primary_source)
+                   VALUES (?, 'private-other', 99, 0)""",
+                (cid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        sources = _client(clusters_env['app']).get(
+            f'/api/clusters/{cid}/sources'
+        ).json()['sources']
+
+        assert 'private-other' not in {source['item_id'] for source in sources}
+        assert 'https://cdn.example/private.mp4' not in json.dumps(sources)
 
     def test_pagination_query(self, clusters_env):
         cid = clusters_env['clusters'][0]
@@ -1067,3 +1333,94 @@ class TestSearchContext:
         titles = [e.get('ai_title') for e in (b.get('events') or [])]
         assert 'Legacy v1 leak' not in titles
         assert b.get('events_total', 0) == 0
+
+
+@pytest.mark.parametrize("user", [False, True])
+@pytest.mark.parametrize("future", ["2026-09-14T00:00:00Z", "2026-09-12T16:00:00Z"])
+def test_future_events_excluded_before_pagination_and_counts(clusters_env, monkeypatch, user, future):
+    from datetime import datetime, timezone
+    import time_utils
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 12, 10, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(time_utils, 'datetime', FrozenDateTime)
+    ids = clusters_env['clusters']
+    conn = db_mod.get_conn()
+    for cid, stamp in zip(ids, [future,
+                                '2026-09-12T15:59:59Z',
+                                '2026-09-11T07:00:00Z']):
+        conn.execute("UPDATE clusters SET first_doc_at=?, last_doc_at=?, is_visible_in_feed=1 WHERE id=?", (stamp, stamp, cid))
+    conn.commit()
+    conn.close()
+    client = _client(clusters_env['app']) if user else TestClient(clusters_env['app'])
+    body = client.get('/api/feed/events?limit=1&since_version_snapshot=0').json()
+    assert [e['id'] for e in body['events']] == [ids[1]]
+    assert body['date_counts'] == {'2026-09-12': 1, '2026-09-11': 1}
+    assert body['total_available_within_30d'] == 2
+    assert body['new_since_last_fetch'] == 2
+    assert body['next_cursor'] == 2
+    second = client.get('/api/feed/events?limit=1&page=2').json()
+    assert [e['id'] for e in second['events']] == [ids[2]]
+    assert second['next_cursor'] is None
+    seek = client.get('/api/feed/events?limit=1&target_date=2026-09-12').json()
+    assert seek['date_seek']['anchor_event_id'] == ids[1]
+    assert [e['id'] for e in seek['events']] == [ids[1]]
+    assert seek['next_cursor'] == 2
+    assert seek['date_counts'] == body['date_counts']
+    future_day = datetime.fromisoformat(future).astimezone(time_utils.LOCAL_NAIVE_TZ).date().isoformat()
+    missing = client.get(f'/api/feed/events?limit=1&target_date={future_day}').json()
+    assert missing['date_seek'] == {
+        'requested_date': future_day, 'status': 'not_found', 'anchor_event_id': None,
+    }
+    assert missing['events'] == [] and missing['next_cursor'] is None
+    assert missing['date_counts'] == body['date_counts']
+
+
+def test_beijing_rollover_releases_article_and_refreshes_public_cache(clusters_env, monkeypatch):
+    from datetime import datetime, timezone
+    import routes.clusters as route
+
+    cutoff = [datetime(2026, 9, 12, 16, tzinfo=timezone.utc)]
+    monkeypatch.setattr(route, 'highlights_published_before', lambda: cutoff[0])
+    cid = clusters_env['clusters'][0]
+    conn = db_mod.get_conn()
+    conn.execute("UPDATE clusters SET first_doc_at='2026-09-12T16:00:00Z', last_doc_at='2026-09-12T16:00:00Z' WHERE id=?", (cid,))
+    conn.commit()
+    conn.close()
+    client = TestClient(clusters_env['app'])
+    before = client.get('/api/feed/events').json()
+    assert cid not in [e['id'] for e in before['events']]
+    assert '2026-09-13' not in before['date_counts']
+    cutoff[0] = datetime(2026, 9, 13, 16, tzinfo=timezone.utc)
+    after = client.get('/api/feed/events').json()
+    assert after['events'][0]['id'] == cid
+    assert after['date_counts']['2026-09-13'] == 1
+    assert after['total_available_within_30d'] == before['total_available_within_30d'] + 1
+
+
+@pytest.mark.parametrize('save_future', [False, True])
+def test_resume_excludes_future_articles_from_anchor_and_page(clusters_env, monkeypatch, save_future):
+    from datetime import datetime, timezone
+    import routes.clusters as route
+
+    monkeypatch.setattr(route, 'highlights_published_before',
+                        lambda: datetime(2026, 9, 12, 16, tzinfo=timezone.utc))
+    conn = db_mod.get_conn()
+    for idx in range(20):
+        future_id = conn.execute("""INSERT INTO clusters(ai_title, is_visible_in_feed,
+            first_doc_at, last_doc_at, last_updated_at, published_at)
+            VALUES('future',1,'2026-09-14T00:00:00Z','2026-09-14T00:00:00Z',datetime('now'),datetime('now'))""").lastrowid
+    saved_id = future_id if save_future else clusters_env['clusters'][0]
+    anchor = conn.execute('SELECT first_doc_at FROM clusters WHERE id=?', (saved_id,)).fetchone()['first_doc_at']
+    conn.execute("INSERT INTO reading_progress(user_id,surface,cluster_id,anchor_sort_at,updated_at) VALUES(?,'highlights',?,?,datetime('now'))",
+                 (clusters_env['user_id'], saved_id, anchor))
+    conn.commit()
+    conn.close()
+    client = _client(clusters_env['app'])
+    progress = client.get('/api/reading-progress/highlights').json()['progress']
+    assert progress['resolved_cluster_id'] == clusters_env['clusters'][0]
+    assert progress['cursor'] == 1
+    assert progress['resolution'] == ('nearest_older' if save_future else 'exact')

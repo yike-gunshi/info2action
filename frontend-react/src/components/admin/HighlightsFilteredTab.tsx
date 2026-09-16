@@ -352,9 +352,27 @@ export function HighlightsFilteredTab({ reloadSignal }: HighlightsFilteredTabPro
         <InlineError title="漏斗列表加载失败" detail={rowsError} onRetry={() => void loadRows()} />
       ) : !rows || rows.items.length === 0 ? (
         <StatePanel>
-          {query
-            ? '没有匹配的条目。搜不到通常意味着它未入库——请检查信源池'
-            : view === 'anomaly' ? `近 ${days} 天没有异常` : `当前筛选下近 ${days} 天没有内容`}
+          {/* 空态要说清"卡在哪一步"：未进簇的条目按设计不出现在全景表(后端搜索
+              CTE 带 cluster_id IS NOT NULL)，只在异常视图里。把这三种状态说成
+              同一种会把排查引向信源池——BF-0804-3。 */}
+          {!query
+            ? (view === 'anomaly' ? `近 ${days} 天没有异常` : `当前筛选下近 ${days} 天没有内容`)
+            : view === 'anomaly'
+              ? '异常表里没有匹配的条目。可以切回全景表，看它是否已经正常进簇。'
+              : (funnel?.anomalies_count ?? 0) > 0
+                ? (
+                  <span className="inline-flex flex-wrap items-center justify-center gap-2">
+                    <span>{`命中了 ${funnel?.anomalies_count} 条，但它们没进簇，所以不在全景表里。`}</span>
+                    <button
+                      type="button"
+                      className={pillClass(false)}
+                      onClick={() => { setView('anomaly'); setStage(''); resetPage() }}
+                    >
+                      查看异常表
+                    </button>
+                  </span>
+                )
+                : '没有匹配的条目。它可能尚未入库，也可能不在当前时间窗或标签筛选内。'}
         </StatePanel>
       ) : rows.granularity === 'item' ? (
         <AnomalyTable rows={rows.items} />
@@ -552,7 +570,10 @@ function PanoramaTable({
                   <td className="px-2 py-2.5">
                     <ItemTitle member={member} />
                   </td>
-                  <td className={cn('px-2 py-2.5 text-right font-mono tabular-nums', scoreClass(member.score10))}>{formatScore(member.score10)}</td>
+                  <td className={cn('px-2 py-2.5 text-right font-mono tabular-nums', scoreClass(member.score10))}>
+                    {formatScore(member.score10)}
+                    {member.reach !== null ? <span className="block font-mono text-[10px] text-muted-foreground">r{member.reach}</span> : null}
+                  </td>
                   <td data-testid="item-block-reason" className="px-2 py-2.5">{itemBlockedReason(member)}</td>
                   <td className="px-2 py-2.5">
                     <ItemFeedbackControls
@@ -762,10 +783,10 @@ function formatDim(value: number | null) { return value === null || !Number.isFi
 function formatInput(value: unknown) { return typeof value === 'number' && Number.isFinite(value) ? String(value) : '—' }
 function scoreClass(value: number | null) { if (value === null) return 'text-muted-foreground'; if (value >= 7) return 'a-text-ok'; if (value >= 5) return 'a-text-warn'; return 'a-text-crit' }
 function formatTime(value: string | null) { if (!value) return '—'; const date = new Date(value); if (Number.isNaN(date.getTime())) return '—'; return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).replace(' ', '\n') }
-function itemBlockedReason(member: AdminHighlightsClusterMember) { const veto = humanVeto(member.veto); if (veto) return <span className="inline-block rounded-[4px] px-1.5 py-0.5 a-pill-crit">veto · {veto}</span>; if (member.verdict === 'drop' && member.score10 !== null) return `score ${formatScore(member.score10)} 未过打分闸`; return member.reason || '—' }
+function itemBlockedReason(member: AdminHighlightsClusterMember) { const veto = humanVeto(member.veto); if (veto) return <span className="inline-block rounded-[4px] px-1.5 py-0.5 a-pill-crit">veto · {veto}</span>; if (member.reason?.startsWith('[reach_guard] ') || (member.reach === 1 && member.verdict === 'drop')) return <span className="inline-block rounded-[4px] px-1.5 py-0.5 a-pill-warn">reach · 受众面过窄</span>; if (member.verdict === 'drop' && member.score10 !== null) return `score ${formatScore(member.score10)} 未过打分闸`; return member.reason || '—' }
 function humanVeto(veto: string | null) { if (!veto || veto === 'none') return null; return ({ marketing: '营销通稿', rumor_unverified: '传闻未证实', flamewar: '引战', engagement_bait: '互动诱饵' } as Record<string, string>)[veto] ?? veto }
 function categoryLabel(value: string) { return TAGS.find(([id]) => id === value)?.[1] ?? value }
-function emptyMember(clusterId: number): AdminHighlightsClusterMember { return { id: `cluster-${clusterId}-empty`, title: null, url: null, platform: null, source: null, author_name: null, fetched_at: null, verdict: null, score10: null, dims: EMPTY_DIMS, veto: null, uncertainty: null, reason: null, feedback: { kind: null, note: null } } }
+function emptyMember(clusterId: number): AdminHighlightsClusterMember { return { id: `cluster-${clusterId}-empty`, title: null, url: null, platform: null, source: null, author_name: null, fetched_at: null, verdict: null, score10: null, reach: null, dims: EMPTY_DIMS, veto: null, uncertainty: null, reason: null, feedback: { kind: null, note: null } } }
 function errorStatus(error: unknown) { return typeof error === 'object' && error !== null && 'status' in error ? Number((error as { status?: number }).status) : null }
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : '加载失败' }
 function readPageSize(): PageSize { const value = Number(getStoredValue(PAGE_SIZE_STORAGE_KEY)); return PAGE_SIZE_OPTIONS.includes(value as PageSize) ? value as PageSize : 20 }

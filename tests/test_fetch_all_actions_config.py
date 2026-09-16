@@ -20,6 +20,31 @@ def test_fetch_all_gates_dedup_actions_behind_config():
     assert "自动行动点去重已关闭" in text
 
 
+def test_fetch_all_does_not_fetch_bilibili():
+    """B 站已于 2026-08-06 全面下线:前端 section 早已隐藏(PR #286),抓取同步停止。"""
+    text = (ROOT / "ops" / "fetch_all.sh").read_text()
+
+    assert "fetch_bili_hot.py" not in text
+    assert "fetch_bili_watch_later.py" not in text
+    assert "$SOURCE_DIR/bilibili" not in text
+
+
+def test_config_disables_bilibili_platform():
+    """手动 / micro 抓取路径靠 config 开关兜底,防止绕过 fetch_all.sh 再把 B 站抓回来。"""
+    import json
+
+    cfg = json.loads((ROOT / "config" / "config.json").read_text())
+
+    assert cfg["bilibili"]["enabled"] is False
+
+
+def test_fetch_orchestrator_guards_bilibili_behind_config():
+    text = (ROOT / "src" / "fetch_orchestrator.py").read_text()
+
+    assert text.count("_is_platform_enabled('bilibili')") == 2
+    assert "bilibili is disabled in config, skipping" in text
+
+
 def test_fetch_all_uses_unified_enrichment():
     text = (ROOT / "ops" / "fetch_all.sh").read_text()
 
