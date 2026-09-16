@@ -70,7 +70,11 @@ describe('EventCard', () => {
     expect(time.className).toContain('text-muted-foreground')
     expect(time.className).toContain('self-start')
     expect(time.className).toContain('mt-[8px]')
-    expect(screen.getByRole('heading', { level: 3 }).className).toContain('leading-[1.32]')
+    expect(screen.getByRole('heading', { level: 3 }).className).toContain('leading-[1.42]')
+    expect(screen.getByRole('heading', { level: 3 }).className).toContain('sm:leading-[1.32]')
+    expect(screen.getByTestId('event-title-text').className).toContain('pb-[0.12em]')
+    expect(screen.getByTestId('event-title-text').className).toContain('-mb-[0.12em]')
+    expect(screen.getByTestId('event-title-text').className).toContain('sm:pb-0')
     expect(screen.queryByText(/小时前|分钟前|天前/)).not.toBeInTheDocument()
   })
 
@@ -143,6 +147,17 @@ describe('EventCard', () => {
     const card = screen.getByTestId('event-card')
     await user.click(card)
     expect(onSelect).toHaveBeenCalledWith(99, expect.objectContaining({ id: 99 }))  // B7: onSelect 携带 cluster
+  })
+
+  it('阅读同步失败时显示精确文案，重试不打开卡片', async () => {
+    const user = userEvent.setup()
+    const onSelect = vi.fn()
+    const onRetry = vi.fn()
+    render(<EventCard cluster={makeCluster()} onSelect={onSelect} readSyncError onRetry={onRetry} />)
+    expect(screen.getByText('阅读状态未同步，可重试')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '重试阅读状态同步' }))
+    expect(onRetry).toHaveBeenCalledTimes(1)
+    expect(onSelect).not.toHaveBeenCalled()
   })
 
   it('键盘 Enter 触发 onSelect(可访问性)', async () => {
@@ -228,6 +243,10 @@ describe('EventCard', () => {
     expect(mediaSlot.className).toContain('overflow-hidden')
     expect(mediaSlot.className).toContain('rounded-md')
     expect(mediaSlot.className).not.toContain('h-[120px]')
+    expect(mediaSlot.className).toContain('w-[88px]')
+    expect(mediaSlot.className).toContain('h-[56px]')
+    expect(mediaSlot.className).toContain('sm:w-[200px]')
+    expect(mediaSlot.className).toContain('sm:h-auto')
   })
 
   it('cover_url 加载失败时移除右侧图片区,正文铺满可用宽度', () => {

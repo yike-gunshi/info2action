@@ -212,13 +212,20 @@ export const useClusterDetailStore = create<ClusterDetailState>((set, get) => ({
         sources: bundle.sources,
         sourcesCursor: bundle.sources_next_cursor,
       })
-      // 异步 click 打点（不阻塞 UI；失败也不报错给用户）
-      clickCluster(clusterId).catch(() => { /* swallow */ })
-      // v15.1 R7.1：用户点开 cluster 弹窗时通知 eventsStore 乐观清角标
-      // + fire-and-forget 后端 /seen 写入（失败不影响渲染）
+      // 唯一可靠写入：click 同时写 clicked 与 seen；失败回滚乐观状态。
       void import('./eventsStore').then(({ useEventsStore }) => {
         useEventsStore.getState().markSeen(clusterId)
-      }).catch(() => { /* swallow */ })
+        void clickCluster(clusterId)
+          .then(() => {
+            useEventsStore.getState().confirmSeen(clusterId)
+            if (typeof BroadcastChannel !== 'undefined') {
+              const channel = new BroadcastChannel('info2act-cluster-read')
+              channel.postMessage({ clusterId })
+              channel.close()
+            }
+          })
+          .catch(() => useEventsStore.getState().rollbackSeen(clusterId))
+      }).catch(() => { /* store loading failure leaves modal usable */ })
     } catch (e) {
       if (loadingTimer) clearTimeout(loadingTimer)
       if (_openModalSeq !== openSeq || get().modalClusterId !== clusterId) return

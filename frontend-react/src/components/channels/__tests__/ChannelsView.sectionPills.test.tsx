@@ -106,6 +106,22 @@ describe('ChannelsView section-local pills', () => {
     vi.useRealTimers()
   })
 
+  it('信息页不展示 B站模块，即使接口返回 B站数据', () => {
+    useFeedStore.setState({
+      platformSectionItems: new Map([
+        ['twitter', [item('x1', 'twitter', 'following')]],
+        ['bilibili', [item('b1', 'bilibili', 'hot')]],
+      ]),
+      platformCounts: { twitter: 1, bilibili: 1 },
+    })
+
+    render(<ChannelsView embedded />)
+
+    expect(screen.getByText('Item x1')).toBeInTheDocument()
+    expect(screen.queryByText('Item b1')).toBeNull()
+    expect(document.getElementById('s-bilibili')).toBeNull()
+  })
+
   it('X section 使用 L1 内容分类 pill，不展示关注/推荐/书签 source pill', async () => {
     const scrollTo = vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
     Object.defineProperty(window, 'scrollY', { configurable: true, value: 100 })

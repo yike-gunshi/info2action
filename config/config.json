@@ -153,6 +153,7 @@
     }
   },
   "bilibili": {
+    "enabled": false,
     "up_list": [
       {
         "name": "影视飓风",
@@ -623,6 +624,61 @@
         "name": "Google Developers Blog",
         "url": "https://developers.googleblog.com/feeds/posts/default",
         "slug": "google_dev_blog"
+      },
+      {
+        "name": "HF Daily Papers",
+        "url": "https://azuresilent.github.io/hf-paper-rss/feed.xml",
+        "slug": "hf_daily_papers"
+      },
+      {
+        "name": "NLP Newsletter (elvis)",
+        "url": "https://nlp.elvissaravia.com/feed",
+        "slug": "nlp_newsletter"
+      },
+      {
+        "name": "OpenAI Cookbook",
+        "url": "https://github.com/openai/openai-cookbook/commits/main.atom",
+        "slug": "openai_cookbook"
+      },
+      {
+        "name": "Claude Cookbooks",
+        "url": "https://github.com/anthropics/claude-cookbooks/commits/main.atom",
+        "slug": "claude_cookbooks"
+      },
+      {
+        "name": "Codex Changelog",
+        "url": "https://learn.chatgpt.com/docs/changelog/rss.xml",
+        "slug": "codex_changelog"
+      },
+      {
+        "name": "Anthropic Skills",
+        "url": "https://github.com/anthropics/skills/commits/main.atom",
+        "slug": "anthropic_skills"
+      },
+      {
+        "name": "OpenAI Agents SDK",
+        "url": "https://github.com/openai/openai-agents-python/releases.atom",
+        "slug": "openai_agents_sdk"
+      },
+      {
+        "name": "Gemini Cookbook",
+        "url": "https://github.com/google-gemini/cookbook/commits/main.atom",
+        "slug": "gemini_cookbook"
+      },
+      {
+        "name": "MCP Spec Releases",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/releases.atom",
+        "slug": "mcp_spec"
+      },
+      {
+        "name": "MCP Blog",
+        "url": "https://blog.modelcontextprotocol.io/index.xml",
+        "slug": "mcp_blog"
+      },
+      {
+        "name": "vLLM Blog",
+        "url": "https://vllm.ai/blog/rss.xml",
+        "slug": "vllm_blog"
       }
     ]
   },

@@ -66,13 +66,13 @@ const clusterRow = {
     {
       id: 'item-1', title: 'Introducing Claude 5', url: 'https://example.com/1',
       platform: 'official', source: 'anthropic', author_name: 'Anthropic', fetched_at: '2026-07-17T09:42:00Z',
-      verdict: 'featured', score10: 9.2, dims, veto: null, uncertainty: null,
+      verdict: 'featured', score10: 9.2, reach: null, dims, veto: null, uncertainty: null,
       reason: '官方一手发布', feedback: { kind: null, note: null },
     },
     {
       id: 'item-2', title: '普通人如何抓住 Claude 5 红利', url: 'https://example.com/2',
       platform: 'wechat_mp', source: 'ai-note', author_name: 'AI掘金笔记', fetched_at: '2026-07-17T08:00:00Z',
-      verdict: 'drop', score10: 3.1, dims: { ...dims, authority: 1 }, veto: 'marketing', uncertainty: null,
+      verdict: 'drop', score10: 3.1, reach: null, dims: { ...dims, authority: 1 }, veto: 'marketing', uncertainty: null,
       reason: '营销通稿', feedback: { kind: null, note: null },
     },
   ],
@@ -356,6 +356,28 @@ describe('HighlightsFilteredTab 全景表', () => {
     expect(screen.queryByText('veto · none')).not.toBeInTheDocument()
   })
 
+  it('高分 reach_guard drop 显示受众面原因和 reach，不误报打分闸', async () => {
+    vi.mocked(getAdminHighlightsFunnelRows).mockResolvedValue({
+      ...panoramaResponse,
+      items: [{
+        ...clusterRow,
+        members: [{
+          ...clusterRow.members[0], id: 'reach-guard', title: '窄受众高质量内容',
+          verdict: 'drop', score10: 8.7, reach: 1, veto: null,
+          reason: '[reach_guard] audience too narrow',
+        }],
+      }],
+    })
+    render(<HighlightsFilteredTab reloadSignal={0} />)
+
+    const row = await screen.findByTestId('funnel-item-row-reach-guard')
+    const reason = within(row).getByTestId('item-block-reason')
+    expect(reason).toHaveTextContent('reach · 受众面过窄')
+    expect(reason).not.toHaveTextContent('未过打分闸')
+    expect(within(row).getByText('reach · 受众面过窄')).toHaveClass('a-pill-warn')
+    expect(within(row).getByText('r1')).toHaveClass('font-mono', 'text-[10px]')
+  })
+
   it('item 无 veto/分数时回退显示 LLM reason', async () => {
     vi.mocked(getAdminHighlightsFunnelRows).mockResolvedValue({
       ...panoramaResponse,
@@ -385,13 +407,53 @@ describe('HighlightsFilteredTab 全景表', () => {
     expect(within(cell).getByRole('button', { name: '不展示' })).toHaveAttribute('aria-pressed', 'false')
   })
 
-  it('搜索空态与 non-remote 降级态保留边界教育', async () => {
+  it('搜索命中未进簇条目时提示聚类异常并可切换到异常表', async () => {
     render(<HighlightsFilteredTab reloadSignal={0} />)
     await screen.findByText('Claude 5 系列发布')
     const search = screen.getByRole('searchbox', { name: '搜索全景表' })
     fireEvent.change(search, { target: { value: '不存在' } })
     fireEvent.keyDown(search, { key: 'Enter' })
-    expect(await screen.findByText('没有匹配的条目。搜不到通常意味着它未入库——请检查信源池')).toBeInTheDocument()
+
+    expect(await screen.findByText('命中了 3 条，但它们没进簇，所以不在全景表里。')).toBeInTheDocument()
+    expect(screen.queryByText(/请检查信源池/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '查看异常表' }))
+    await waitFor(() => expect(getAdminHighlightsFunnelRows).toHaveBeenLastCalledWith(
+      expect.objectContaining({ view: 'anomaly', stage: '', page: 1 }),
+    ))
+  })
+
+  it('搜索无异常命中时提示可能未入库或不在当前筛选内', async () => {
+    vi.mocked(getAdminHighlightsFunnel).mockResolvedValue({ ...funnelResponse, anomalies_count: 0 })
+    render(<HighlightsFilteredTab reloadSignal={0} />)
+    await screen.findByText('Claude 5 系列发布')
+    const search = screen.getByRole('searchbox', { name: '搜索全景表' })
+    fireEvent.change(search, { target: { value: '不存在' } })
+    fireEvent.keyDown(search, { key: 'Enter' })
+
+    expect(await screen.findByText('没有匹配的条目。它可能尚未入库，也可能不在当前时间窗或标签筛选内。')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '查看异常表' })).not.toBeInTheDocument()
+  })
+
+  it('异常视图下搜索无结果不再提信源池，而是引导切回全景表', async () => {
+    render(<HighlightsFilteredTab reloadSignal={0} />)
+    await screen.findByText('Claude 5 系列发布')
+
+    fireEvent.click(screen.getByRole('button', { name: /异常/ }))
+    vi.mocked(getAdminHighlightsFunnelRows).mockResolvedValue({
+      ...panoramaResponse, granularity: 'item', items: [], total: 0,
+    })
+    const search = screen.getByRole('searchbox', { name: '搜索全景表' })
+    fireEvent.change(search, { target: { value: '不存在' } })
+    fireEvent.keyDown(search, { key: 'Enter' })
+
+    expect(await screen.findByText('异常表里没有匹配的条目。可以切回全景表，看它是否已经正常进簇。')).toBeInTheDocument()
+    expect(screen.queryByText(/请检查信源池/)).not.toBeInTheDocument()
+  })
+
+  it('non-remote 降级态保留边界教育', async () => {
+    render(<HighlightsFilteredTab reloadSignal={0} />)
+    await screen.findByText('Claude 5 系列发布')
 
     const unavailable = Object.assign(new Error('remote required'), { status: 501 })
     vi.mocked(getAdminHighlightsFunnelRows).mockRejectedValue(unavailable)

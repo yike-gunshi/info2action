@@ -3,7 +3,7 @@
 Usage: python3 fetch_lingowhale.py
 Outputs: data/lingowhale/feed.json, data/lingowhale/groups.json
 """
-import json, os, re, ssl, sys, threading, time, urllib.request, urllib.parse
+import base64, json, os, re, ssl, sys, threading, time, urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -30,7 +30,7 @@ def _cred(env_key, config_key, default=''):
 API_BASE = 'https://api-public.lingowhale.com'
 API_INTERNAL = 'https://api.lingowhale.com'
 PASSPORT_BASE = 'https://api-passport.shenyandayi.com'
-TOKEN_STORE_PATH = os.path.join(DATA_DIR, 'lingowhale_tokens.json')
+TOKEN_STORE_PATH = os.path.join(BASE, 'data', 'lingowhale_tokens.json')
 GROUP_ENDPOINTS = (
     '/api/lingowhale/v1/user_subscribe/list',
     '/api/feed/v1/user_subscribe/list',
@@ -49,13 +49,14 @@ _TOKEN_STORE_CACHE_MTIME = None
 _TOKEN_STORE_LOCK = threading.Lock()
 _REFRESH_LOCK = threading.Lock()
 _LAST_REFRESH_OK = False
+_LAST_REFRESH_FAILED_AT = None
+# 覆盖同一抓取轮次的频繁10010，又保留下轮自动恢复机会。
+REFRESH_FAILURE_COOLDOWN_SEC = 300
 
 
 def _token_store_path():
-    data_dir = os.environ.get('INFO2ACTION_DATA_DIR')
-    if data_dir:
-        return os.path.join(data_dir, 'lingowhale_tokens.json')
-    return TOKEN_STORE_PATH
+    # BF-0803-1: token 必须跨 run 持久化，仅保留显式测试覆盖。
+    return os.environ.get('INFO2ACTION_LINGOWHALE_TOKEN_STORE') or TOKEN_STORE_PATH
 
 
 def _load_token_store():
@@ -224,14 +225,67 @@ def _is_lingowhale_token_error(data):
     return str(code) == '10010' or 'token' in msg.lower()
 
 
+def _jwt_exp(token):
+    try:
+        payload = str(token or '').split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload.encode()))['exp'])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _alert_lingowhale(alert_type, subject, message):
+    try:
+        from utils.email import send_lingowhale_alert
+        return send_lingowhale_alert(alert_type, subject, message)
+    except Exception as exc:  # noqa: BLE001 — 告警失败不影响抓取
+        print(f"  ⚠️  语鲸告警发送失败: {type(exc).__name__}")
+        return False
+
+
+def _refresh_expiring_tokens(timeout=30):
+    """BF-0803-1: 在 auth_token 仍可用时提前续期，JWT 解析失败时降级原流程。"""
+    tokens = _current_token_fields()
+    now = time.time()
+    access_exp = _jwt_exp(tokens.get('access_token'))
+    auth_exp = _jwt_exp(tokens.get('auth_token'))
+    auth_expiring = auth_exp is not None and auth_exp - now < 3 * 86400
+    access_expiring = access_exp is not None and access_exp - now < 24 * 3600
+
+    if access_expiring or auth_expiring:
+        refreshed = refresh_lingowhale_tokens(timeout=timeout)
+        if not refreshed and auth_expiring:
+            _alert_lingowhale(
+                'auth_expiring',
+                '语鲸 auth_token 即将过期且自动续期失败',
+                '语鲸 auth_token 剩余有效期不足 3 天，自动续期已失败，需要人工重新登录语鲸。',
+            )
+        return refreshed
+    return None
+
+
 def refresh_lingowhale_tokens(timeout=30):
-    global _LAST_REFRESH_OK
+    global _LAST_REFRESH_OK, _LAST_REFRESH_FAILED_AT
 
     if not _REFRESH_LOCK.acquire(blocking=False):
         with _REFRESH_LOCK:
             return _LAST_REFRESH_OK
 
     try:
+        now = time.time()
+        if (
+            _LAST_REFRESH_FAILED_AT is not None
+            and now - _LAST_REFRESH_FAILED_AT < REFRESH_FAILURE_COOLDOWN_SEC
+        ):
+            print("  ⏸️  语鲸 token 刷新失败冷却中，跳过 passport 请求")
+            return False
+
+        def fail_refresh():
+            global _LAST_REFRESH_OK, _LAST_REFRESH_FAILED_AT
+            _LAST_REFRESH_OK = False
+            _LAST_REFRESH_FAILED_AT = time.time()
+            return False
+
         current = _current_token_fields()
         try:
             data = _raw_post_json(
@@ -242,20 +296,17 @@ def refresh_lingowhale_tokens(timeout=30):
             )
         except Exception as exc:
             print(f"  ⚠️  语鲸 token 刷新异常: {type(exc).__name__}")
-            _LAST_REFRESH_OK = False
-            return False
+            return fail_refresh()
 
         if not isinstance(data, dict) or data.get('code') != 0:
             code = data.get('code') if isinstance(data, dict) else 'invalid'
             print(f"  ⚠️  语鲸 token 刷新失败: code={code}")
-            _LAST_REFRESH_OK = False
-            return False
+            return fail_refresh()
 
         body = data.get('data') or {}
         if not isinstance(body, dict):
             print("  ⚠️  语鲸 token 刷新失败: data invalid")
-            _LAST_REFRESH_OK = False
-            return False
+            return fail_refresh()
 
         tokens = {
             'access_token': str(body.get('access_token') or ''),
@@ -266,13 +317,14 @@ def refresh_lingowhale_tokens(timeout=30):
         }
         if not tokens['access_token'] or not tokens['auth_token'] or not tokens['b_id']:
             print("  ⚠️  语鲸 token 刷新失败: 缺少必要字段")
-            _LAST_REFRESH_OK = False
-            return False
+            return fail_refresh()
 
         _LAST_REFRESH_OK = _write_token_store(tokens)
         if _LAST_REFRESH_OK:
+            _LAST_REFRESH_FAILED_AT = None
             print("  ✅ 已刷新语鲸 token")
-        return _LAST_REFRESH_OK
+            return True
+        return fail_refresh()
     finally:
         _REFRESH_LOCK.release()
 
@@ -286,6 +338,12 @@ def _post_json(path, payload, timeout=30):
                 return _raw_post_json(url, payload, _current_headers(), timeout=timeout)
             except Exception as exc:
                 print(f"  ⚠️  语鲸 token 刷新后重试失败: {type(exc).__name__}")
+        else:
+            _alert_lingowhale(
+                'credential_refresh_failed',
+                '语鲸凭据失效且自动刷新失败',
+                '语鲸接口返回凭据错误，自动刷新未成功，请检查 LINGOWHALE_* 凭据。',
+            )
         return data
     return data
 
@@ -694,6 +752,8 @@ def _fetch_subscription_feed_from_endpoint(endpoint, channel_ids, label, timeout
             result = _fetch_feed_page(endpoint, channel_ids, cursor, timeout=timeout)
         except Exception as e:
             print(f"  ❌ 公众号 API 请求失败 ({label}, page {page}): {e}")
+            if page == 1:
+                raise
             break
 
         entries = [_normalize_entry(e) for e in (result.get('feed_list') or [])]
@@ -762,6 +822,7 @@ def fetch_subscription_feed(groups_info=None, since_ts=None):
     all_entries = []
     seen = set()
     total_pages = 0
+    channel_results = []
     endpoint = FEED_ENDPOINTS[0]
 
     if channel_ids:
@@ -776,11 +837,9 @@ def fetch_subscription_feed(groups_info=None, since_ts=None):
                     timeout=CHANNEL_TIMEOUT_SEC,
                     since_ts=since_ts,
                 )
-                if source_id is not None:
-                    _record_lingowhale_result(source_id, ok=True)
+                channel_results.append((source_id, True, None))
             except Exception as exc:  # noqa: BLE001 — 单频道失败不影响后续频道
-                if source_id is not None:
-                    _record_lingowhale_result(source_id, ok=False, error=exc)
+                channel_results.append((source_id, False, exc))
                 print(f"    channel {idx}/{len(channel_ids)} failed: {exc}")
                 continue
             total_pages += pages
@@ -800,6 +859,16 @@ def fetch_subscription_feed(groups_info=None, since_ts=None):
         key=lambda e: e.get('pub_time') or 0,
         reverse=True,
     )[:MAX_ITEMS]
+    if channel_results and all(not ok for _, ok, _ in channel_results):
+        # BF-0803-1: 全部频道请求失败才判整体失败；成功请求 0 更新是正常轮次。
+        error = 'lingowhale feed 整体失败: 全部频道请求失败'
+        for source_id in registry_channel_map.values():
+            if source_id is not None:
+                _record_lingowhale_result(source_id, ok=False, error=error)
+    else:
+        for source_id, ok, error in channel_results:
+            if source_id is not None:
+                _record_lingowhale_result(source_id, ok=ok, error=error)
     print(f"  📥 Feed: {len(result)} entries in {total_pages} pages ({stop_reason})")
     return result
 
@@ -1083,6 +1152,8 @@ def main():
     if not _current_headers().get('Auth-Token'):
         print("  ⚠️  公众号 auth_token 未配置(检查 .env LINGOWHALE_AUTH_TOKEN 或 source .env 后再跑),跳过")
         return
+
+    _refresh_expiring_tokens()
 
     t0 = time.time()
     print("🐋 公众号订阅 Feed...")

@@ -272,7 +272,7 @@ def test_read_model_date_counts_cache_and_total_follow_display_threshold(monkeyp
     remote_db.clear_feed_cache_keys()
 
     assert disabled["date_counts"] == {"2026-07-15": 5}
-    assert disabled["total_available_within_30d"] == 9
+    assert disabled["total_available_within_30d"] == 5
     assert enabled["date_counts"] == {"2026-07-15": 2}
     assert enabled["total_available_within_30d"] == 2
     assert fake.date_queries == 2

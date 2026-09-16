@@ -108,6 +108,67 @@ def test_invalid_ai_relevance_is_dropped_from_diagnostic_field():
     assert result["highlight_ai_relevant"] is None
 
 
+def test_reach_parsed_into_scores():
+    result = highlight_verdict.normalize_verdict_result(_raw(reach=2))
+
+    assert result["highlight_scores"]["reach"] == 2
+    assert result["highlight_include_in_highlights"] is True
+    assert result["highlight_verdict"] == "featured"
+
+
+def test_reach_guard_demotes_featured():
+    result = highlight_verdict.normalize_verdict_result(_raw(reach=1))
+
+    assert result["highlight_verdict"] == "drop"
+    assert result["cluster_verdict"] == "drop"
+    assert result["highlight_include_in_highlights"] is False
+    assert result["highlight_reason"].startswith("[reach_guard] ")
+    assert "①实质收获：给出可照做方法" in result["highlight_reason"]
+
+
+def test_reach_guard_demotes_positive_borderline():
+    result = highlight_verdict.normalize_verdict_result(
+        _raw(
+            verdict="borderline",
+            value_path="lead_value",
+            uncertainty="thin_detail",
+            reach=1,
+        )
+    )
+
+    assert result["highlight_include_in_highlights"] is False
+    assert result["cluster_verdict"] == "drop"
+
+
+def test_missing_reach_keeps_legacy_behavior():
+    result = highlight_verdict.normalize_verdict_result(_raw())
+
+    assert result["highlight_include_in_highlights"] is True
+    assert "reach" not in result["highlight_scores"]
+    assert not result["highlight_reason"].startswith("[reach_guard] ")
+
+
+def test_invalid_reach_treated_as_missing():
+    for reach in ("5", "abc"):
+        result = highlight_verdict.normalize_verdict_result(_raw(reach=reach))
+
+        assert result["highlight_include_in_highlights"] is True
+        assert "reach" not in result["highlight_scores"]
+
+
+def test_reach_guard_skips_risk_borderline():
+    result = highlight_verdict.normalize_verdict_result(
+        _raw(
+            verdict="borderline",
+            value_path="major_event",
+            uncertainty="unverified_major_claim",
+            reach=1,
+        )
+    )
+
+    assert result["cluster_verdict"] == "risk_borderline"
+
+
 def test_veto_marketing_forces_drop_even_if_llm_said_featured():
     result = highlight_verdict.normalize_verdict_result(
         _raw(veto="marketing", reason="产品新版本发布，功能强大")
@@ -169,10 +230,10 @@ def test_pending_result_carries_veto_key():
     assert result["highlight_veto"] is None
 
 
-def test_prompt_v3_8_has_veto_dimension():
+def test_prompt_v3_9_has_veto_and_reach_dimensions():
     prompt = highlight_verdict.load_system_prompt()
 
-    assert highlight_verdict.PROMPT_VERSION == "item_verdict_v3_8_veto_dimension_2026_07_10"
+    assert highlight_verdict.PROMPT_VERSION == "item_verdict_v3_9_0_reach_gate_2026_08_01"
     assert "veto" in prompt
     assert "marketing" in prompt
     assert "rumor_unverified" in prompt
@@ -185,12 +246,15 @@ def test_prompt_v3_8_has_veto_dimension():
         "flamewar",
         "engagement_bait",
     }
+    assert "reach" in prompt
+    assert "reach=1 → drop" in prompt
+    assert '"reach": 2' in prompt
 
 
 def test_prompt_keeps_v3_7_ai_audience_scope_anchors():
     prompt = highlight_verdict.load_system_prompt()
 
-    assert "item_verdict_v3_8" in highlight_verdict.PROMPT_VERSION
+    assert "item_verdict_v3_9" in highlight_verdict.PROMPT_VERSION
     assert "AI 投资" in prompt
     assert "AI 相关 = AI 受众相关" in prompt
     assert "GitHub/repo/开源教程" in prompt

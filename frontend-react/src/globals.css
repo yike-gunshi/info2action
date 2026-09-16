@@ -4,6 +4,127 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Highlights date directory: page-local geometry, sharing the real sticky row. */
+html.highlights-no-scrollbar { scrollbar-width: none; scrollbar-gutter: auto; }
+html.highlights-no-scrollbar::-webkit-scrollbar { display: none; width: 0; height: 0; }
+.highlights-view {
+  --highlights-l2-height: 44px;
+  --highlights-date-top: calc(var(--highlights-l2-top) + var(--highlights-l2-height));
+}
+.highlights-view .highlights-filter-row,
+.highlights-view [data-testid="highlights-filter-tabs-inner"],
+.highlights-view [data-testid="highlights-filter-tabs-inner"] > button {
+  height: var(--highlights-l2-height);
+}
+.highlights-view .highlights-filter-row { border-bottom: 1px solid var(--border); }
+.highlights-view [data-testid="highlights-filter-tabs-inner"] { border-bottom-color: transparent; }
+.highlights-view [data-testid="event-date-heading"] { scroll-margin-top: calc(var(--highlights-date-top) + 8px); }
+.highlights-view [data-testid="event-date-heading"]:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+/* A zero-height overlay stays below the category bar without moving the date/card anchors. */
+.highlights-newer-feedback {
+  position: sticky; top: var(--highlights-date-top); height: 0; z-index: 40; pointer-events: none;
+}
+.highlights-newer-status {
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 8px; width: max-content; max-width: calc(100% - 16px);
+  padding: 10px 14px; border: 1px solid var(--brand-border); border-radius: 4px;
+  color: color-mix(in srgb, var(--brand) 80%, var(--foreground)); background: var(--background);
+  font-size: 13px; line-height: 1.5; overflow-wrap: anywhere;
+}
+.highlights-newer-status[data-state="error"] { max-width: min(440px, calc(100% - 16px)); pointer-events: auto; }
+/* The date header and digest share the same paper and scroll in normal flow. */
+.highlights-day-heading {
+  color: color-mix(in srgb, var(--brand) 80%, var(--foreground));
+  background: color-mix(in srgb, var(--brand) 7%, var(--background));
+  border-radius: 4px;
+  padding: 16px 20px;
+}
+.highlights-day-heading[data-has-digest] { border-radius: 4px 4px 0 0; padding-bottom: 8px; }
+.highlights-day-heading + [data-testid="daily-digest-strip"] { border-radius: 0 0 4px 4px; padding-top: 0; }
+.highlights-date-directory { display: flex; flex-direction: column; max-height: inherit; min-height: 0; }
+.highlights-date-footer { flex: 0 0 auto; }
+.highlights-date-list { overflow-y: auto; overscroll-behavior: contain; min-height: 0; padding: 4px; scrollbar-width: none; }
+.highlights-date-list::-webkit-scrollbar { display: none; width: 0; height: 0; }
+.highlights-date-button {
+  position: relative; display: flex; align-items: center; gap: 10px;
+  width: 100%; min-height: 44px; padding: 0 3px;
+  color: var(--muted-foreground); text-align: left;
+  font-family: theme('fontFamily.display'); font-size: 15px; font-variant-numeric: tabular-nums;
+}
+.highlights-date-button::before {
+  content: ''; position: absolute; left: 5.5px; top: 0; bottom: 0; width: 1px;
+  background: var(--border); pointer-events: none;
+}
+.highlights-date-dot { position: relative; flex: 0 0 6px; height: 6px; display: grid; place-items: center; }
+.highlights-date-dot::after { content: ''; width: 4px; height: 4px; border-radius: 50%; background: var(--muted-foreground); }
+.highlights-date-button[aria-current="date"] { color: var(--foreground); font-weight: 600; }
+.highlights-date-button[aria-current="date"] .highlights-date-dot::after { width: 6px; height: 6px; background: var(--brand); }
+.highlights-date-text { position: relative; white-space: nowrap; }
+.highlights-date-text::after { content: attr(data-label); position: absolute; inset: 0; opacity: 0; color: transparent; pointer-events: none; transition: opacity 160ms ease-out; }
+.highlights-date-button[aria-current="date"] .highlights-date-text::after {
+  opacity: 1;
+  text-shadow: 0 0 8px color-mix(in srgb, var(--brand) 35%, transparent), 0 0 14px color-mix(in srgb, var(--brand) 16%, transparent);
+}
+.highlights-date-button:hover:not(:disabled) { color: var(--foreground); }
+.highlights-date-button:focus-visible,
+.highlights-date-trigger:focus-visible,
+.highlights-date-latest:focus-visible,
+.highlights-date-status button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 2px; }
+.highlights-date-button:disabled,
+.highlights-date-latest:disabled,
+.highlights-date-status button:disabled { cursor: not-allowed; opacity: .65; }
+.highlights-date-spinner { position: absolute; right: 0; animation: highlights-date-spin 1s linear infinite; background: var(--background); }
+.highlights-date-year {
+  position: relative;
+  display: flex; align-items: center; flex: 0 0 auto; height: var(--highlights-l2-height, 44px); padding-left: 23px;
+  color: var(--foreground); background: var(--background);
+  font-family: theme('fontFamily.display'); font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.highlights-date-year::before {
+  /* Match the date track: 4px list padding + 5.5px button inset. */
+  content: ''; position: absolute; left: 9.5px; top: 0;
+  bottom: calc(-4px - var(--date-list-offset, 0px)); width: 1px;
+  background: var(--border); pointer-events: none;
+}
+.highlights-date-status { color: var(--muted-foreground); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.highlights-date-status:has(> p) { padding: 8px 4px; }
+.highlights-date-status button { min-height: 44px; color: var(--foreground); text-decoration: underline; text-underline-offset: 3px; }
+.highlights-date-latest { display: block; width: 100%; margin-top: 8px; min-height: 44px; color: var(--foreground); font-size: 12px; text-align: left; padding: 0 4px; }
+.highlights-date-latest:hover { text-decoration: underline; text-underline-offset: 3px; }
+.highlights-date-trigger { flex: 0 0 64px; display: flex; align-items: center; justify-content: flex-end; gap: 4px; min-height: 44px; color: var(--foreground); font-size: 13px; }
+.highlights-date-popover {
+  z-index: 60; width: min(192px, calc(100vw - 32px));
+  max-height: min(360px, calc(var(--radix-popover-content-available-height) - 16px));
+  background: var(--background); border: 1px solid var(--border); border-radius: 4px; padding: 4px;
+}
+@keyframes highlights-date-spin { to { transform: rotate(360deg); } }
+@media (min-width: 1280px) {
+  .highlights-view { --highlights-l2-height: 40px; display: grid; grid-template-columns: 80px minmax(0, 1040px); gap: 16px; }
+  .highlights-date-rail {
+    --date-label-center: var(--highlights-label-center, 16px);
+    --date-first-y: max(var(--highlights-first-label-y, calc(var(--highlights-date-top) + var(--date-label-center))), calc(var(--highlights-date-top) + var(--date-label-center)));
+    --date-footer-height: var(--highlights-date-footer-height, 0px);
+    /* Fourteen rows extend 13.5 row heights below the first centered point. */
+    --date-row-height: max(44px, calc((100dvh - var(--date-first-y) - 24px - 4px - var(--date-footer-height)) / 13.5));
+    --date-list-offset: calc(var(--highlights-first-group-top, var(--highlights-l2-height)) - var(--highlights-l2-height) + var(--date-label-center) - 4px - var(--date-row-height) / 2);
+    position: sticky; align-self: start; width: 80px;
+    margin-left: calc((1136px - min(100vw, 1440px)) / 2 + 10px);
+    top: var(--highlights-l2-top);
+    height: calc(100dvh - var(--highlights-l2-top) - 24px);
+  }
+  .highlights-date-rail .highlights-date-directory { height: 100%; }
+  .highlights-date-rail .highlights-date-list {
+    flex: 1;
+    margin-top: var(--date-list-offset);
+  }
+  .highlights-date-rail .highlights-date-row { position: relative; height: var(--date-row-height); min-height: 44px; }
+  .highlights-date-rail .highlights-date-button { height: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .highlights-date-text::after { transition: none; }
+  .highlights-date-spinner { animation: none; }
+}
+
 @layer base {
   :root {
     --background: #F4F3EF;

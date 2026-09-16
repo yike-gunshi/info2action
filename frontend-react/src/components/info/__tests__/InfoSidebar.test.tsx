@@ -227,7 +227,7 @@ describe('InfoSidebar', () => {
 
   it('按频道模式使用固定平台目录且不在 pill 内展示数量', () => {
     useFeedStore.setState({
-      platformCounts: { twitter: 36, lingowhale: 24, github: 18 },
+      platformCounts: { twitter: 36, lingowhale: 24, github: 18, bilibili: 12 },
     })
 
     render(<InfoSidebar groupBy="platform" onGroupByChange={vi.fn()} />)
@@ -244,6 +244,8 @@ describe('InfoSidebar', () => {
     expect(screen.getByTestId('info-group-github')).toHaveTextContent('GitHub')
     expect(screen.getByTestId('info-group-lingowhale')).not.toHaveTextContent('24')
     expect(screen.getByTestId('info-group-github')).not.toHaveTextContent('18')
+    expect(screen.queryByTestId('info-group-bilibili')).toBeNull()
+    expect(screen.queryByText('B站')).toBeNull()
     expect(screen.queryByText(/条/)).toBeNull()
   })
 

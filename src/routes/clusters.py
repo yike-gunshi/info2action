@@ -30,7 +30,7 @@ import os
 import queue
 import threading
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,15 +41,17 @@ from starlette.concurrency import run_in_threadpool
 import db
 import remote_db
 import action_quota
+import daily_digest
 from authz import can_access_all, current_user_id
 from category_taxonomy import ACTIVE_CATEGORY_IDS, canonicalize_category, expand_query_categories
 from deps import BASE
+from media_assets import image_urls, media_kind, merge_media, normalize_media
 from routes.public_response_cache import (
     get_public_json_response,
     is_public_get_request,
     set_public_json_response,
 )
-from time_utils import parse_datetime, sort_key, to_utc_iso
+from time_utils import highlights_published_before, parse_datetime, sort_key, to_utc_iso
 
 
 def _log_event(event: str, **fields):
@@ -199,12 +201,12 @@ def _github_cluster_display_min_stars() -> int:
         return 50
 
 
-def _remote_error_response(exc: Exception) -> JSONResponse:
+def _remote_error_response(exc: Exception, *, no_store: bool = False) -> JSONResponse:
     return JSONResponse({
         'error': 'Remote event read failed',
         'detail': str(exc),
         'data_backend': remote_db.event_read_backend(),
-    }, status_code=503)
+    }, status_code=503, headers={'Cache-Control': 'no-store'} if no_store else None)
 
 
 # BF-0708-3: last-good snapshot of the events payload, keyed like the public
@@ -317,8 +319,14 @@ def _build_event_source_metadata(rows) -> dict[int, dict]:
         cluster_id = int(row['cluster_id'])
         data = grouped.setdefault(
             cluster_id,
-            {'source_preview': [], '_seen_sources': set(), '_category_counts': {}},
+            {'source_preview': [], '_seen_sources': set(), '_category_counts': {}, '_media': []},
         )
+        try:
+            data['_media'].extend(
+                normalize_media(row['cover_url'], row['media_json'], source_url=row['url'])
+            )
+        except (KeyError, IndexError):
+            pass
 
         category = _category_l1(row['ai_category'])
         if category:
@@ -353,6 +361,7 @@ def _build_event_source_metadata(rows) -> dict[int, dict]:
         result[cluster_id] = {
             'category': category,
             'source_preview': data['source_preview'],
+            'media_kind': media_kind(data['_media']),
         }
     return result
 
@@ -365,7 +374,7 @@ def _load_event_source_metadata(conn, cluster_ids: list[int]) -> dict[int, dict]
         f"""SELECT ci.cluster_id, ci.source_identity, ci.rank_in_cluster,
                   ci.is_primary_source,
                   i.id AS item_id, i.platform, i.author_name, i.source,
-                  i.url, i.ai_category, i.published_at, i.fetched_at
+                  i.url, i.cover_url, i.media_json, i.ai_category, i.published_at, i.fetched_at
            FROM cluster_items ci
            JOIN items i ON i.id = ci.item_id
            WHERE ci.cluster_id IN ({placeholders})
@@ -387,36 +396,7 @@ def _load_event_source_metadata(conn, cluster_ids: list[int]) -> dict[int, dict]
 
 
 def _media_urls_from_item(cover_url: Any, media_json: Any) -> list[str]:
-    urls: list[str] = []
-
-    def add_url(value: Any):
-        if not value:
-            return
-        url = str(value).strip()
-        if url and url not in urls:
-            urls.append(url)
-
-    add_url(cover_url)
-    media = media_json
-    if isinstance(media, str):
-        try:
-            media = json.loads(media)
-        except Exception:
-            media = []
-    if not isinstance(media, list):
-        return urls
-
-    for entry in media:
-        if isinstance(entry, str):
-            add_url(entry)
-            continue
-        if not isinstance(entry, dict):
-            continue
-        media_type = str(entry.get('type') or '').lower()
-        if media_type in ('video', 'animated_gif'):
-            continue
-        add_url(entry.get('url') or entry.get('preview_image_url') or entry.get('src'))
-    return urls
+    return image_urls(normalize_media(cover_url, media_json))
 
 
 def _row_to_event(
@@ -456,6 +436,7 @@ def _row_to_event(
         'last_doc_at': to_utc_iso(row['last_doc_at']) if row['last_doc_at'] else None,
         'platforms': platforms,
         'cover_url': row['cover_url'],
+        'media_kind': metadata.get('media_kind') or ('image' if row['cover_url'] else None),
         'has_update': has_update,
         'live_version': lv,
         'last_seen_version': seen,
@@ -550,6 +531,27 @@ def _categories_sql_clause(categories: list[str]) -> tuple[str, list[str]]:
     return clause, list(categories)
 
 
+@router.get('/api/feed/daily-digest')
+async def feed_daily_digest(
+    request: Request,
+    start: date = Query(...),
+    end: date = Query(...),
+):
+    # Same auth boundary as /api/feed/events: public read, with authenticated
+    # requests resolved through the same current-user mechanism.
+    current_user_id(request)
+    if end < start:
+        return JSONResponse({'detail': 'end must be on or after start'}, status_code=422)
+    if (end - start).days > 31:
+        return JSONResponse({'detail': 'date range must not exceed 31 days'}, status_code=422)
+    try:
+        digests = await run_in_threadpool(daily_digest.list_digests, start, end)
+    except Exception as exc:
+        logger.exception('daily_digest API read failed: %s', exc)
+        return JSONResponse({'error': str(exc)}, status_code=503)
+    return {'digests': digests}
+
+
 @router.get('/api/feed/events')
 async def feed_events(
     request: Request,
@@ -559,6 +561,7 @@ async def feed_events(
     since_version_snapshot: int | None = Query(None, description='client snapshot anchor'),
     fetched_since: str | None = Query(None, description='only clusters touched by docs fetched since this timestamp'),
     cursor: str | None = Query(None, description='opaque read-model cursor for versioned event pagination'),
+    target_date: date | None = Query(None, description='YYYY-MM-DD timeline day to locate within ordinary pagination'),
     categories: str | None = Query(None, description='v17.0: L1 ids comma-separated, OR 多选 (e.g. models,coding)'),
     timezone_offset_minutes: int = Query(
         _DEFAULT_TIMELINE_TIMEZONE_OFFSET_MINUTES,
@@ -567,9 +570,14 @@ async def feed_events(
         description='browser Date#getTimezoneOffset minutes for timeline day counts',
     ),
 ):
+    # Direct route calls in existing tests retain FastAPI's Query default.
+    target_date = target_date if isinstance(target_date, date) else None
+    if target_date and request.query_params.get('target_date') != target_date.isoformat():
+        return JSONResponse({'detail': 'target_date must be YYYY-MM-DD'}, status_code=422)
     uid = current_user_id(request)
     public_only = _is_anonymous_public_request(request)
     tz_offset = _timezone_offset_minutes(timezone_offset_minutes)
+    published_before = highlights_published_before()
     # v17.0: categories L1 筛选（精选 tab chip OR）— remote 和 local 路径共用
     categories_list = _parse_categories_filter(categories)
     read_model_cursor = _optional_read_model_cursor(cursor)
@@ -586,8 +594,9 @@ async def feed_events(
         and fetched_since is None
         and read_model_cursor is None
         and not categories_list
+        and target_date is None
     ):
-        cache_key = ("feed_events", _public_cache_scope(), tz_offset, min_github_stars, events_enabled)
+        cache_key = ("feed_events", _public_cache_scope(), tz_offset, min_github_stars, events_enabled, published_before)
         cached = get_public_json_response(cache_key)
         if cached is not None:
             return cached
@@ -614,6 +623,7 @@ async def feed_events(
                     enabled=events_enabled,
                     categories=categories_list,
                     timezone_offset_minutes=tz_offset,
+                    **({'target_date': target_date.isoformat()} if target_date else {}),
                 ),
                 timeout=_feed_events_request_timeout_sec(),
             )
@@ -622,18 +632,22 @@ async def feed_events(
                 return set_public_json_response(cache_key, result)
             return result
         except (asyncio.TimeoutError, TimeoutError):
+            if target_date:
+                return JSONResponse({'detail': 'Date lookup timed out'}, status_code=503, headers={'Cache-Control': 'no-store'})
             logger.warning(
                 'feed_events: request exceeded %.1fs budget, serving degraded response',
                 _feed_events_request_timeout_sec(),
             )
             return _degraded_events_response(cache_key)
         except remote_db.RemoteDBTimeoutError as exc:
+            if target_date:
+                return _remote_error_response(exc, no_store=True)
             # A single statement blew its statement_timeout. The DB is reachable,
             # this read was just too slow — degrade rather than surface an error.
             logger.warning('feed_events: read timed out, serving degraded response: %s', exc)
             return _degraded_events_response(cache_key)
         except remote_db.RemoteDBError as exc:
-            return _remote_error_response(exc)
+            return _remote_error_response(exc, no_store=target_date is not None)
 
     public_filter = _public_cluster_sql_filter('c') if public_only else ''
     github_display_filter, github_display_params = _github_cluster_display_filter('c')
@@ -683,6 +697,11 @@ async def feed_events(
                """,
             (fetched_since, fetched_since, *github_display_params, *categories_params),
         ).fetchall()
+        # Filter before totals and pagination. parse_datetime handles the
+        # legacy naive Beijing / RFC 2822 timestamps that SQLite cannot.
+        rows = [r for r in rows if sort_key(
+            r['first_doc_at'] or r['last_doc_at'] or r['last_updated_at']
+        ) < published_before.timestamp()]
         rows = sorted(
             rows,
             key=lambda r: (
@@ -694,7 +713,17 @@ async def feed_events(
         )
         total_avail = len(rows)
         date_counts = _timeline_date_counts(rows, tz_offset)
-        page_rows = rows[offset:offset + limit + 1]
+        date_seek = None
+        if target_date:
+            requested_date = target_date.isoformat()
+            anchor_index = next((index for index, row in enumerate(rows)
+                                 if _timeline_date_key(row['first_doc_at'] or row['last_doc_at'] or row['last_updated_at'], tz_offset) == requested_date), None)
+            anchor_id = int(rows[anchor_index]['id']) if anchor_index is not None else None
+            date_seek = {'requested_date': requested_date, 'status': 'found' if anchor_id is not None else 'not_found', 'anchor_event_id': anchor_id}
+            if anchor_index is not None:
+                page = anchor_index // limit + 1
+                offset = (page - 1) * limit
+        page_rows = [] if date_seek and date_seek['status'] == 'not_found' else rows[offset:offset + limit + 1]
         has_more = len(page_rows) > limit
         rows = page_rows[:limit]
 
@@ -722,8 +751,8 @@ async def feed_events(
         # new_since_last_fetch = clusters newer than client's snapshot anchor
         new_since = 0
         if since_version_snapshot is not None:
-            new_since_row = conn.execute(
-                f"""SELECT COUNT(*) AS n FROM clusters c
+            new_since_rows = conn.execute(
+                f"""SELECT c.first_doc_at, c.last_doc_at, c.last_updated_at FROM clusters c
                    WHERE c.is_visible_in_feed = 1
                      AND c.published_at IS NOT NULL
                      AND c.archived = 0 AND c.merged_into IS NULL
@@ -742,8 +771,12 @@ async def feed_events(
                      {github_display_filter}
                      {categories_clause}""",
                 (since_version_snapshot, fetched_since, fetched_since, *github_display_params, *categories_params),
-            ).fetchone()
-            new_since = new_since_row['n'] if new_since_row else 0
+            ).fetchall()
+            new_since = sum(
+                sort_key(r['first_doc_at'] or r['last_doc_at'] or r['last_updated_at'])
+                < published_before.timestamp()
+                for r in new_since_rows
+            )
 
         result = {
             'enabled': events_enabled,
@@ -753,6 +786,8 @@ async def feed_events(
             'total_available_within_30d': total_avail,
             'date_counts': date_counts,
         }
+        if date_seek is not None:
+            result['date_seek'] = date_seek
         if cache_key is not None:
             return set_public_json_response(cache_key, result)
         return result
@@ -761,6 +796,176 @@ async def feed_events(
 
 
 # ── GET /api/clusters/{id} ──────────────────────────────────────────
+
+def _validated_cluster_ids(payload: Any) -> list[int] | None:
+    raw = payload.get('cluster_ids') if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or len(raw) > 500:
+        return None
+    ids: list[int] = []
+    for value in raw:
+        if isinstance(value, bool):
+            return None
+        try:
+            cluster_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        if cluster_id <= 0:
+            return None
+        if cluster_id not in ids:
+            ids.append(cluster_id)
+    return ids
+
+
+@router.post('/api/clusters/status/batch')
+async def cluster_status_batch(request: Request):
+    uid, err = _require_user(request)
+    if err:
+        return err
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    cluster_ids = _validated_cluster_ids(payload)
+    if cluster_ids is None:
+        return JSONResponse({'error': 'cluster_ids must contain at most 500 positive integers'}, status_code=400)
+    if remote_db.status_write_to_remote() or remote_db.events_read_from_remote():
+        try:
+            statuses = await run_in_threadpool(
+                remote_db.get_cluster_statuses, user_id=uid, cluster_ids=cluster_ids)
+        except remote_db.RemoteDBError as exc:
+            return _remote_error_response(exc)
+        return {'statuses': statuses}
+
+    status_map: dict[int, Any] = {}
+    conn = db.get_conn()
+    try:
+        if cluster_ids:
+            placeholders = ','.join('?' for _ in cluster_ids)
+            rows = conn.execute(
+                f"SELECT cluster_id, clicked_at, last_seen_version FROM cluster_status WHERE user_id=? AND cluster_id IN ({placeholders})",
+                (uid, *cluster_ids),
+            ).fetchall()
+            status_map = {int(row['cluster_id']): row for row in rows}
+    finally:
+        conn.close()
+    return {'statuses': [
+        {
+            'cluster_id': cluster_id,
+            'clicked_at': to_utc_iso(status_map[cluster_id]['clicked_at'])
+                if cluster_id in status_map and status_map[cluster_id]['clicked_at'] else None,
+            'last_seen_version': int(status_map[cluster_id]['last_seen_version'])
+                if cluster_id in status_map and status_map[cluster_id]['last_seen_version'] is not None else None,
+        }
+        for cluster_id in cluster_ids
+    ]}
+
+
+def _local_reading_progress(conn, user_id: str) -> dict[str, Any] | None:
+    saved = conn.execute(
+        "SELECT cluster_id, anchor_sort_at, updated_at FROM reading_progress WHERE user_id=? AND surface='highlights'",
+        (user_id,),
+    ).fetchone()
+    if not saved:
+        return None
+    published_before = highlights_published_before().timestamp()
+    rows = conn.execute(
+        """SELECT id, first_doc_at, last_doc_at, last_updated_at FROM clusters
+             WHERE is_visible_in_feed=1 AND COALESCE(archived,0)=0
+               AND published_at IS NOT NULL AND merged_into IS NULL
+               AND last_updated_at > datetime('now','-30 days')""",
+    ).fetchall()
+    rows = sorted(
+        (r for r in rows if sort_key(
+            r['first_doc_at'] or r['last_doc_at'] or r['last_updated_at']
+        ) < published_before),
+        key=lambda r: (sort_key(r['first_doc_at'] or r['last_updated_at']),
+                       sort_key(r['last_updated_at']), int(r['id'])),
+        reverse=True,
+    )
+    index = next((i for i, r in enumerate(rows) if r['id'] == saved['cluster_id']), None)
+    resolution = 'exact'
+    if index is None:
+        anchor_time = sort_key(saved['anchor_sort_at'])
+        index = next((i for i, r in enumerate(rows)
+                      if sort_key(r['first_doc_at']) <= anchor_time), None)
+        resolution = 'nearest_older'
+    if index is None:
+        return None
+    resolved = rows[index]
+    return {
+        'cluster_id': int(saved['cluster_id']),
+        'resolved_cluster_id': int(resolved['id']),
+        'anchor_sort_at': to_utc_iso(saved['anchor_sort_at']) or saved['anchor_sort_at'],
+        'updated_at': to_utc_iso(saved['updated_at']) or saved['updated_at'],
+        # SQLite feed pagination uses numeric page cursors; remote uses the
+        # existing versioned read-model cursor object. Treat this as opaque.
+        'cursor': index // 20 + 1,
+        'resolution': resolution,
+    }
+
+
+@router.put('/api/reading-progress/highlights')
+async def put_highlights_reading_progress(request: Request):
+    uid, err = _require_user(request)
+    if err:
+        return err
+    try:
+        payload = await request.json()
+        cluster_id = int(payload.get('cluster_id'))
+    except (AttributeError, TypeError, ValueError):
+        return JSONResponse({'error': 'cluster_id must be a positive integer'}, status_code=400)
+    if cluster_id <= 0:
+        return JSONResponse({'error': 'cluster_id must be a positive integer'}, status_code=400)
+    if remote_db.status_write_to_remote() or remote_db.events_read_from_remote():
+        try:
+            progress = await run_in_threadpool(
+                remote_db.save_highlights_reading_progress, user_id=uid, cluster_id=cluster_id)
+        except remote_db.RemoteDBError as exc:
+            return _remote_error_response(exc)
+        if progress is None:
+            return JSONResponse({'error': 'Cluster not found'}, status_code=404)
+        return {'progress': progress}
+
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            """SELECT first_doc_at FROM clusters WHERE id=? AND is_visible_in_feed=1
+                 AND COALESCE(archived,0)=0 AND merged_into IS NULL
+                 AND last_updated_at > datetime('now','-30 days')""",
+            (cluster_id,),
+        ).fetchone()
+        if not row:
+            return JSONResponse({'error': 'Cluster not found'}, status_code=404)
+        conn.execute(
+            """INSERT INTO reading_progress(user_id,surface,cluster_id,anchor_sort_at,updated_at)
+                 VALUES (?, 'highlights', ?, ?, datetime('now'))
+                 ON CONFLICT(user_id,surface) DO UPDATE SET cluster_id=excluded.cluster_id,
+                   anchor_sort_at=excluded.anchor_sort_at, updated_at=excluded.updated_at""",
+            (uid, cluster_id, row['first_doc_at']),
+        )
+        conn.commit()
+        return {'progress': _local_reading_progress(conn, uid)}
+    finally:
+        conn.close()
+
+
+@router.get('/api/reading-progress/highlights')
+async def get_highlights_reading_progress(request: Request):
+    uid, err = _require_user(request)
+    if err:
+        return err
+    if remote_db.status_write_to_remote() or remote_db.events_read_from_remote():
+        try:
+            progress = await run_in_threadpool(remote_db.get_highlights_reading_progress, user_id=uid)
+        except remote_db.RemoteDBError as exc:
+            return _remote_error_response(exc)
+        return {'progress': progress}
+    conn = db.get_conn()
+    try:
+        return {'progress': _local_reading_progress(conn, uid)}
+    finally:
+        conn.close()
+
 
 @router.get('/api/clusters/{cluster_id}')
 async def cluster_detail(request: Request, cluster_id: int):
@@ -808,6 +1013,18 @@ async def cluster_detail(request: Request, cluster_id: int):
         if public_only and _cluster_has_private_members(conn, cluster_id):
             return JSONResponse({'error': 'Cluster not found'}, status_code=404)
         metadata = _load_event_source_metadata(conn, [cluster_id]).get(cluster_id, {})
+        media_rows = conn.execute(
+            """SELECT i.cover_url, i.media_json, i.url
+                 FROM cluster_items ci JOIN items i ON i.id=ci.item_id
+                WHERE ci.cluster_id=? AND i.platform != 'manual' AND i.user_id IS NULL
+                ORDER BY COALESCE(ci.is_primary_source,0) DESC,
+                         COALESCE(ci.rank_in_cluster,999999) ASC""",
+            (cluster_id,),
+        ).fetchall()
+        cluster_media = merge_media(
+            normalize_media(media_row['cover_url'], media_row['media_json'], source_url=media_row['url'])
+            for media_row in media_rows
+        )
 
         platforms = []
         try:
@@ -852,6 +1069,7 @@ async def cluster_detail(request: Request, cluster_id: int):
             'last_doc_at': to_utc_iso(row['last_doc_at']) if row['last_doc_at'] else None,
             'cover_url': row['cover_url'],
             'media_urls': _media_urls_from_item(row['cover_url'], None),
+            'media': cluster_media,
             'live_version': row['live_version'],
             'user_last_seen_version': user_last_seen,
             'viewer_status': viewer_status,
@@ -873,6 +1091,7 @@ async def cluster_sources(
     page: int = Query(1, ge=1, le=500),
     limit: int = Query(20, ge=1, le=100),
 ):
+    uid = current_user_id(request)
     public_only = _is_anonymous_public_request(request)
     if remote_db.events_read_from_remote():
         try:
@@ -882,6 +1101,7 @@ async def cluster_sources(
                 page=page,
                 limit=limit,
                 public_only=public_only,
+                user_id=uid,
             )
         except remote_db.RemoteDBError as exc:
             return _remote_error_response(exc)
@@ -898,15 +1118,22 @@ async def cluster_sources(
         if public_only and _cluster_has_private_members(conn, cluster_id):
             return JSONResponse({'error': 'Cluster not found'}, status_code=404)
         offset = (page - 1) * limit
+        owner_filter = (
+            "AND ((i.platform != 'manual' AND i.user_id IS NULL) OR i.user_id = ?)"
+            if uid else
+            "AND i.platform != 'manual' AND i.user_id IS NULL"
+        )
+        params: tuple[Any, ...] = (cluster_id, uid) if uid else (cluster_id,)
         rows = conn.execute(
-            """SELECT i.id AS item_id, i.title, i.author_name, i.platform,
+            f"""SELECT i.id AS item_id, i.title, i.author_name, i.platform,
                       i.published_at, i.fetched_at, i.url, ci.is_primary_source,
                       i.cover_url, i.media_json,
                       SUBSTR(COALESCE(i.ai_summary, i.content, ''), 1, 200) AS snippet
                FROM cluster_items ci JOIN items i ON i.id = ci.item_id
                WHERE ci.cluster_id = ?
+                 {owner_filter}
                """,
-            (cluster_id,),
+            params,
         ).fetchall()
         rows = sorted(
             rows,
@@ -928,6 +1155,7 @@ async def cluster_sources(
                 badge = 'official'
             elif plat in ('hackernews',):
                 badge = 'community'
+            source_media = normalize_media(r['cover_url'], r['media_json'], source_url=r['url'])
             sources.append({
                 'item_id': r['item_id'],
                 'title': r['title'],
@@ -936,7 +1164,8 @@ async def cluster_sources(
                 'published_at': to_utc_iso(r['published_at'] or r['fetched_at']),
                 'url': r['url'],
                 'cover_url': r['cover_url'],
-                'media_urls': _media_urls_from_item(r['cover_url'], r['media_json']),
+                'media_urls': image_urls(source_media),
+                'media': source_media,
                 'is_primary_source': int(r['is_primary_source'] or 0),
                 'authority_badge': badge,
                 'snippet': (r['snippet'] or '').strip(),

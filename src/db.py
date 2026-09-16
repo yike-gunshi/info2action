@@ -490,6 +490,18 @@ CREATE TABLE IF NOT EXISTS cluster_status (
   PRIMARY KEY (user_id, cluster_id)
 );
 
+-- v30.0: cross-device checkpoint. Recording progress never marks a cluster read.
+CREATE TABLE IF NOT EXISTS reading_progress (
+  user_id        TEXT NOT NULL,
+  surface        TEXT NOT NULL,
+  cluster_id     INTEGER NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
+  anchor_sort_at TIMESTAMP NOT NULL,
+  updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, surface)
+);
+CREATE INDEX IF NOT EXISTS idx_reading_progress_anchor
+  ON reading_progress(user_id, surface, anchor_sort_at DESC);
+
 -- v15.0 generic settings KV store (feature flags / one-shot migration markers)
 CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
@@ -1328,6 +1340,7 @@ def upsert_item(conn, item_dict, source_index=None):
             detail_json = COALESCE(excluded.detail_json, detail_json),
             comments_json = excluded.comments_json,
             cover_url = COALESCE(excluded.cover_url, cover_url),
+            media_json = COALESCE(excluded.media_json, media_json),
             author_name = COALESCE(NULLIF(excluded.author_name, ''), author_name),
             source = COALESCE(NULLIF(excluded.source, ''), source),
             fetch_run_id = COALESCE(excluded.fetch_run_id, fetch_run_id),

@@ -66,6 +66,69 @@ def test_admin_console_summary_remote_errors_return_503(monkeypatch):
     }
 
 
+def test_admin_console_summary_merges_cloudflare_traffic(monkeypatch):
+    import routes.admin as admin
+
+    fake_traffic = {"available": True, "source": "cloudflare", "uv_avg_7d": 139, "pv_30d": 31339}
+
+    monkeypatch.setattr(admin.remote_db, "app_state_to_remote", lambda: True)
+    monkeypatch.setattr(
+        admin.remote_db,
+        "admin_console_summary_remote",
+        lambda: {"available": True, "c_metrics": {}, "trends": {}},
+    )
+    monkeypatch.setattr(admin.cf_analytics, "fetch_traffic_summary", lambda: fake_traffic)
+
+    result = asyncio.run(admin.admin_console_summary(_request()))
+
+    assert result["available"] is True
+    assert result["traffic"] == fake_traffic
+
+
+def test_admin_console_summary_traffic_failure_does_not_break_summary(monkeypatch):
+    import routes.admin as admin
+
+    monkeypatch.setattr(admin.remote_db, "app_state_to_remote", lambda: True)
+    monkeypatch.setattr(
+        admin.remote_db,
+        "admin_console_summary_remote",
+        lambda: {"available": True, "c_metrics": {}},
+    )
+
+    def boom():
+        raise RuntimeError("cf down")
+
+    monkeypatch.setattr(admin.cf_analytics, "fetch_traffic_summary", boom)
+
+    result = asyncio.run(admin.admin_console_summary(_request()))
+
+    # 流量拉取失败绝不能拖垮已取到的 C 端指标
+    assert result["available"] is True
+    assert result["traffic"]["available"] is False
+    assert result["traffic"]["reason"] == "cf_error"
+
+
+def test_admin_console_summary_unavailable_summary_skips_traffic(monkeypatch):
+    import routes.admin as admin
+
+    monkeypatch.setattr(admin.remote_db, "app_state_to_remote", lambda: True)
+    monkeypatch.setattr(
+        admin.remote_db,
+        "admin_console_summary_remote",
+        lambda: {"available": False, "reason": "remote_error"},
+    )
+
+    def must_not_call():
+        raise AssertionError("must not fetch CF traffic when summary unavailable")
+
+    monkeypatch.setattr(admin.cf_analytics, "fetch_traffic_summary", must_not_call)
+
+    result = asyncio.run(admin.admin_console_summary(_request()))
+
+    assert result == {"available": False, "reason": "remote_error"}
+    assert "traffic" not in result
+
+
 def test_admin_console_health_boundaries_embedding_10_percent_crit_disk_80_warn():
     embedding = remote_db._admin_console_embedding_signal(total_calls=10, failed_calls=1)
     disk = remote_db._admin_console_disk_signal(used_percent=80.0, db_size="1.8 GB")

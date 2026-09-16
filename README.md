@@ -14,7 +14,7 @@
 
 **中文** · [English](docs/README.en.md)
 
-[核心能力](#-核心能力) · [能力全景](#-能力全景) · [架构](#-架构) · [Quick Start](#-quick-start) · [自部署](#-self-hosting) · [Community](#-community)
+[核心能力](#-核心能力) · [功能演示](#-功能演示) · [能力全景](#-能力全景) · [架构](#-架构) · [Quick Start](#-quick-start) · [自部署](#-self-hosting) · [Community](#-community)
 
 <br>
 
@@ -89,6 +89,60 @@
 | ![个人设置](docs/assets/readme/settings.png) | ![登录页](docs/assets/readme/login.png) |
 
 </details>
+
+## 🎬 功能演示
+
+静图看结构，动图看流程——下面是几段真实操作录屏，覆盖「读到 → 判断 → 行动」的完整闭环。
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/highlights-demo.gif" alt="精选 tab — 跨源事件时间线">
+      <p align="center"><sub><b>精选事件</b> — 同一件事十家报道折叠成一条，沿时间线读增量</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/info-feed-demo.gif" alt="信息 tab — 全部信源分类流">
+      <p align="center"><sub><b>信息流</b> — 全部信源按内容分类归拢，一屏扫完所有平台</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/action-generate-demo.gif" alt="一键从事件生成行动点">
+      <p align="center"><sub><b>生成行动点</b> — 一键把值得做的事件拆成可执行行动卡</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/action-copy-prompt.gif" alt="行动点 + 自包含 prompt 复制">
+      <p align="center"><sub><b>行动 + Prompt</b> — 复制自包含 prompt，直接交给 Claude Code / Codex 执行</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/video-translate-demo.gif" alt="视频播放 + 中英文转译">
+      <p align="center"><sub><b>视频转译</b> — 弹窗内播放视频，一键 AI 转写生成双语字幕</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/submit-link-demo.gif" alt="手动上传链接 AI 分析入流">
+      <p align="center"><sub><b>上传链接</b> — 粘贴任意链接，AI 抓取分析后入流</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/starred-demo.gif" alt="我的收藏">
+      <p align="center"><sub><b>我的收藏</b> — 一键收藏，随时回看攒下来的信号</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/history-demo.gif" alt="查看浏览历史">
+      <p align="center"><sub><b>查看历史</b> — 读过的内容按时间留痕，避免重复打捞</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/dark-mode-demo.gif" alt="暗色模式切换">
+      <p align="center"><sub><b>暗色模式</b> — 全站双主题，跟随系统或手动切换</sub></p>
+    </td>
+    <td width="50%"></td>
+  </tr>
+</table>
 
 ## 🛠 管理后台：给策展算法装上仪表盘
 

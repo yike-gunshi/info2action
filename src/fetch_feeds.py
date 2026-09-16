@@ -7,6 +7,8 @@ import html, json, logging, os, re, sys, time, hashlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+import reddit_media
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -519,6 +521,9 @@ def fetch_reddit():
                     if not preview_src and post_hint == 'image':
                         preview_src = direct_url
                     cover = preview_src or thumbnail
+                    media = reddit_media.extract_reddit_media(post)
+                    if media and not cover:
+                        cover = media[0].get('poster_url', '')
                     posts.append({
                         'id': post.get('id', ''),
                         'title': post.get('title', ''),
@@ -534,6 +539,12 @@ def fetch_reddit():
                         'link_flair_text': post.get('link_flair_text', ''),
                         'is_self': post.get('is_self', False),
                         'subreddit': sub,
+                        'media': media,
+                        'source_url': (
+                            f"https://www.reddit.com{post.get('permalink', '')}"
+                            if post.get('permalink')
+                            else post.get('url', '')
+                        ),
                     })
 
             out_path = os.path.join(out_dir, f'{sub}.json')

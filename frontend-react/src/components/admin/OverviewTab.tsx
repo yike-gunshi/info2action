@@ -5,6 +5,7 @@ import type {
   AdminConsoleSummary,
   AdminHealthLevel,
   AdminHealthSignal,
+  AdminTraffic,
   AdminTrendPoint,
 } from '../../lib/api'
 import { cn } from '../../lib/utils'
@@ -148,6 +149,8 @@ export function OverviewTab({ reloadSignal, onOpenRuns }: OverviewTabProps) {
         </StatCard>
       </div>
 
+      <TrafficSection traffic={data.traffic} />
+
       <SectionLabel>系统健康</SectionLabel>
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-2">
         {health.signals.map((s) => (
@@ -223,6 +226,53 @@ function SectionLabel({ children, note }: { children: React.ReactNode; note?: st
       <span className="text-[11px] font-semibold tracking-[0.09em] uppercase text-muted-foreground">{children}</span>
       {note && <span className="text-[11px] text-muted-foreground/80">{note}</span>}
     </div>
+  )
+}
+
+function TrafficSection({ traffic }: { traffic?: AdminTraffic }) {
+  if (!traffic || !traffic.available) {
+    const detail = !traffic
+      ? '此实例未返回流量数据（需连接生产远程库 + 配置 Cloudflare）。'
+      : traffic.reason === 'not_configured'
+        ? '未配置 CF_API_TOKEN / CF_ZONE_ID —— 配置后展示站点 UV / PV。'
+        : `Cloudflare 拉取失败：${traffic.error || '无响应'}`
+    return (
+      <>
+        <SectionLabel note="Cloudflare 边缘 · 含未注册访客">站点流量</SectionLabel>
+        <div className="rounded-md border border-dashed border-border bg-card px-3 py-3 text-[11px] text-muted-foreground">
+          {detail}
+        </div>
+      </>
+    )
+  }
+
+  const uvLast = [...traffic.uv_trend_30d].reverse().find((p) => p.value !== null)?.value ?? null
+  const pvLast = [...traffic.pv_trend_30d].reverse().find((p) => p.value !== null)?.value ?? null
+
+  return (
+    <>
+      <SectionLabel note={`Cloudflare 边缘 · 含未注册访客 · UV 为每日去重后日均 · 截至 ${fmtTime(traffic.generated_at)}`}>
+        站点流量
+      </SectionLabel>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <StatCard k="日均 UV · 7 日" v={fmtNum(traffic.uv_avg_7d)} unit="人" cap="CF 边缘口径 · 含未注册访客">
+          <Sub>独立访客，每日去重</Sub>
+        </StatCard>
+        <StatCard k="日均 UV · 30 日" v={fmtNum(traffic.uv_avg_30d)} unit="人">
+          <Sub>30 日窗口日均</Sub>
+        </StatCard>
+        <StatCard k="页面浏览 · 7 日" v={fmtNum(traffic.pv_7d)}>
+          <Sub>PV · 近 7 日累计</Sub>
+        </StatCard>
+        <StatCard k="页面浏览 · 30 日" v={fmtNum(traffic.pv_30d)}>
+          <Sub>PV · 近 30 日累计</Sub>
+        </StatCard>
+      </div>
+      <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+        <TrendPanel title="独立访客 · 30 日" current={fmtNum(uvLast)} points={traffic.uv_trend_30d} variant="line" />
+        <TrendPanel title="页面浏览 · 30 日" current={fmtNum(pvLast)} points={traffic.pv_trend_30d} variant="bar" />
+      </div>
+    </>
   )
 }
 

@@ -163,7 +163,7 @@ describe('App public event aggregation entry', () => {
     expect(await screen.findByTestId('detail-panel')).toBeInTheDocument()
   })
 
-  it('does not start a full channel load while global search is pending', async () => {
+  it('keeps the info search surface visible without starting a full channel load', async () => {
     render(<App />)
 
     expect(await screen.findByTestId('latest-events')).toBeInTheDocument()
@@ -184,7 +184,8 @@ describe('App public event aggregation entry', () => {
     })
 
     expect(fetchFeedPlatforms).not.toHaveBeenCalled()
-    expect(screen.queryByTestId('info-view')).not.toBeInTheDocument()
+    expect(screen.getByTestId('info-view')).toBeVisible()
+    expect(screen.getByTestId('latest-events')).not.toBeVisible()
   })
 
   it('shows channel search results without triggering the full channel loader', async () => {

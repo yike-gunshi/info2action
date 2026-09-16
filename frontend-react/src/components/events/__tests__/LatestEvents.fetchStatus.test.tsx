@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { fireEvent, render, screen, cleanup, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, cleanup, waitFor } from '@testing-library/react'
 import { LatestEvents } from '../LatestEvents'
 import { useEventsStore } from '../../../store/eventsStore'
 import { useFeedStore } from '../../../store/feedStore'
+import { useAuthStore } from '../../../store/authStore'
 import type { ClusterEvent } from '../../../lib/types'
-import { fetchEvents } from '../../../lib/api'
+import { fetchEvents, fetchClusterStatuses, getHighlightsReadingProgress, putHighlightsReadingProgress } from '../../../lib/api'
 import { toast } from 'sonner'
 
 vi.mock('../../../lib/api', () => ({
@@ -16,6 +17,9 @@ vi.mock('../../../lib/api', () => ({
   fetchFeedSections: vi.fn(),
   fetchFeedPlatforms: vi.fn(),
   fetchFeed: vi.fn(),
+  fetchClusterStatuses: vi.fn(),
+  getHighlightsReadingProgress: vi.fn().mockResolvedValue({ progress: null }),
+  putHighlightsReadingProgress: vi.fn(),
 }))
 
 vi.mock('sonner', () => ({
@@ -25,6 +29,8 @@ vi.mock('sonner', () => ({
 }))
 
 const mockFetchEvents = fetchEvents as unknown as ReturnType<typeof vi.fn>
+const mockFetchClusterStatuses = fetchClusterStatuses as unknown as ReturnType<typeof vi.fn>
+const mockGetHighlightsReadingProgress = getHighlightsReadingProgress as unknown as ReturnType<typeof vi.fn>
 
 function makeCluster(overrides: Partial<ClusterEvent> = {}): ClusterEvent {
   return {
@@ -45,13 +51,111 @@ function makeCluster(overrides: Partial<ClusterEvent> = {}): ClusterEvent {
 describe('LatestEvents relaxed highlights timeline', () => {
   beforeEach(() => {
     mockFetchEvents.mockReset()
+    mockFetchClusterStatuses.mockReset()
+    mockFetchClusterStatuses.mockResolvedValue({ statuses: [] })
+    mockGetHighlightsReadingProgress.mockReset()
+    mockGetHighlightsReadingProgress.mockResolvedValue({ progress: null })
+    useAuthStore.setState({ user: null, isLoading: false, isChecked: true })
     mockFetchEvents.mockResolvedValue({ enabled: true, events: [makeCluster()], next_cursor: null })
     vi.mocked(toast.info).mockReset()
     useEventsStore.getState().reset()
     useFeedStore.setState({ isFetching: false, fetchProgress: null })
   })
 
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it.each(['page', 'panel'] as const)('%s 不再请求或展示上次阅读模块', async (variant) => {
+    useAuthStore.setState({ user: { id: 'u1', username: 'u', email: 'u@test', role: 'user' } })
+    mockGetHighlightsReadingProgress.mockResolvedValue({
+      progress: {
+        cluster_id: 1,
+        resolved_cluster_id: 1,
+        anchor_sort_at: '2026-05-08T09:30:00Z',
+        updated_at: '2026-05-08T09:30:00Z',
+        cursor: null,
+        resolution: 'exact',
+      },
+    })
+
+    render(<LatestEvents variant={variant} />)
+
+    await screen.findByText('WayToAGI 更新知识库导航')
+    expect(screen.queryByTestId('continue-reading')).toBeNull()
+    expect(screen.queryByTestId('back-to-latest')).toBeNull()
+    expect(mockGetHighlightsReadingProgress).not.toHaveBeenCalled()
+    fireEvent(window, new Event('pagehide'))
+    expect(putHighlightsReadingProgress).not.toHaveBeenCalled()
+  })
+
+  it('匿名用户已有本地阅读进度也不再展示入口，且不清除历史数据', async () => {
+    const saved = JSON.stringify({ cluster_id: 1, updated_at: '2026-05-08T09:30:00Z' })
+    localStorage.setItem('highlights-reading-progress', saved)
+    try {
+      render(<LatestEvents variant="page" />)
+
+      await screen.findByText('WayToAGI 更新知识库导航')
+      expect(screen.queryByTestId('continue-reading')).toBeNull()
+      expect(localStorage.getItem('highlights-reading-progress')).toBe(saved)
+    } finally {
+      localStorage.removeItem('highlights-reading-progress')
+    }
+  })
+
+  it('收到阅读同步频道消息后将对应事件标记为已读', async () => {
+    class BroadcastChannelMock {
+      static instances: BroadcastChannelMock[] = []
+      postMessage = vi.fn()
+      close = vi.fn()
+      onmessage: ((event: MessageEvent) => void) | null = null
+
+      constructor(readonly name: string) {
+        BroadcastChannelMock.instances.push(this)
+      }
+    }
+    vi.stubGlobal('BroadcastChannel', BroadcastChannelMock)
+    useAuthStore.setState({ user: { id: 'u1', username: 'u', email: 'u@test', role: 'user' } })
+    useEventsStore.setState({
+      enabled: true,
+      events: [makeCluster({ id: 7, has_update: true, live_version: 3, last_seen_version: 1 })],
+      dateCounts: { '2026-05-08': 1 },
+    })
+
+    render(<LatestEvents />)
+
+    await screen.findByText('WayToAGI 更新知识库导航')
+    expect(BroadcastChannelMock.instances).toHaveLength(1)
+    expect(BroadcastChannelMock.instances[0].name).toBe('info2act-cluster-read')
+    await act(async () => {
+      BroadcastChannelMock.instances[0].onmessage?.({ data: { clusterId: 7 } } as MessageEvent)
+    })
+
+    const event = useEventsStore.getState().events[0]
+    expect(event.last_seen_version).toBe(3)
+    expect(event.has_update).toBe(false)
+  })
+
+  it('登录用户在 mount、focus 和 visible 恢复时立即 batch 复查；匿名跳过', async () => {
+    useAuthStore.setState({ user: { id: 'u1', username: 'u', email: 'u@test', role: 'user' } })
+    render(<LatestEvents />)
+    await screen.findByText('WayToAGI 更新知识库导航')
+    await waitFor(() => expect(mockFetchClusterStatuses).toHaveBeenCalledTimes(1))
+    fireEvent.focus(window)
+    await waitFor(() => expect(mockFetchClusterStatuses).toHaveBeenCalledTimes(2))
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    await waitFor(() => expect(mockFetchClusterStatuses).toHaveBeenCalledTimes(3))
+    cleanup()
+    mockFetchClusterStatuses.mockClear()
+    useAuthStore.setState({ user: null })
+    render(<LatestEvents />)
+    await screen.findByText('WayToAGI 更新知识库导航')
+    expect(mockFetchClusterStatuses).not.toHaveBeenCalled()
+  })
 
   it('不再展示标题、抓取进度和手动刷新按钮', async () => {
     useFeedStore.setState({
@@ -103,26 +207,24 @@ describe('LatestEvents relaxed highlights timeline', () => {
     expect(timeline.className).toContain('px-0')
 
 	    const heading = screen.getByTestId('event-date-heading')
-	    expect(heading.className).toContain('sticky')
-	    expect(heading.className).toContain('top-[var(--highlights-date-top)]')
-	    expect(heading.className).toContain('z-40')
-	    expect(heading.className).toContain('grid-cols-1')
+	    expect(heading.className).not.toContain('sticky')
+	    expect(heading.className).not.toContain('top-[var(--highlights-date-top)]')
+	    expect(heading.className).not.toContain('z-40')
+	    expect(heading.className).toContain('highlights-day-heading')
 	    expect(heading.className).toContain('min-h-12')
 	    expect(heading.className).toContain('items-center')
-	    // v24.1: 时间列收窄 52/56 + 栏距统一 16px
-	    expect(heading.className).toContain('sm:grid-cols-[52px_minmax(0,1fr)]')
-	    expect(heading.className).toContain('lg:grid-cols-[56px_minmax(0,1fr)]')
-	    expect(heading.className).toContain('gap-x-4')
-	    expect(heading.className).not.toContain('gap-x-5')
+	    expect(heading.className).toContain('flex')
+	    expect(screen.queryByTestId('event-scotch-rule')).toBeNull()
 	    expect(heading.className).not.toContain('pt-0')
 	    expect(heading.className).not.toContain('pb-3.5')
 	    expect(heading.className).not.toContain('border-b')
 	    expect(heading.className).not.toContain('top-0')
 	    expect(heading.className).not.toContain('-mx-5')
-	    // v24.1: 日期标签去缩进——日期文字、Scotch rule、时间列共享同一 x0 左缘
+	    // 日期栏与要点共用内边距，外框仍共线。
 	    expect(screen.getByTestId('event-date-label').parentElement?.className).not.toContain('ml-[')
-	    // v24.1: 日组整体内缩 16px（正文区 ~960 略窄于筛选 tab 行 992）
-	    expect(screen.getByTestId('event-date-group').className).toContain('sm:px-4')
+	    // 精选外框共享左边界，日期组与新闻行区不再逐层缩进。
+	    expect(screen.getByTestId('event-date-group').className).not.toContain('sm:px-4')
+	    expect(screen.getByTestId('event-rows').className).not.toContain('sm:pl-4')
 	    const headingLabel = screen.getByTestId('event-date-label')
 	    expect(headingLabel.className).toContain('text-[22px]')
 	    expect(headingLabel.className).not.toContain('text-[26px]')
@@ -314,7 +416,7 @@ describe('LatestEvents relaxed highlights timeline', () => {
       page: 2,
       limit: 20,
       categories: [],
-      timezoneOffsetMinutes: expect.any(Number),
+      timezoneOffsetMinutes: -480,
     })
     expect(screen.getByText('已展示全部事件')).toBeInTheDocument()
     expect((scroller as HTMLElement).style.overflowAnchor).toBe('none')

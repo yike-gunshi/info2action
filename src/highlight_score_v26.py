@@ -7,7 +7,7 @@ from typing import Any
 
 
 PROMPT_FILE = "15_item_score_v26.md"
-PROMPT_VERSION = "item_score_v26_7_taste_anchors_2026_07_15"
+PROMPT_VERSION = "item_score_v26_9_1_reach_niche_2026_08_02"
 
 DIMENSIONS = ("authority", "substance", "novelty", "timeliness", "audience_fit")
 VALID_VETOES = {"none", "marketing", "rumor_unverified", "flamewar", "engagement_bait"}
@@ -116,8 +116,27 @@ def normalize_score_result(raw: str | dict[str, Any]) -> dict[str, Any]:
 
     normalized = dict(parsed)
     normalized["dims"] = dict(dims)
-    if marketing == 3:
-        normalized["veto"] = "marketing"
+    raw_reach = parsed.get("reach")
+    reach = None
+    if type(raw_reach) is int:
+        reach = raw_reach
+    elif isinstance(raw_reach, float) and raw_reach.is_integer():
+        reach = int(raw_reach)
+    elif isinstance(raw_reach, str):
+        try:
+            reach = int(raw_reach.strip())
+        except ValueError:
+            pass
+    if reach not in {1, 2, 3}:
+        reach = None
+    normalized["reach"] = reach
+    has_independent_value = bool(
+        dims["substance"] >= 2
+        and dims["audience_fit"] >= 2
+        and parsed["value_path"] in {"substantive", "major_event", "lead_value"}
+    )
+    if normalized["veto"] == "marketing" and has_independent_value:
+        normalized["veto"] = "none"
     return normalized
 
 

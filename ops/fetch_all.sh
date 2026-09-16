@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # 一键全量抓取脚本 - 读取 config.json
-# Usage: ./fetch_all.sh [--skip-xhs-details] [--skip-bili-covers] [--raw-only] [--run-id N]
+# Usage: ./fetch_all.sh [--skip-xhs-details] [--raw-only] [--run-id N]
 # ============================================================
 set -uo pipefail
 # Note: not using set -e to allow graceful error handling
@@ -21,7 +21,6 @@ echo ""
 
 # Parse flags
 SKIP_XHS_DETAILS=false
-SKIP_BILI_COVERS=false
 RAW_ONLY=false
 RUN_ID=""
 NEXT_IS_RUN_ID=false
@@ -33,7 +32,6 @@ for arg in "$@"; do
   fi
   case $arg in
     --skip-xhs-details) SKIP_XHS_DETAILS=true ;;
-    --skip-bili-covers) SKIP_BILI_COVERS=true ;;
     --raw-only) RAW_ONLY=true ;;
     --run-id) NEXT_IS_RUN_ID=true ;;
   esac
@@ -42,7 +40,7 @@ done
 # ============================================================
 # 1. X（sources 注册表全量账号）
 # ============================================================
-echo "📱 [1/5] Twitter..."
+echo "📱 [1/4] Twitter..."
 mkdir -p "$SOURCE_DIR/twitter"
 
 # X 内容只读 sources 注册表，每轮由脚本遍历全部可抓取账号。
@@ -50,40 +48,31 @@ mkdir -p "$SOURCE_DIR/twitter"
 
 echo ""
 
-# ============================================================
-# 2. BILIBILI（v16.0: 只留 hot/rank/watch-later，删 search；UP 主订阅推 TODO CH-FUTURE-1）
-# ============================================================
-echo "📺 [2/5] B站 (hot + rank + 稍后再看)..."
-mkdir -p "$SOURCE_DIR/bilibili"
-
-# 热门 + 排行（绕开 bili hot/rank CLI 输出无 pic 字段的问题，直接调 B 站开放 API）
-"$PYTHON_BIN" "$BASE/src/fetch_bili_hot.py" 2>&1 | tail -2
-
-# 稍后再看（绕开 bilibili-cli v0.6.2 的 watch-later bug，直接调 B 站 API）
-"$PYTHON_BIN" "$BASE/src/fetch_bili_watch_later.py" 2>&1 | tail -2
+# 2026-08-06: B 站 section 全部下线（抓取 + 前端 section 隐藏，前端见 PR #286）。
+# 抓进来的都是娱乐向视频，AI 富化一条不过，纯占抓取和入库开销。
 
 # ============================================================
-# 3. WECHAT MP (Lingowhale primary + RSS supplement)
+# 2. WECHAT MP (Lingowhale primary + RSS supplement)
 # ============================================================
 echo ""
-echo "🐋 [3/5] 公众号 (语鲸主力 + RSS 补充)..."
+echo "🐋 [2/4] 公众号 (语鲸主力 + RSS 补充)..."
 "$PYTHON_BIN" "$BASE/src/fetch_lingowhale.py" 2>&1 || true
 "$PYTHON_BIN" "$BASE/src/fetch_feeds.py" --wechat 2>&1 || true
 
 # v16.0: 小红书 section 全部下线（抓取 + 前端 section 隐藏 + 收藏一并停）
 
 # ============================================================
-# 4. RSS / HACKER NEWS / REDDIT / GITHUB (Trending + Awesome 仓库)
+# 3. RSS / HACKER NEWS / REDDIT / GITHUB (Trending + Awesome 仓库)
 # ============================================================
 echo ""
-echo "📡 [4/5] RSS / HN / Reddit / GitHub (trending + awesome)..."
+echo "📡 [3/4] RSS / HN / Reddit / GitHub (trending + awesome)..."
 "$PYTHON_BIN" "$BASE/src/fetch_feeds.py" --rss --hn --reddit --github 2>&1 || true
 
 # ============================================================
-# 5. WAYTOAGI (Feishu Wiki)
+# 4. WAYTOAGI (Feishu Wiki)
 # ============================================================
 echo ""
-echo "🔖 [5/5] WayToAGI..."
+echo "🔖 [4/4] WayToAGI..."
 "$PYTHON_BIN" "$BASE/src/fetch_waytoagi.py" 2>&1 || true
 
 echo ""

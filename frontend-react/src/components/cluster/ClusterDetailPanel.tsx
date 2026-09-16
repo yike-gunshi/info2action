@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent } from 'react'
 import { Bookmark, ChevronLeft, ChevronRight, ExternalLink, EyeOff, Share2, ThumbsDown, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useClusterDetailStore } from '../../store/clusterDetailStore'
-import type { ClusterDetail, ClusterSource } from '../../lib/types'
+import type { ClusterDetail, ClusterMedia, ClusterSource } from '../../lib/types'
 import { cn, eventPlatformName, platformClass, safeExternalUrl, stripMd } from '../../lib/utils'
 import { parseClusterBreakdownSections, parseClusterSummary } from '../../lib/cluster-summary-parser'
 import { renderMarkdownInline, renderMarkdownLite } from '../../lib/markdown-lite'
@@ -12,6 +12,7 @@ import { PlatformBrandIcon } from '../shared/PlatformIcon'
 import { requireAuth } from '../shared/AuthGate'
 import { buildInfoItemHref } from '../../lib/itemDeepLink'
 import { ClusterActionZone } from './ClusterActionZone'
+import { YoutubePlayer } from '../detail/YoutubePlayer'
 
 type KeyPointItem = string | { title: string; points: string[] }
 type ModalVariant = 'no-media' | 'single-media' | 'multi-media'
@@ -82,8 +83,15 @@ function OfficialBadge() {
 }
 
 function uniquePush(urls: string[], value?: string | null) {
-  const url = value?.trim()
+  const url = safeMediaUrl(value)
   if (url && !urls.includes(url)) urls.push(url)
+}
+
+function safeMediaUrl(value?: string | null): string | null {
+  const url = value?.trim()
+  if (!url) return null
+  if (url.startsWith('/') && !url.startsWith('//')) return url
+  return safeExternalUrl(url)
 }
 
 function collectMediaUrls(cluster: ClusterDetail, sources: ClusterSource[]): string[] {
@@ -95,6 +103,21 @@ function collectMediaUrls(cluster: ClusterDetail, sources: ClusterSource[]): str
     uniquePush(urls, source.cover_url)
   })
   return urls
+}
+
+function isGeneratedVideoPoster(url: string): boolean {
+  return url.includes('/api/media/twitter-poster/') || url.includes('/video_posters/')
+}
+
+function collectVideoPosterUrls(cluster: ClusterDetail, sources: ClusterSource[]): Set<string> {
+  const posters = new Set<string>()
+  const media = [...(cluster.media ?? []), ...sources.flatMap((source) => source.media ?? [])]
+  media.forEach((asset) => {
+    if (asset.type !== 'video' && asset.type !== 'embed') return
+    const poster = safeMediaUrl(asset.poster_url)
+    if (poster) posters.add(poster)
+  })
+  return posters
 }
 
 function modalVariantFor(mediaCount: number): ModalVariant {
@@ -135,28 +158,90 @@ function paragraphLines(text: string): string[] {
     .filter(Boolean)
 }
 
+function youtubeVideoId(media: ClusterMedia | null | undefined): string | null {
+  if (!media || (media.provider !== 'youtube' && !/youtu\.be|youtube\.com/i.test(media.url))) return null
+  try {
+    const url = new URL(media.url)
+    return url.searchParams.get('v') || url.pathname.split('/').filter(Boolean).pop() || null
+  } catch {
+    return null
+  }
+}
+
+function redditEmbedUrl(media: ClusterMedia | null | undefined): string | null {
+  if (!media || media.type !== 'embed' || media.provider?.toLowerCase() !== 'reddit') return null
+  const safeUrl = safeExternalUrl(media.url)
+  if (!safeUrl) return null
+  try {
+    const url = new URL(safeUrl)
+    return url.protocol === 'https:' && url.hostname === 'www.redditmedia.com' ? url.href : null
+  } catch {
+    return null
+  }
+}
+
+function twitterVideoItemId(media: ClusterMedia | null | undefined, sources: ClusterSource[]): string | null {
+  if (!media || media.type !== 'video') return null
+  const mediaUrl = safeMediaUrl(media.url)
+  if (!mediaUrl) return null
+
+  const matchingSource = sources.find((source) =>
+    source.platform === 'twitter'
+      && source.media?.some((asset) => asset.type === 'video' && safeMediaUrl(asset.url) === mediaUrl),
+  )
+  if (matchingSource?.item_id) return matchingSource.item_id
+
+  const sourceUrl = safeExternalUrl(media.source_url)
+  if (!sourceUrl) return null
+  try {
+    const url = new URL(sourceUrl)
+    if (!['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com'].includes(url.hostname.toLowerCase())) return null
+    return url.pathname.match(/\/status\/(\d+)/)?.[1] ?? null
+  } catch {
+    return null
+  }
+}
+
 function ClusterMediaBlock({
   urls,
+  video,
+  videoItemId,
   onOpen,
   onError,
   isLightboxOpen,
 }: {
   urls: string[]
+  video?: ClusterMedia | null
+  videoItemId?: string | null
   onOpen: (url: string, images: string[]) => void
   onError: (url: string) => void
   isLightboxOpen: boolean
 }) {
   const [activeIndex, setActiveIndex] = useState(0)
+  const [stripIndex, setStripIndex] = useState(0)
   const [isHovered, setIsHovered] = useState(false)
   // D5: 触屏无 hover,自动轮播每 4s 跳图无法停。用户首次交互(触摸/点点)后
   // 永久暂停自动轮播,改为纯手动;换事件(carouselKey 变)时重置。
   const [userPaused, setUserPaused] = useState(false)
-  const hasCarousel = urls.length > 1
+  const stripRef = useRef<HTMLDivElement>(null)
+  const safeVideoUrl = safeMediaUrl(video?.url)
+  const safePosterUrl = safeMediaUrl(video?.poster_url)
+  const safeSourceUrl = safeExternalUrl(video?.source_url) || safeExternalUrl(video?.url)
+  const safeVideo = video && safeVideoUrl ? { ...video, url: safeVideoUrl } : null
+  const videoId = youtubeVideoId(safeVideo)
+  const redditUrl = redditEmbedUrl(safeVideo)
+  const hasPlayableVideo = safeVideo?.type === 'video'
+  const hasExternalMedia = safeVideo?.type === 'embed' && !videoId && !redditUrl && Boolean(safeSourceUrl)
+  const hasPrimaryMedia = Boolean(videoId || redditUrl || hasPlayableVideo || hasExternalMedia)
+  const hasCarousel = !hasPrimaryMedia && urls.length > 1
+  const hasStripControls = hasPrimaryMedia && urls.length > 1
+  const playableVideoUrl = videoItemId ? `/api/media/twitter-mp4/${encodeURIComponent(videoItemId)}` : safeVideoUrl
   const carouselKey = urls.join('\u0001')
   const activeUrl = urls[activeIndex] ?? urls[0] ?? ''
 
   useEffect(() => {
     setActiveIndex(0)
+    setStripIndex(0)
     setIsHovered(false)
     setUserPaused(false)
   }, [carouselKey])
@@ -169,10 +254,132 @@ function ClusterMediaBlock({
     return () => window.clearInterval(timer)
   }, [activeIndex, carouselKey, hasCarousel, isHovered, isLightboxOpen, userPaused, urls.length])
 
-  if (urls.length === 0) return null
+  if (urls.length === 0 && !videoId && !redditUrl && !hasPlayableVideo && !hasExternalMedia) return null
+
+  const moveStripTo = (nextIndex: number) => {
+    const boundedIndex = Math.max(0, Math.min(nextIndex, urls.length - 1))
+    setStripIndex(boundedIndex)
+    const strip = stripRef.current
+    const first = strip?.children.item(0) as HTMLElement | null
+    const target = strip?.children.item(boundedIndex) as HTMLElement | null
+    strip?.scrollTo?.({
+      left: target && first ? target.offsetLeft - first.offsetLeft : 0,
+      behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+    })
+  }
 
   return (
-    <figure className="mb-6">
+    <figure className="mb-6 space-y-3">
+      {videoId && <YoutubePlayer videoId={videoId} itemId={`cluster_${videoId}`} />}
+      {redditUrl && (
+        <div className="space-y-2">
+          <iframe
+            data-testid="cluster-media-reddit"
+            src={redditUrl}
+            title="Reddit 视频"
+            loading="lazy"
+            sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+            allow="fullscreen; picture-in-picture"
+            referrerPolicy="strict-origin-when-cross-origin"
+            style={mediaCapStyle}
+            className="aspect-video w-full rounded-[8px] border border-[var(--modal-border)] bg-black"
+          />
+          {safeSourceUrl && (
+            <a href={safeSourceUrl} target="_blank" rel="noreferrer" className="reading-meta inline-flex">
+              在 Reddit 打开原帖
+            </a>
+          )}
+        </div>
+      )}
+      {hasPlayableVideo && !videoId && (
+        <div
+          data-testid="cluster-video-stage"
+          className="flex w-full justify-center overflow-hidden rounded-[8px] border border-[var(--modal-border)] bg-black"
+        >
+          <video
+            data-testid="cluster-media-video"
+            controls
+            playsInline
+            preload="metadata"
+            poster={safePosterUrl ? proxiedImageUrl(safePosterUrl) : undefined}
+            style={{ maxHeight: '56vh' }}
+            className="block h-auto w-auto max-w-full object-contain"
+          >
+            <source src={playableVideoUrl ?? undefined} />
+          </video>
+        </div>
+      )}
+      {hasExternalMedia && (
+        <a data-testid="cluster-media-external" href={safeSourceUrl ?? undefined} target="_blank" rel="noreferrer" className="block">
+          {safePosterUrl ? <img src={proxiedImageUrl(safePosterUrl)} alt="媒体海报" className="w-full rounded-[8px]" /> : '查看原文'}
+        </a>
+      )}
+      {hasPrimaryMedia && urls.length > 0 && (
+        <div className="flex items-center gap-1 sm:gap-2">
+          {hasStripControls && (
+            <button
+              type="button"
+              aria-label="上一张图片"
+              disabled={stripIndex === 0}
+              onClick={() => moveStripTo(stripIndex - 1)}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--modal-text-muted)] transition-colors hover:bg-[var(--modal-hover)] hover:text-[var(--modal-text)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] disabled:cursor-default disabled:opacity-30"
+            >
+              <ChevronLeft className="h-5 w-5" />
+            </button>
+          )}
+          <div
+            ref={stripRef}
+            data-testid="cluster-video-image-strip"
+            aria-label="补充图片"
+            onScroll={(event) => {
+              const strip = event.currentTarget
+              const children = Array.from(strip.children) as HTMLElement[]
+              if (children.length === 0) return
+              const origin = children[0].offsetLeft
+              const closest = children.reduce((best, child, index) => (
+                Math.abs(child.offsetLeft - origin - strip.scrollLeft)
+                  < Math.abs(children[best].offsetLeft - origin - strip.scrollLeft)
+                  ? index
+                  : best
+              ), 0)
+              setStripIndex(closest)
+            }}
+            className="flex min-w-0 flex-1 snap-x snap-mandatory gap-2 overflow-x-auto overscroll-x-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          >
+            {urls.map((url, index) => (
+              <button
+                key={url}
+                type="button"
+                data-testid="cluster-video-image"
+                aria-label={`查看第 ${index + 1} 张图片`}
+                onClick={() => onOpen(url, urls)}
+                className="h-[76px] w-[112px] shrink-0 snap-start overflow-hidden rounded-[8px] border border-[var(--modal-border)] bg-[var(--modal-surface-muted)] p-0 text-left shadow-[0_1px_0_rgba(255,255,255,0.72)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] sm:h-24 sm:w-36"
+              >
+                <img
+                  src={proxiedImageUrl(url)}
+                  alt=""
+                  referrerPolicy="no-referrer"
+                  loading={index === 0 ? 'eager' : 'lazy'}
+                  className="h-full w-full object-cover transition-opacity hover:opacity-95"
+                  onError={() => onError(url)}
+                />
+              </button>
+            ))}
+          </div>
+          {hasStripControls && (
+            <button
+              type="button"
+              aria-label="下一张图片"
+              disabled={stripIndex === urls.length - 1}
+              onClick={() => moveStripTo(stripIndex + 1)}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--modal-text-muted)] transition-colors hover:bg-[var(--modal-hover)] hover:text-[var(--modal-text)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] disabled:cursor-default disabled:opacity-30"
+            >
+              <ChevronRight className="h-5 w-5" />
+            </button>
+          )}
+        </div>
+      )}
+      {!hasPrimaryMedia && urls.length > 0 && (
       <div
         data-testid="cluster-modal-media-grid"
         data-media-count={String(urls.length)}
@@ -227,6 +434,7 @@ function ClusterMediaBlock({
           </div>
         )}
       </div>
+      )}
     </figure>
   )
 }
@@ -461,10 +669,24 @@ export function ClusterDetailPanel() {
     }, 180)
   }, [closeModal])
 
+  const primaryVideo = useMemo(() => {
+    if (!cluster) return null
+    return [ ...(cluster.media ?? []), ...sources.flatMap((source) => source.media ?? []) ]
+      .find((media) => media.type === 'video' || media.type === 'embed') ?? null
+  }, [cluster, sources])
+  const primaryVideoItemId = useMemo(
+    () => twitterVideoItemId(primaryVideo, sources),
+    [primaryVideo, sources],
+  )
   const mediaUrls = useMemo(() => {
     if (!cluster) return []
-    return collectMediaUrls(cluster, sources).filter((url) => !failedMediaUrls.includes(url))
-  }, [cluster, sources, failedMediaUrls])
+    const videoPosters = collectVideoPosterUrls(cluster, sources)
+    return collectMediaUrls(cluster, sources).filter(
+      (url) => !videoPosters.has(url)
+        && !(primaryVideo && isGeneratedVideoPoster(url))
+        && !failedMediaUrls.includes(url),
+    )
+  }, [cluster, sources, primaryVideo, failedMediaUrls])
 
   useEffect(() => {
     setLightboxSrc(null)
@@ -721,6 +943,8 @@ export function ClusterDetailPanel() {
             <div className="flex-1 overflow-y-auto overscroll-contain px-4 pb-7 pt-0 sm:px-10 sm:pb-8">
               <ClusterMediaBlock
                 urls={mediaUrls}
+                video={primaryVideo}
+                videoItemId={primaryVideoItemId}
                 onOpen={openLightbox}
                 onError={markMediaFailed}
                 isLightboxOpen={!!lightboxSrc}

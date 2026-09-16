@@ -625,6 +625,88 @@ def _consume_asr_quota(conn, duration_sec: int, user_id=0) -> dict:
     return db.consume_asr_quota(conn, duration_sec, user_id=user_id)
 
 
+def _cluster_ids_for_item(item_id: str) -> list[int]:
+    if remote_db.app_state_to_remote():
+        return remote_db.cluster_ids_for_item_remote(item_id)
+    import db
+
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT cluster_id FROM cluster_items WHERE item_id = ? ORDER BY cluster_id",
+            (item_id,),
+        ).fetchall()
+        return [int(row["cluster_id"] if hasattr(row, "keys") else row[0]) for row in rows]
+    finally:
+        conn.close()
+
+
+def _regenerate_related_cluster_summaries(item_id: str) -> dict[str, int]:
+    cluster_ids = _cluster_ids_for_item(item_id)
+    if not cluster_ids:
+        return {"cluster_summaries": 0, "cluster_failures": 0}
+
+    from clustering import summary_writer
+
+    cfg = load_minimax_config()
+    conn = None
+    if not remote_db.app_state_to_remote():
+        import db
+
+        conn = db.get_conn()
+    completed = 0
+    failed = 0
+    try:
+        for cluster_id in cluster_ids:
+            try:
+                if summary_writer.regenerate_and_swap(
+                    conn,
+                    cluster_id,
+                    api_key=cfg["api_key"],
+                    api_base=cfg.get("api_base"),
+                    model=cfg["model"],
+                    summary_max_docs=20,
+                    publish_immediately=True,
+                ):
+                    completed += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                failed += 1
+                print(
+                    f"[asr_worker] cluster summary non-fatal "
+                    f"item_id={item_id} cluster_id={cluster_id}: {exc!r}",
+                    flush=True,
+                )
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"cluster_summaries": completed, "cluster_failures": failed}
+
+
+def _regenerate_summaries_after_asr(item_id: str) -> dict[str, Any]:
+    """Reuse the normal Item summary path, then refresh dependent Clusters."""
+    item_result = asyncio.run(
+        transcribe_and_summarize(
+            item_id,
+            user_id=0,
+            skip_transcript=True,
+            regenerate_clusters=False,
+        )
+    )
+    if item_result.status != "success":
+        return {
+            "item_summary": False,
+            "cluster_summaries": 0,
+            "cluster_failures": 0,
+        }
+    cluster_result = _regenerate_related_cluster_summaries(item_id)
+    return {
+        "item_summary": True,
+        **cluster_result,
+    }
+
+
 def run_asr_inline(
     item_id: str,
     bypass_quota: bool = False,
@@ -812,6 +894,14 @@ def run_asr_inline(
         except Exception as _e:
             print(f"[run_asr_inline] consume_asr_quota non-fatal: {_e}", flush=True)
 
+        try:
+            _regenerate_summaries_after_asr(item_id)
+        except Exception as _e:
+            print(
+                f"[run_asr_inline] summary regeneration non-fatal for {item_id}: {_e}",
+                flush=True,
+            )
+
         return AsrResult("success", transcript, duration_sec, cost_yuan)
 
     finally:
@@ -847,6 +937,7 @@ async def transcribe_and_summarize(
     user_id: int,
     emit: Optional[EventEmitter] = None,
     skip_transcript: bool = False,
+    regenerate_clusters: bool = True,
 ) -> AsrResult:
     """主流程: 按需 ASR + 摘要重跑.
 
@@ -890,6 +981,15 @@ async def transcribe_and_summarize(
             await _db_io(_update_asr_fields, conn, item_id, ai_summary=summary)
             await _db_io(_write_asr_status, conn, item_id, asr_status="success", asr_failed_reason=None)
             await _emit("summary_updated", {"ai_summary": summary})
+            if regenerate_clusters:
+                try:
+                    await asyncio.to_thread(_regenerate_related_cluster_summaries, item_id)
+                except Exception as cluster_exc:
+                    print(
+                        f"[transcribe_and_summarize] cluster summary non-fatal "
+                        f"for {item_id}: {cluster_exc!r}",
+                        flush=True,
+                    )
             await _emit("done", {"status": "success"})
             return AsrResult("success", transcript, duration, None)
         except Exception as e:
@@ -1062,6 +1162,15 @@ async def transcribe_and_summarize(
         await _db_io(_update_asr_fields, conn, item_id, ai_summary=summary)
         await _db_io(_write_asr_status, conn, item_id, asr_status="success", asr_failed_reason=None)
         await _emit("summary_updated", {"ai_summary": summary})
+        if regenerate_clusters:
+            try:
+                await asyncio.to_thread(_regenerate_related_cluster_summaries, item_id)
+            except Exception as cluster_exc:
+                print(
+                    f"[transcribe_and_summarize] cluster summary non-fatal "
+                    f"for {item_id}: {cluster_exc!r}",
+                    flush=True,
+                )
 
         await _emit("done", {"status": "success"})
         return AsrResult("success", transcript, duration_sec, cost_yuan)

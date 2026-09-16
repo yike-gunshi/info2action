@@ -9,6 +9,26 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
+def test_retry_backlog_limit_uses_safe_default(monkeypatch):
+    import enrich_items
+
+    monkeypatch.delenv("INFO2ACTION_ENRICH_RETRY_BACKLOG_LIMIT", raising=False)
+
+    assert enrich_items._retry_backlog_limit() == 20
+
+
+def test_retry_backlog_limit_logs_when_disabled(monkeypatch, capsys):
+    import enrich_items
+
+    monkeypatch.setenv("INFO2ACTION_ENRICH_RETRY_BACKLOG_LIMIT", "0")
+
+    assert enrich_items._retry_backlog_limit() == 0
+    assert (
+        "Enrichment retry backlog disabled: "
+        "INFO2ACTION_ENRICH_RETRY_BACKLOG_LIMIT=0"
+    ) in capsys.readouterr().out
+
+
 def test_query_pending_items_orders_window_by_published_at_desc(monkeypatch, tmp_path):
     import db as db_mod
     import enrich_items

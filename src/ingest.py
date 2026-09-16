@@ -437,7 +437,12 @@ def ingest_twitter(conn, *, timeline_only=False):
 
 
 def _run_asr_for_twitter_videos_inline(conn, tweet_ids: list[str]) -> None:
-    """v13.0 F52:ingest 结尾对含视频的 tweet 并发跑 ASR。
+    """Backward-compatible Twitter entrypoint for the generic video ASR hook."""
+    _run_asr_for_video_items_inline(conn, tweet_ids)
+
+
+def _run_asr_for_video_items_inline(conn, item_ids: list[str]) -> None:
+    """Ingest 结尾对含视频的 item 并发跑 ASR。
 
     - 只对 `asr_status IS NULL`(未跑过 / 新入库)的 item 触发,避免重复消费配额
     - 并发池 N = env `ASR_INGEST_CONCURRENCY`(默认 5)
@@ -448,32 +453,34 @@ def _run_asr_for_twitter_videos_inline(conn, tweet_ids: list[str]) -> None:
 
     注意: 不 re-raise,保持 cron 稳定;所有错误仅 log。
     """
-    if not tweet_ids:
+    if not item_ids:
         return
     # 2026-04-28: 永久关闭 ingest 期 ASR(用户决策;MiniMax/豆包 API key 持续 401 卡死 ingest)
     # 恢复时改成 INGEST_SKIP_ASR='0' 或删除本块。日志里要看到 SKIP 才算闭环。
     if os.environ.get('INGEST_SKIP_ASR', '1') == '1':
-        print(f"  🎙️  ASR ingest: SKIP {len(tweet_ids)} videos (INGEST_SKIP_ASR=1)",
+        print(f"  🎙️  ASR ingest: SKIP {len(item_ids)} videos (INGEST_SKIP_ASR=1)",
               flush=True)
         return
     if not os.environ.get('DOUBAO_ASR_API_KEY'):
-        print(f"  🎙️  ASR ingest: SKIP {len(tweet_ids)} videos (DOUBAO_ASR_API_KEY not set)",
+        print(f"  🎙️  ASR ingest: SKIP {len(item_ids)} videos (DOUBAO_ASR_API_KEY not set)",
               flush=True)
         return
-    if conn is None:
-        print(f"  🎙️  ASR ingest: SKIP {len(tweet_ids)} videos (remote fetch writer)",
-              flush=True)
-        return
-
-    # 过滤出"需要跑"的 tweet(asr_status IS NULL)
-    placeholders = ','.join('?' * len(tweet_ids))
-    rows = conn.execute(
-        f"SELECT id FROM items WHERE id IN ({placeholders}) AND asr_status IS NULL",
-        tweet_ids,
-    ).fetchall()
-    pending = [r['id'] for r in rows]
+    if remote_db.app_state_to_remote():
+        pending = remote_db.get_pending_asr_item_ids_remote(item_ids)
+    else:
+        if conn is None:
+            print(f"  🎙️  ASR ingest: SKIP {len(item_ids)} videos (no writable backend)",
+                  flush=True)
+            return
+        # 过滤出"需要跑"的 item(asr_status IS NULL)
+        placeholders = ','.join('?' * len(item_ids))
+        rows = conn.execute(
+            f"SELECT id FROM items WHERE id IN ({placeholders}) AND asr_status IS NULL",
+            item_ids,
+        ).fetchall()
+        pending = [r['id'] for r in rows]
     if not pending:
-        print(f"  🎙️  ASR ingest: all {len(tweet_ids)} videos already processed, skip", flush=True)
+        print(f"  🎙️  ASR ingest: all {len(item_ids)} videos already processed, skip", flush=True)
         return
 
     concurrency = int(os.environ.get('ASR_INGEST_CONCURRENCY', '5'))
@@ -489,7 +496,7 @@ def _run_asr_for_twitter_videos_inline(conn, tweet_ids: list[str]) -> None:
 
     def _one(tid: str) -> tuple[str, str]:
         # 每个 future 自己的 DB connection(SQLite thread-safe 不共享 conn)
-        c = db.get_conn()
+        c = None if remote_db.app_state_to_remote() else db.get_conn()
         try:
             r = asr_worker.run_asr_inline(tid, bypass_quota=False, conn=c,
                                           max_wait_sec=single_task_max_sec)
@@ -497,7 +504,9 @@ def _run_asr_for_twitter_videos_inline(conn, tweet_ids: list[str]) -> None:
         except Exception as e:  # noqa: BLE001
             return (tid, f"exception:{type(e).__name__}:{str(e)[:80]}")
         finally:
-            try: c.close()
+            try:
+                if c is not None:
+                    c.close()
             except Exception: pass
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -1431,6 +1440,7 @@ def ingest_hackernews(conn):
 def ingest_reddit(conn):
     """Ingest all Reddit JSON files."""
     total = 0
+    video_item_ids: list[str] = []
     reddit_dir = source_path('reddit')
     if not os.path.isdir(reddit_dir):
         return 0
@@ -1462,6 +1472,16 @@ def ingest_reddit(conn):
             thumbnail = post.get('thumbnail', '')
             if thumbnail in ('self', 'default', 'nsfw', 'spoiler', ''):
                 thumbnail = ''
+            media = post.get('media') if isinstance(post.get('media'), list) else []
+            if any(
+                isinstance(entry, dict)
+                and entry.get('type') == 'video'
+                and entry.get('url')
+                for entry in media
+            ):
+                video_item_ids.append(f'reddit_{pid}')
+            if not thumbnail and media:
+                thumbnail = str(media[0].get('poster_url') or '')
             flair = post.get('link_flair_text', '')
 
             metrics = {
@@ -1474,6 +1494,9 @@ def ingest_reddit(conn):
                 detail['external_url'] = external_url
             if flair:
                 detail['flair'] = flair
+            source_url = str(post.get('source_url') or '').strip()
+            if source_url:
+                detail['source_url'] = source_url
 
             items.append({
                 'id': f'reddit_{pid}',
@@ -1486,7 +1509,7 @@ def ingest_reddit(conn):
                 'author_avatar': '',
                 'url': url,
                 'cover_url': thumbnail or None,
-                'media_json': None,
+                'media_json': json.dumps(media, ensure_ascii=False) if media else None,
                 'metrics_json': json.dumps(metrics, ensure_ascii=False),
                 'tags_json': json.dumps([flair], ensure_ascii=False) if flair else None,
                 'lang': 'en',
@@ -1503,6 +1526,9 @@ def ingest_reddit(conn):
             total += len(items)
             print(f"  ✅ Reddit r/{sub}: {len(items)} posts")
 
+    # Fresh-run ordering is ingest → ASR → item enrichment → cluster summary.
+    # A successful transcript is therefore consumed by both later summary stages.
+    _run_asr_for_video_items_inline(conn, video_item_ids)
     return total
 
 

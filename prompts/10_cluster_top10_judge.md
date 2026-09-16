@@ -31,6 +31,9 @@ info2action 是一个面向 AI/科技从业者和内容创作者的信息雷达�
 - 不确定时不要合并。
 - 宁可漏合，不要错合。
 - 单 doc 不能因为自身重要就变成可见事件；如果没有同事件候选，应创建内部 singleton。
+- 当 New Doc 带有 `quoted_original`，且候选带有 `recall_relation: explicitly_quoted_source` 时，说明两者存在明确的原帖引用关系。这是强候选关系，仍需结合两段原文判断它属于同一事件、直接评论或无关转述。
+- 必须区分当前帖作者与被引用原作者。New Doc 的第一人称内容归当前帖作者；`quoted_original.text` 才归被引用作者。转述者新增的工具、观点或实践不得写成原作者的行为。
+- 当 `quoted_original.item_id` 与候选的 `referenced_item_id` 完全相同时，默认判为 `same_event=true`、`relationship=direct_commentary`。转发导语、回归调侃、个人评价和对原方法的实践补充都属于直接转述。只有当前帖明确发布了另一个具有独立主体、独立动作和独立事实载荷的具体事件，且原帖仅作为背景引用时，才可判为不同事件；理由中必须写出这个独立事件。
 
 ## 什么是同一事件
 
@@ -53,7 +56,7 @@ info2action 是一个面向 AI/科技从业者和内容创作者的信息雷达�
   - 同行业 / 同主题（"都是 AI 产品发布" / "都是浏览器产品" / "都是 RSS feed 文章"）
   - 同公司不同产品（"阿里 HappyHorse" vs "阿里悟空"）
   - 同主题不同事件（"OpenAI 战略文件" vs "Anthropic Claude 限制" — 都是 AI 战略,但不是同事件）
-  - 短文本（如仅含 URL / 标题不含具体事件信息 / Twitter 280 字内仅含模糊描述）→ 必须 same_event=false
+- 短文本（如仅含 URL / 标题不含具体事件信息 / Twitter 280 字内仅含模糊描述）→ 必须 same_event=false。若输入同时给出完整 `quoted_original` 与命中的 `explicitly_quoted_source` 候选，可基于引用关系和两段原文继续判断。
 
 允许加入的关系：
 - same_event：同一个事件本体，例如同一个产品发布、同一次融资、同一次关闭功能。

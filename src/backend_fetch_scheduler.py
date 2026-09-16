@@ -58,6 +58,28 @@ def fetch_tick_interval_minutes(env: Mapping[str, str] | None = None) -> int:
     return minutes if minutes > 0 else DEFAULT_BACKEND_FETCH_TICK_MINUTES
 
 
+BACKEND_FETCH_POLL_SECONDS_ENV = "INFO2ACTION_BACKEND_FETCH_POLL_SECONDS"
+DEFAULT_BACKEND_FETCH_POLL_SECONDS = 30.0
+
+
+def global_fetch_poll_seconds(env: Mapping[str, str] | None = None) -> float:
+    """全局抓取调度的轮询间隔(秒)。
+
+    调度器不再对齐墙钟刻度。每隔这么久检查一次"上一轮是否已结束 + 是否已满最小间隔",
+    两个条件都满足才起下一轮,于是两轮启动间隔 = max(min_interval, 上一轮执行时长)。
+    墙钟对齐的老做法会在一轮超时跨过刻度时直接丢弃那个刻度,把间隔顶成两倍。
+    """
+    values = os.environ if env is None else env
+    raw = values.get(BACKEND_FETCH_POLL_SECONDS_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_BACKEND_FETCH_POLL_SECONDS
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_BACKEND_FETCH_POLL_SECONDS
+    return seconds if seconds > 0 else DEFAULT_BACKEND_FETCH_POLL_SECONDS
+
+
 def seconds_until_next_interval(interval_minutes: int = 30,
                                 now: datetime | None = None) -> float:
     """距下一个墙钟对齐 tick 的秒数。interval=30 → :00/:30;interval=15 → :00/:15/:30/:45。"""

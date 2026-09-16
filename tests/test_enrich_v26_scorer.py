@@ -68,22 +68,42 @@ def _score_result_at(score10, **overrides):
     return result
 
 
-def test_build_item_content_v26_includes_quoted_tweet_from_string_detail_json():
+def test_item_summary_and_v26_score_share_quoted_tweet_with_attribution():
     item = {
         "id": "x-1",
         "platform": "twitter",
+        "author_name": "评论者",
         "title": "原推标题",
         "content": "原推正文",
         "detail_json": json.dumps(
-            {"quotedTweet": {"text": "被引用推文的完整信息"}},
+            {
+                "quotedTweet": {
+                    "id": "quoted-1",
+                    "text": "被引用推文的完整信息",
+                    "author": {"name": "产品作者", "screenName": "product_author"},
+                }
+            },
             ensure_ascii=False,
         ),
     }
 
-    content = enrich_items.build_item_content_v26(item)
+    summary_content = enrich_items.build_item_content(item)
+    score_content = enrich_items.build_item_content_v26(item)
 
-    assert "原推正文" in content
-    assert "quoted: 被引用推文的完整信息" in content
+    for content in (summary_content, score_content):
+        assert "原推正文" in content
+        assert "引用原帖" in content
+        assert "产品作者 (@product_author)" in content
+        assert "被引用推文的完整信息" in content
+        assert content.count("被引用推文的完整信息") == 1
+
+
+def test_item_enrichment_prompt_requires_current_and_quoted_author_attribution():
+    prompt = enrich_items.build_system_prompt([])
+
+    assert "当前帖作者" in prompt
+    assert "引用原帖作者" in prompt
+    assert "分别归属" in prompt
 
 
 def test_build_item_content_v26_includes_dict_readme_even_when_description_exists():
@@ -244,6 +264,85 @@ def test_enrich_highlight_score_v26_does_not_rerun_outside_edge_band(monkeypatch
     assert result["runs"] == [8.0]
 
 
+@pytest.mark.parametrize(
+    "value_path",
+    ["substantive", "none"],
+    ids=["substantive", "none"],
+)
+def test_enrich_highlight_score_v26_reach_guard_excludes_narrow_non_major_event(
+    monkeypatch,
+    value_path,
+):
+    written = []
+    monkeypatch.setattr(enrich_items, "load_prompt", lambda _filename: "system")
+    monkeypatch.setattr(
+        enrich_items,
+        "call_minimax",
+        lambda *args, **kwargs: json.dumps(
+            _score_result_at(8.0, reach=1, value_path=value_path),
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        enrich_items,
+        "write_highlight_score_v26_current",
+        lambda item_id, result, threshold: written.append((item_id, result, threshold)),
+    )
+
+    result = enrich_items.enrich_highlight_score_v26_for_item(
+        {"id": "item-narrow", "title": "narrow", "content": "narrow content"},
+        "key",
+        "base",
+        "model",
+        threshold=5.5,
+        dry_run=False,
+    )
+
+    assert result["score10"] == 8.0
+    assert result["is_flag_bearer"] is False
+    assert result["reason"] == "[reach_guard] 完整可复用的教程"
+    assert written == [("item-narrow", result, 5.5)]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_reach"),
+    [
+        ({"reach": 1, "value_path": "major_event"}, 1),
+        ({}, None),
+        ({"reach": 2}, 2),
+    ],
+    ids=["major_event_exempt", "missing_reach_compatible", "reach_two_included"],
+)
+def test_enrich_highlight_score_v26_reach_guard_preserves_existing_behavior(
+    monkeypatch,
+    overrides,
+    expected_reach,
+):
+    monkeypatch.setattr(enrich_items, "load_prompt", lambda _filename: "system")
+    monkeypatch.setattr(
+        enrich_items,
+        "call_minimax",
+        lambda *args, **kwargs: json.dumps(
+            _score_result_at(8.0, **overrides),
+            ensure_ascii=False,
+        ),
+    )
+
+    result = enrich_items.enrich_highlight_score_v26_for_item(
+        {"id": "item-preserved", "title": "kept", "content": "kept content"},
+        "key",
+        "base",
+        "model",
+        threshold=5.5,
+        dry_run=True,
+    )
+
+    assert result["reach"] is expected_reach
+    assert result["score10"] == 8.0
+    assert result["is_flag_bearer"] is True
+    assert result["reason"] == "完整可复用的教程"
+
+
 def test_enrich_highlight_score_v26_falls_back_when_pass2_fails(monkeypatch):
     responses = iter([
         json.dumps(_score_result_at(5.5), ensure_ascii=False),
@@ -368,6 +467,7 @@ def test_write_highlight_score_v26_remote_nests_scores_and_maps_verdict(
         "content_type",
         "reject",
         "veto",
+        "reach",
     }
     assert "importance" not in nested_score
     assert params[1] is is_flag_bearer
@@ -375,6 +475,35 @@ def test_write_highlight_score_v26_remote_nests_scores_and_maps_verdict(
     assert params[7] == highlight_score_v26.PROMPT_VERSION
     assert params[-1] == "item-1"
     assert conn.calls[-1] == ("commit", None)
+
+
+@pytest.mark.parametrize(
+    "value_path",
+    ["substantive", "none"],
+    ids=["substantive", "none"],
+)
+def test_write_highlight_score_v26_remote_applies_reach_guard(
+    monkeypatch,
+    value_path,
+):
+    monkeypatch.setattr(remote_db, "_maybe_jsonb", lambda value: value)
+    conn = _FakeConn()
+    result = _score_result(reach=1, value_path=value_path)
+    result.update(score10=8.0, is_flag_bearer=True)
+
+    remote_db.write_highlight_score_v26_remote(
+        conn,
+        "item-narrow",
+        result,
+        threshold=5.5,
+    )
+
+    _, params = conn.calls[0]
+    assert params[0]["reach"] == 1
+    assert params[0]["score10"] == 8.0
+    assert params[1] is False
+    assert params[2] == "drop"
+    assert params[5] == "[reach_guard] 完整可复用的教程"
 
 
 def test_highlight_scorer_dispatch_defaults_to_v38(monkeypatch):

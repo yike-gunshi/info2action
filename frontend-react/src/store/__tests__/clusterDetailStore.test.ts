@@ -91,6 +91,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.unstubAllGlobals()
 })
 
 describe('clusterDetailStore.openModal', () => {
@@ -183,6 +184,28 @@ describe('clusterDetailStore.openModal', () => {
     await new Promise((r) => setTimeout(r, 0))
     expect(clickCluster).toHaveBeenCalledWith(42)
   })
+
+  it('click 成功后向阅读同步频道广播 clusterId', async () => {
+    class BroadcastChannelMock {
+      static instances: BroadcastChannelMock[] = []
+      postMessage = vi.fn()
+      close = vi.fn()
+      onmessage: ((event: MessageEvent) => void) | null = null
+
+      constructor(readonly name: string) {
+        BroadcastChannelMock.instances.push(this)
+      }
+    }
+    vi.stubGlobal('BroadcastChannel', BroadcastChannelMock)
+
+    await useClusterDetailStore.getState().openModal(42)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(BroadcastChannelMock.instances).toHaveLength(1)
+    expect(BroadcastChannelMock.instances[0].name).toBe('info2act-cluster-read')
+    expect(BroadcastChannelMock.instances[0].postMessage).toHaveBeenCalledWith({ clusterId: 42 })
+  })
+
 })
 
 describe('clusterDetailStore.toggleClusterStar', () => {

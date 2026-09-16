@@ -1,11 +1,15 @@
 """Email sending via Resend API."""
 from html import escape
+import json
 import os
+import time
 import resend
 
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 BRAND_NAME = os.environ.get('EMAIL_BRAND_NAME') or os.environ.get('APP_BRAND_NAME') or 'info2act'
 FROM_EMAIL = os.environ.get('RESEND_FROM_EMAIL', f'{BRAND_NAME} <noreply@info2act.com>')
+BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ALERT_STATE_PATH = os.path.join(BASE, 'data', 'lingowhale_alerts.json')
 
 
 def _email_shell(title: str, greeting: str, body_html: str, footer_note: str) -> str:
@@ -124,4 +128,49 @@ def send_password_reset(to_email: str, reset_url: str, username: str = '') -> bo
         return True
     except Exception as e:
         print(f"[email] Failed to send reset to {to_email}: {e}")
+        return False
+
+
+def send_lingowhale_alert(alert_type: str, subject: str, message: str, *,
+                          state_path: str = None, now: float = None) -> bool:
+    """BF-0803-1: 发送语鲸告警，同类型 24 小时内去重。"""
+    recipient = os.environ.get('ALERT_EMAIL') or os.environ.get('INFO2ACTION_ADMIN_EMAIL')
+    if not recipient or not RESEND_API_KEY:
+        return False
+
+    state_path = state_path or ALERT_STATE_PATH
+    now = time.time() if now is None else now
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError, TypeError):
+        state = {}
+    if now - float(state.get(alert_type, 0) or 0) < 24 * 3600:
+        return False
+
+    try:
+        resend.api_key = RESEND_API_KEY
+        resend.Emails.send({
+            'from': FROM_EMAIL,
+            'to': [recipient],
+            'subject': f'[{BRAND_NAME}] {subject}',
+            'html': _email_shell(
+                title=escape(subject),
+                greeting='管理员你好，',
+                body_html=f'<p style="margin:0;font-size:15px;line-height:1.7;color:#3a352c;">{escape(message)}</p>',
+                footer_note='这是语鲸抓取链路的自动健康告警。',
+            ),
+            'text': f'{subject}\n\n{message}\n\n— {BRAND_NAME}',
+        })
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        tmp_path = f'{state_path}.{os.getpid()}.tmp'
+        state[alert_type] = now
+        with open(tmp_path, 'w') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, state_path)
+        return True
+    except Exception as exc:  # noqa: BLE001 — 告警失败不影响抓取
+        print(f'[email] Failed to send Lingowhale alert: {exc}')
         return False

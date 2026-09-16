@@ -36,6 +36,50 @@ def _result(**overrides):
 
 def test_prompt_file_matches_v26_contract():
     assert scoring.PROMPT_FILE == "15_item_score_v26.md"
+    assert scoring.PROMPT_VERSION == "item_score_v26_9_1_reach_niche_2026_08_02"
+
+
+@pytest.mark.parametrize(
+    ("raw_reach", "expected"),
+    [
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        ("2", 2),
+        (2.0, 2),
+        (None, None),
+        ("broad", None),
+    ],
+    ids=[
+        "integer_one",
+        "integer_two",
+        "integer_three",
+        "numeric_string",
+        "integer_float",
+        "missing",
+        "invalid",
+    ],
+)
+def test_normalize_reach(raw_reach, expected):
+    raw = _result()
+    if raw_reach is not None:
+        raw["reach"] = raw_reach
+
+    normalized = scoring.normalize_score_result(raw)
+
+    assert "error" not in normalized
+    assert normalized["reach"] is expected
+
+
+def test_prompt_separates_product_promotion_from_conversion_only_veto():
+    prompt = (ROOT / "prompts" / scoring.PROMPT_FILE).read_text(encoding="utf-8")
+
+    assert "产品发布、功能介绍、使用教程、官方宣传" in prompt
+    assert "推广程度只记入 marketing 分" in prompt
+    assert "该字段只参与扣分，不直接决定 veto" in prompt
+    assert "删除购买、关注、预约、加群等转化动作后没有留下独立信息价值" in prompt
+    assert "substance>=2" in prompt
+    assert "audience_fit>=2" in prompt
 
 
 def test_normalize_accepts_strict_json_and_markdown_code_fence():
@@ -151,13 +195,58 @@ def test_invalid_dimension_returns_pending_error_result(invalid_value):
     assert "error" in result
 
 
-def test_marketing_three_forces_marketing_veto():
+def test_high_promotion_score_does_not_force_marketing_veto():
     result = scoring.normalize_score_result(
         _result(marketing=3, veto="none")
     )
 
     assert "error" not in result
+    assert result["veto"] == "none"
+
+
+def test_product_promotion_with_independent_value_clears_marketing_veto():
+    result = scoring.normalize_score_result(
+        _result(
+            content_type="tutorial_method",
+            dims={
+                "authority": 3,
+                "substance": 3,
+                "novelty": 1,
+                "timeliness": 1,
+                "audience_fit": 3,
+            },
+            marketing=3,
+            veto="marketing",
+            value_path="substantive",
+        )
+    )
+
+    assert "error" not in result
+    assert result["veto"] == "none"
+    assert scoring.compute_score10(result) == 7.0
+    assert scoring.is_flag_bearer(result, 7.0, 4.75) is True
+
+
+def test_conversion_only_content_keeps_marketing_veto():
+    result = scoring.normalize_score_result(
+        _result(
+            content_type="product_tool",
+            dims={
+                "authority": 1,
+                "substance": 1,
+                "novelty": 0,
+                "timeliness": 1,
+                "audience_fit": 1,
+            },
+            marketing=3,
+            veto="marketing",
+            value_path="none",
+        )
+    )
+
+    assert "error" not in result
     assert result["veto"] == "marketing"
+    assert scoring.is_flag_bearer(result, scoring.compute_score10(result), 4.75) is False
 
 
 @pytest.mark.parametrize(
