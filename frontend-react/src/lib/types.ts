@@ -186,6 +186,7 @@ export interface ActionBoardDirection extends ActionDirectionSummary {
 
 /** Feed section (grouped by category) */
 export interface FeedSection {
+  countKnown?: boolean
   key: string
   label: string
   items: FeedItem[]
@@ -198,6 +199,15 @@ export interface InfoReadModelCursor {
   rank_after?: number | null
   exclude_ids?: string[] | null
 }
+
+export interface InfoLiveCursor {
+  kind: 'live'
+  v: 1
+  scope_key: string
+  after: { sort_at: string | null; fetched_at: string | null; relevance_score: number | null; id: string }
+}
+
+export type InfoFeedCursor = InfoReadModelCursor | InfoLiveCursor
 
 export type FeedEventsCursor = number | InfoReadModelCursor | null
 

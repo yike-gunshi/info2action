@@ -30,6 +30,11 @@
  */
 import type { ReactNode } from 'react'
 
+interface MarkdownLiteOptions {
+  /** Render URLs as inert text when false; other callers keep linkification. */
+  links?: boolean
+}
+
 const AUTO_LINK_RE = /\b(?:https?:\/\/(?:(?!&(?:lt|gt|quot|#39);)[^\s<>"'`[\]{}|^，。！？、；：）】〕》」』（【《「『\u4e00-\u9fff])+|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,}(?:[/?#](?:(?!&(?:lt|gt|quot|#39);)[^\s<>"'`[\]{}|^，。！？、；：）】〕》」』（【《「『\u4e00-\u9fff])*)?)/gi
 const TRAILING_URL_PUNCT_RE = /[)\].,;:!?，。！？、；：）】〕》」』]+$/
 const CJK_TEXT_RE = /[\u3400-\u9fff]/
@@ -110,6 +115,12 @@ function hasLinkishContext(precedingText: string): boolean {
 function shouldLinkBareDomain(displayUrl: string, url: URL, precedingText: string): boolean {
   if (hasExplicitHttpProtocol(displayUrl)) return true
   if (/@$/.test(precedingText)) return false
+  // A slash right before the match means this is a path segment, not a host.
+  // Plenty of file extensions are also real TLDs (.md is Moldova, .sh, .it, .co…),
+  // so "/docs/architecture.md" would otherwise be linkified as the domain
+  // "architecture.md" — and the surrounding words 文档/链接 are exactly the context
+  // that lets a bare domain through (user feedback 2026-09-22).
+  if (/\//.test(precedingText.slice(-1))) return false
 
   const decoded = decodeUrlEntities(displayUrl)
   if (/^www\./i.test(decoded)) return true
@@ -203,7 +214,7 @@ function applyBold(line: string): string {
 }
 
 /** 把 escape 后的文本里的 `X` / **X** / *X* 替换为对应 HTML 标签 */
-function applyInline(escaped: string): string {
+function applyInline(escaped: string, options: MarkdownLiteOptions): string {
   let out = escaped
   const codePlaceholders: string[] = []
   // 1. inline code 最先处理 — 内部的 * 替换为 HTML entity,防后续 bold/italic 误抢
@@ -218,7 +229,7 @@ function applyInline(escaped: string): string {
   // 3. italic(*X*)— 不能跨行;前后不紧邻 *(避开 ** 残留)
   out = out.replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, '$1<em class="italic">$2</em>')
   // 4. bare http(s) URL → safe external link. Code placeholders are restored after linkification.
-  out = applyAutoLinks(out)
+  if (options.links !== false) out = applyAutoLinks(out)
   out = out.replace(/\uE000(\d+)\uE001/g, (_, key: string) => codePlaceholders[Number(key)] ?? '')
   return out
 }
@@ -245,7 +256,7 @@ function normalizeTableRow(line: string): string | null {
 }
 
 /** 把纯文本拆成块级结构(段落 vs 列表),每块应用内联转换 */
-function toBlocks(text: string): RenderedBlock[] {
+function toBlocks(text: string, options: MarkdownLiteOptions): RenderedBlock[] {
   const lines = text.split('\n')
   const blocks: RenderedBlock[] = []
   let currentList: { kind: 'ul' | 'ol'; items: ListItem[] } | null = null
@@ -287,7 +298,7 @@ function toBlocks(text: string): RenderedBlock[] {
       flushPara()
       const headText = headingMatch[2].trim()
       if (headText) {
-        const wrapped = applyInline(escapeHtml(`**${headText}**`))
+        const wrapped = applyInline(escapeHtml(`**${headText}**`), options)
         blocks.push({ kind: 'p', html: [wrapped] })
       }
       continue
@@ -302,7 +313,7 @@ function toBlocks(text: string): RenderedBlock[] {
     const numberedMatch = line.match(/^(\s*)\d+[.、]\s+(.*)$/)
     if (bulletMatch) {
       const indent = bulletMatch[1].length
-      const itemHtml = applyInline(escapeHtml(bulletMatch[2]))
+      const itemHtml = applyInline(escapeHtml(bulletMatch[2]), options)
       flushPara()
       if (!currentList || currentList.kind !== 'ul') {
         flushList()
@@ -317,7 +328,7 @@ function toBlocks(text: string): RenderedBlock[] {
     }
     if (numberedMatch) {
       const indent = numberedMatch[1].length
-      const itemHtml = applyInline(escapeHtml(numberedMatch[2]))
+      const itemHtml = applyInline(escapeHtml(numberedMatch[2]), options)
       flushPara()
       if (!currentList || currentList.kind !== 'ol') {
         flushList()
@@ -336,7 +347,7 @@ function toBlocks(text: string): RenderedBlock[] {
       continue
     }
     flushList()
-    const inline = applyInline(escapeHtml(line))
+    const inline = applyInline(escapeHtml(line), options)
     // 删除孤立 ** 后可能整行变空,跳过避免渲染空 <p>
     if (inline.trim() === '') continue
     if (!currentPara) currentPara = []
@@ -353,9 +364,9 @@ function toBlocks(text: string): RenderedBlock[] {
  *
  * Usage: <li>{renderMarkdownInline(sub)}</li>
  */
-export function renderMarkdownInline(text: string | null | undefined): ReactNode {
+export function renderMarkdownInline(text: string | null | undefined, options: MarkdownLiteOptions = {}): ReactNode {
   if (!text) return null
-  const html = applyInline(escapeHtml(text))
+  const html = applyInline(escapeHtml(text), options)
   return <span dangerouslySetInnerHTML={{ __html: html }} />
 }
 
@@ -365,9 +376,9 @@ export function renderMarkdownInline(text: string | null | undefined): ReactNode
  *
  * Usage: const nodes = renderMarkdownLite(text); return <>{nodes}</>
  */
-export function renderMarkdownLite(text: string | null | undefined): ReactNode[] {
+export function renderMarkdownLite(text: string | null | undefined, options: MarkdownLiteOptions = {}): ReactNode[] {
   if (!text) return []
-  const blocks = toBlocks(text)
+  const blocks = toBlocks(text, options)
   return blocks.map((b, i) => {
     if (b.kind === 'p') {
       return (

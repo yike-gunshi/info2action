@@ -55,6 +55,7 @@ _PUBLIC_API_EXACT_PATHS = frozenset((
 ))
 
 _PUBLIC_API_PREFIXES = (
+    '/api/ai-search',   # public status/history/polling; route gates submissions and filters sources
     '/api/feed',        # feed listing, sections, item detail
     # v12.2 Round 2 媒体代理(Twitter CDN Referer 绕行):匿名可看视频/封面
     '/api/media',
@@ -128,6 +129,10 @@ def _is_public_api(path: str, method: str = 'GET') -> bool:
     if path in _PUBLIC_API_EXACT_PATHS:
         return True
     if _is_public_cluster_api(path, method):
+        return True
+    # These GETs enforce the existing admin dependency and return JSON 403,
+    # including for anonymous callers; JWT attachment above remains unchanged.
+    if method == 'GET' and re.fullmatch(r'/api/admin/ai-search/jobs(?:/[^/]+)?', path):
         return True
     return any(path == prefix or path.startswith(prefix + '/') for prefix in _PUBLIC_API_PREFIXES)
 

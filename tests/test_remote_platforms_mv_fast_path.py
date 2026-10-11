@@ -74,11 +74,12 @@ class _FakeOneConn:
 
 
 class _QueryFeedConn:
-    def __init__(self, *, rows=None, count=123, fail_items=False, fail_count=False):
+    def __init__(self, *, rows=None, count=123, fail_items=False, fail_count=False, snapshot_total=None):
         self.rows = rows if rows is not None else [_row("tw_1")]
         self.count = count
         self.fail_items = fail_items
         self.fail_count = fail_count
+        self.snapshot_total = snapshot_total
         self.sqls = []
         self.params = []
 
@@ -88,6 +89,17 @@ class _QueryFeedConn:
         normalized = " ".join(sql.split())
         if normalized.startswith("SET LOCAL"):
             return _FakeResult([])
+        if normalized.startswith(('SAVEPOINT', 'RELEASE SAVEPOINT')):
+            return _FakeResult([])
+        if 'FROM remote_poc.info_pill_counts' in normalized:
+            if self.fail_count and self.snapshot_total is None:
+                return _FakeResult([])
+            stars = next(k.split(':')[-1] for k in params['kinds'] if k.startswith('platform:'))
+            return _FakeResult([
+                {'kind': 'platform_meta', 'value': stars, 'n': 1, 'computed_at': '2026-05-22T08:00:00+00:00'},
+                {'kind': f'platform:{stars}', 'value': json.dumps(['public', 'twitter']),
+                 'n': self.snapshot_total if self.snapshot_total is not None else self.count},
+            ])
         if "SELECT count(*) AS n" in normalized:
             if self.fail_count:
                 raise RuntimeError("remote count timeout")
@@ -112,6 +124,23 @@ class _InfoReadModelConn:
         normalized = " ".join(sql.split())
         if normalized.startswith("SET LOCAL"):
             return _FakeResult([])
+        if normalized.startswith(('SAVEPOINT', 'RELEASE SAVEPOINT')):
+            return _FakeResult([])
+        if 'FROM remote_poc.info_pill_counts' in normalized:
+            at = self.generated_at
+            entries = [('platform:50', ['public', 'twitter'], 120),
+                       ('platform_source:50', ['public', 'twitter', 'following'], 80),
+                       ('platform_category:50', ['public', 'twitter', 'ai'], 90),
+                       ('platform:50', ['user:user-1', 'manual'], 1),
+                       ('platform_source:50', ['user:user-1', 'manual', 'user-submit'], 1),
+                       ('platform_category:50', ['user:user-1', 'manual', 'products'], 1)]
+            return _FakeResult([{'kind': 'platform_meta', 'value': '50', 'n': 1, 'computed_at': at}] +
+                [{'kind': k, 'value': json.dumps(v), 'n': n, 'computed_at': at} for k,v,n in entries])
+        if 'WITH candidates AS MATERIALIZED' in normalized:
+            rows = [_row('tw_rm_1', source='following', category='ai')]
+            if (params or {}).get('manual_owner_user_id'):
+                rows.append(_row('manual_private', platform='manual', source='user-submit', category='products'))
+            return _FakeResult(rows)
         if (
             "FROM remote_poc.info_scopes sc" in normalized
             and "sc.dimension = 'section_category'" in normalized
@@ -762,6 +791,16 @@ class _PlatformOverviewConn:
         normalized = " ".join(sql.split())
         if normalized.startswith("SET LOCAL"):
             return _FakeResult([])
+        if normalized.startswith(('SAVEPOINT', 'RELEASE SAVEPOINT')):
+            return _FakeResult([])
+        if 'FROM remote_poc.info_pill_counts' in normalized:
+            stars = next(k.split(':')[-1] for k in params['kinds'] if k.startswith('platform:'))
+            at = '2026-05-22T08:00:00+00:00'
+            entries = [(f'platform:{stars}', ['public', r['platform']], r['cnt']) for r in self.platform_rows]
+            entries += [(f'platform_source:{stars}', ['public', r['platform'], r['source']], r['cnt']) for r in self.source_rows]
+            entries += [(f'platform_category:{stars}', ['public', r['platform'], r['category']], r['cnt']) for r in self.category_rows]
+            return _FakeResult([{'kind': 'platform_meta', 'value': stars, 'n': 1, 'computed_at': at}] +
+                [{'kind': k, 'value': json.dumps(v), 'n': n, 'computed_at': at} for k,v,n in entries])
         if "GROUP BY i.platform, i.source" in normalized:
             return _FakeResult(self.source_rows)
         if "GROUP BY i.platform, cat.value" in normalized:
@@ -896,11 +935,12 @@ def test_query_feed_platforms_live_path_uses_full_counts_not_sample_rows(monkeyp
 
     assert conn.sqls[0] == "SET LOCAL statement_timeout = '2500ms'"
     assert not any("mv_items_top_per_platform" in sql for sql in conn.sqls)
-    item_sql = next(sql for sql in conn.sqls if "WITH ranked AS" in sql)
-    assert "WHERE rn <= %(per_platform)s" in item_sql
+    item_sql = next(sql for sql in conn.sqls if "WITH candidates AS MATERIALIZED" in sql)
+    assert "LIMIT %(probe_limit)s" in item_sql
     assert "FROM remote_poc.items i" in item_sql
     assert "created_at, NULL::timestamptz AS read_at" in item_sql
-    assert ",\n                              row_number() OVER" in item_sql
+    assert "row_number() OVER" not in item_sql
+    assert "CROSS JOIN LATERAL" in item_sql
     assert "NULL::text AS ai_key_points" in item_sql
     assert "i.ai_key_points" not in item_sql
     assert "COALESCE(i.source, '') != 'bookmarks'" in item_sql
@@ -918,7 +958,7 @@ def test_query_feed_platforms_live_path_uses_full_counts_not_sample_rows(monkeyp
     remote_db.clear_feed_cache_keys()
 
 
-def test_query_feed_platforms_uses_info_read_model_when_enabled(monkeypatch):
+def test_query_feed_platforms_uses_live_sources_even_when_type_read_model_enabled(monkeypatch):
     remote_db.clear_feed_cache_keys()
     conn = _InfoReadModelConn()
 
@@ -945,27 +985,16 @@ def test_query_feed_platforms_uses_info_read_model_when_enabled(monkeypatch):
     assert result["source_counts"] == {"twitter": {"following": 80}}
     assert result["category_counts"] == {"twitter": {"ai": 90}}
     assert result["sample_limit"] == 50
-    assert result["overview_generated_at"] == "2026-05-22T08:00:00Z"
-    assert result["overview_max_fetched_at"] == "2026-05-22T07:55:00Z"
+    assert result["overview_generated_at"]
+    assert result["counts_generated_at"] == "2026-05-22T08:00:00Z"
     assert result["data_backend"] == "supabase_poc"
-    assert result["platform_next_cursors"]["twitter"] == {
-        "version_id": conn.version,
-        "scope_key": "platform=twitter|dimension=all|value=",
-        "rank_after": 1,
-    }
+    assert result["platform_next_cursors"] == {}  # one card, no next page
     assert conn.sqls[0] == "SET LOCAL statement_timeout = '2500ms'"
-    assert conn.sqls[1] == "SET LOCAL idle_in_transaction_session_timeout = '5000ms'"
-    assert any("info_read_model_state" in sql for sql in conn.sqls)
-    assert any("info_scope_items" in sql for sql in conn.sqls)
-    card_sql = next(sql for sql in conn.sqls if "WITH all_scope_items AS MATERIALIZED" in sql)
-    assert "WITH all_scope_items AS MATERIALIZED" in card_sql
+    assert not any("info_read_model_state" in sql or "info_scope_items" in sql for sql in conn.sqls)
+    card_sql = next(sql for sql in conn.sqls if "WITH candidates AS MATERIALIZED" in sql)
     assert "CROSS JOIN LATERAL" in card_sql
-    assert "si.scope_key = sc.scope_key" in card_sql
-    assert "ci.item_id = page.item_id" in card_sql
-    assert "COALESCE(ci.source, '') != 'bookmarks'" in card_sql
-    assert "OFFSET 0" in card_sql
-    assert not any("FROM remote_poc.items i" in sql for sql in conn.sqls)
-    assert conn.commits >= 1
+    assert "COALESCE(i.source, '') != 'bookmarks'" in card_sql
+    assert "OFFSET" not in card_sql
 
     remote_db.clear_feed_cache_keys()
 
@@ -992,13 +1021,13 @@ def test_query_feed_platforms_logged_in_merges_private_manual_overlay(monkeypatc
         min_github_stars=50,
     )
 
-    assert result["read_model"] == "info_platforms_v1"
-    assert result["private_manual_overlay"] is True
+    assert "read_model" not in result
+    assert result["stale"] is False
     assert result["platform_counts"]["manual"] == 1
     assert result["source_counts"]["manual"]["user-submit"] == 1
     assert result["category_counts"]["manual"]["products"] == 1
     assert result["sections"]["manual"][0]["id"] == "manual_private"
-    assert any("i.platform = 'manual'" in sql for sql in conn.sqls)
+    assert any("manual_owner_user_id" in sql for sql in conn.sqls)
 
     remote_db.clear_feed_cache_keys()
 
@@ -2191,7 +2220,7 @@ def test_get_feed_item_keeps_detail_columns(monkeypatch):
     remote_db.clear_feed_cache_keys()
 
 
-def test_query_feed_platforms_warms_platform_more_count_cache(monkeypatch):
+def test_query_feed_platforms_and_more_share_snapshot_totals(monkeypatch):
     remote_db.clear_feed_cache_keys()
     min_github_stars = 9876
     overview_conn = _PlatformOverviewConn(
@@ -2200,7 +2229,7 @@ def test_query_feed_platforms_warms_platform_more_count_cache(monkeypatch):
         source_rows=[{"platform": "twitter", "source": "following", "cnt": 80}],
         category_rows=[{"platform": "twitter", "category": "ai", "cnt": 90}],
     )
-    page_conn = _QueryFeedConn(rows=[_row("tw_51"), _row("tw_52")], count=999, fail_count=True)
+    page_conn = _QueryFeedConn(rows=[_row("tw_51"), _row("tw_52")], count=999, fail_count=True, snapshot_total=120)
     conns = [overview_conn, page_conn]
 
     @contextmanager
@@ -2229,13 +2258,13 @@ def test_query_feed_platforms_warms_platform_more_count_cache(monkeypatch):
 
     assert [item["id"] for item in result["items"]] == ["tw_51", "tw_52"]
     assert result["total"] == 120
-    assert result["has_more"] is True
+    assert result["has_more"] is False  # exactly two rows, no third probe row
     assert not any("SELECT count(*) AS n" in sql for sql in page_conn.sqls)
 
     remote_db.clear_feed_cache_keys()
 
 
-def test_query_feed_by_platform_count_timeout_returns_items_with_estimated_total(monkeypatch):
+def test_query_feed_by_platform_missing_count_returns_items_with_unknown_total(monkeypatch):
     remote_db.clear_feed_cache_keys()
     conn = _QueryFeedConn(rows=[_row("tw_51"), _row("tw_52")], fail_count=True)
 
@@ -2256,12 +2285,12 @@ def test_query_feed_by_platform_count_timeout_returns_items_with_estimated_total
     )
 
     assert [item["id"] for item in result["items"]] == ["tw_51", "tw_52"]
-    assert result["total"] == 53
-    assert result["has_more"] is True
-    assert result["next_offset"] == 52
-    assert result["degraded"] is True
-    assert result["degraded_reason"] == "platform_page_total_unavailable"
-    assert result["total_is_estimate"] is True
+    assert result["total"] is None
+    assert result["counts_generated_at"] is None
+    assert result["has_more"] is False
+    assert result["next_offset"] is None
+    assert result.get("degraded") is not True
+    assert not any("SELECT count(*) AS n" in sql for sql in conn.sqls)
 
     remote_db.clear_feed_cache_keys()
 
@@ -2291,10 +2320,11 @@ def test_query_feed_by_platform_excludes_loaded_ids_without_changing_total(monke
         sql for sql in conn.sqls
         if "FROM remote_poc.items i" in sql and "SELECT count(*) AS n" not in sql
     )
-    count_sql = next(sql for sql in conn.sqls if "SELECT count(*) AS n" in sql)
+    count_sql = next(sql for sql in conn.sqls if "info_pill_counts" in sql)
     assert "NOT (i.id::text = ANY(%(exclude_ids)s))" in item_sql
     assert "exclude_ids" in conn.params[1]
-    assert "exclude_ids" not in conn.params[-1]
+    count_params = next(p for s,p in zip(conn.sqls, conn.params) if "info_pill_counts" in s)
+    assert "exclude_ids" not in count_params
     assert "NOT (i.id::text = ANY(%(exclude_ids)s))" not in count_sql
     assert result["total"] == 75
 
@@ -2426,6 +2456,7 @@ def test_prewarm_platforms_uses_platform_query_params(monkeypatch):
         "public_only": True,
         "manual_owner_user_id": None,
         "min_github_stars": 50,
+        "force_refresh": True,
     })]
 
 
@@ -3055,8 +3086,9 @@ def test_query_feed_sections_reuses_cached_result(monkeypatch):
     assert result["sections"]["coding"][0]["id"] == "gh_1"
 
 
-def test_query_feed_platforms_live_path_sets_short_statement_timeout(monkeypatch):
+def test_query_feed_platforms_search_path_uses_search_statement_timeout(monkeypatch):
     remote_db.clear_feed_cache_keys()
+    monkeypatch.setenv(remote_db.REMOTE_FEED_SEARCH_TIMEOUT_MS_ENV, "10000")
 
     class ScriptedConn:
         def __init__(self):
@@ -3099,7 +3131,7 @@ def test_query_feed_platforms_live_path_sets_short_statement_timeout(monkeypatch
     assert result["platform_counts"] == {"twitter": 1}
     assert result["source_counts"] == {"twitter": {"following": 1}}
     assert result["category_counts"] == {"twitter": {"ai": 1}}
-    assert conn.sqls[0] == "SET LOCAL statement_timeout = '2500ms'"
+    assert conn.sqls[0] == "SET LOCAL statement_timeout = '10000ms'"
     assert any("GROUP BY i.platform" in sql for sql in conn.sqls)
     assert any("GROUP BY i.platform, i.source" in sql for sql in conn.sqls)
     assert any("GROUP BY i.platform, cat.value" in sql for sql in conn.sqls)
@@ -3107,8 +3139,9 @@ def test_query_feed_platforms_live_path_sets_short_statement_timeout(monkeypatch
     remote_db.clear_feed_cache_keys()
 
 
-def test_query_feed_sections_live_path_sets_short_statement_timeout(monkeypatch):
+def test_query_feed_sections_search_path_uses_search_statement_timeout(monkeypatch):
     remote_db.clear_feed_cache_keys()
+    monkeypatch.setenv(remote_db.REMOTE_FEED_SEARCH_TIMEOUT_MS_ENV, "10000")
 
     class ScriptedConn:
         def __init__(self):
@@ -3143,8 +3176,10 @@ def test_query_feed_sections_live_path_sets_short_statement_timeout(monkeypatch)
 
     assert result["sections"]["ai"][0]["id"] == "section_live"
     assert result["cat_counts"] == {"ai": 1}
-    assert conn.sqls[0] == "SET LOCAL statement_timeout = '2500ms'"
-    assert len(conn.sqls) == 3
+    assert conn.sqls[0] == "SET LOCAL statement_timeout = '10000ms'"
+    assert len([sql for sql in conn.sqls if not sql.startswith(("SAVEPOINT ", "RELEASE "))]) == 3
+    assert "SAVEPOINT search_count" in conn.sqls
+    assert "RELEASE SAVEPOINT search_count" in conn.sqls
     assert any("GROUP BY 1" in sql for sql in conn.sqls)
 
     remote_db.clear_feed_cache_keys()

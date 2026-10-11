@@ -32,6 +32,9 @@ Checking Twitter, WeChat, Reddit, Discord, RSS and YouTube every day means readi
 - **AI enrichment** — one LLM pass produces summary, key points, category, content type, quality score and keywords
 - **Cross-source event clustering** — embedding recall + LLM verdict on "same event"; event-level digests regenerated from original sources; fully auditable
 - **AI curation** — per-item LLM verdicts (featured / borderline / drop) aggregated per cluster into a "what you should see now" timeline
+- **AI search** — lexical and vector retrieval with asynchronous, cited summaries, source cards, personal history and daily quotas; requires Supabase and a GLM Coding Plan key ([setup](SELF-HOST.md#35-ai-搜索可选))
+- **Unified reading** — shared reading dialogs for items, events and actions, with full-page reading and table-of-contents navigation
+- **Product changelog** — a public changelog page with an unread indicator
 - **Personalized ranking** — onboarding profile (role / interests / tools), pure-computation `quality × engagement × freshness × match` scoring
 - **Info→Action loop** — signals worth acting on become executable action cards, dispatched to Discord Forum or opened in browser
 - **Video understanding** — subtitles first, Doubao ASR fallback, segment-level bilingual captions

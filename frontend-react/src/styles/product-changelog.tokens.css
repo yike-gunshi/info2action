@@ -1,0 +1,78 @@
+/* 由 docs/assets/visuals/product-changelog/product-changelog.tokens.json 生成（工作台「保存」或 build_tokens.py），勿手改。
+ * 更新日志 · 设计工作台 v33.2 页面级与组件级 token。站点基础 token 只引用 var(--…)，值在站点全局样式。
+ * 工作台与前端组件读的是同一个文件。 */
+:root{
+  --cl-page-max: 1040px; /* 页面最大宽 */
+  --cl-timeline-width: 120px; /* 左侧日期栏宽 */
+  --cl-column-gap: 24px; /* 日期与正文间距 */
+  --cl-page-pad: 24px; /* 桌面两侧留白 */
+  --cl-narrow-below: 900px; /* 窄屏布局断点 */
+  --cl-column-gap-narrow: 24px; /* 窄屏两栏间距 */
+  --cl-page-pad-narrow: 20px; /* 窄屏两侧留白 */
+  --cl-mobile-below: 640px; /* 手机布局断点 */
+  --cl-page-pad-mobile: 20px; /* 手机两侧留白 */
+  --cl-page-title-size: 24px; /* 页标题字号 */
+  --cl-page-title-mobile: 24px; /* 手机页标题字号 */
+  --cl-page-title-lh: 1.4; /* 页标题行高 */
+  --cl-release-size: 18px; /* 发布标题字号 */
+  --cl-release-mobile: 18px; /* 手机发布标题字号 */
+  --cl-release-lh: 1.4; /* 发布标题行高 */
+  --cl-title-weight: 500; /* 标题字重 */
+  --cl-entry-size: 15px; /* 条目小标题字号 */
+  --cl-entry-mobile: 15px; /* 手机条目字号 */
+  --cl-entry-line: 28px; /* 小标题行高 */
+  --cl-body-size: 15px; /* 正文字号 */
+  --cl-body-lh: 1.6; /* 正文行高 */
+  --cl-body-weight: 400; /* 正文字重 */
+  --cl-date-size: 15px; /* 左侧日期字号 */
+  --cl-date-mobile: 12px; /* 手机日期字号 */
+  --cl-date-weight: 600; /* 当前日期字重 */
+  --cl-tag-size: 12px; /* 类型标签字号 */
+  --cl-tag-line: 18px; /* 类型标签行高 */
+  --cl-font-family: "PingFang SC", "Noto Sans SC", sans-serif; /* 日志字体（已确认） */
+  --cl-paper: var(--background); /* 页面底色 */
+  --cl-heading: var(--foreground); /* 标题文字 */
+  --cl-date-ink: var(--muted-foreground); /* 普通日期 */
+  --cl-active-ink: var(--foreground); /* 当前日期 */
+  --cl-dot-ink: var(--brand); /* 当前节点 */
+  --cl-line-ink: var(--border); /* 分隔线与时间线 */
+  --cl-tag-ink: var(--brand); /* 类型标签文字 */
+  --cl-body-ink: #46453f; /* 正文颜色 */
+  --cl-tag-fill: #f1e5dc; /* 标签底色 */
+  --cl-media-border: #d7d4ca; /* GIF 边框色 */
+  --cl-media-fill: #e7e5df; /* GIF 加载底色 */
+  --cl-f-background: #F4F3EF; /* 站点 background */
+  --cl-f-foreground: #1A1917; /* 站点 foreground */
+  --cl-f-brand: #C65A1E; /* 站点 brand */
+  --cl-f-border: #E4E2DC; /* 站点 border */
+  --cl-page-top: 32px; /* 页首留白 */
+  --cl-page-top-mobile: 12px; /* 手机页首留白 */
+  --cl-page-bottom: 100px; /* 页末留白 */
+  --cl-page-bottom-mobile: 72px; /* 手机页末留白 */
+  --cl-heading-bottom: 32px; /* 页标题下方留白 */
+  --cl-mobile-head-pad: 16px; /* 手机标题上下留白 */
+  --cl-release-pad: 40px; /* 每期上下留白 */
+  --cl-release-pad-mobile: 32px; /* 手机每期上下留白 */
+  --cl-release-title-gap: 24px; /* 发布标题到首条内容 */
+  --cl-entry-gap: 30px; /* 同一期条目间距 */
+  --cl-title-gap: 10px; /* 标签与小标题间距 */
+  --cl-title-wrap-gap: 6px; /* 小标题换行间距 */
+  --cl-copy-top: 12px; /* 小标题到正文 */
+  --cl-media-top: 20px; /* 文字到 GIF 间距 */
+  --cl-media-radius: 8px; /* GIF 圆角 */
+  --cl-tag-x: 6px; /* 标签左右留白 */
+  --cl-tag-y: 2px; /* 标签上下留白 */
+  --cl-tag-radius: 3px; /* 标签圆角 */
+  --cl-marker-pad: 4px; /* 时间线内侧留白 */
+  --cl-date-pad: 3px; /* 日期按钮内距 */
+  --cl-date-gap: 10px; /* 节点与日期间距 */
+  --cl-dot-size: 6px; /* 当前节点直径 */
+  --cl-dot-idle: 4px; /* 普通节点直径 */
+  --cl-target-height: 44px; /* 日期点击区域高 */
+  --cl-menu-width: 156px; /* 手机日期菜单宽 */
+  --cl-menu-pad: 8px; /* 日期菜单内距 */
+  --cl-glow-ms: 200ms; /* 日期高亮过渡 */
+  --cl-glow-near: 8px; /* 日期近层光晕 */
+  --cl-glow-far: 14px; /* 日期远层光晕 */
+  --cl-mobile-date-line: 20px; /* 手机日期预留行高 */
+}

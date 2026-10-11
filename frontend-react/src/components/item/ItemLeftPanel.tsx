@@ -10,11 +10,12 @@
 import React, { useMemo, useState } from 'react'
 import { ChevronDown, ImageOff, Heart, MessageCircle, Eye, Play, Share2, ThumbsUp, GitFork, Bookmark, Star } from 'lucide-react'
 
-import { cn, formatNumber, platformName, relativeTime } from '../../lib/utils'
+import { cn, formatNumber, platformName } from '../../lib/utils'
 import { PlatformAvatar } from '../shared/PlatformIcon'
 import { VideoPlayer } from '../detail/VideoPlayer'
 import { YoutubePlayer } from '../detail/YoutubePlayer'
 import { TranscriptPanel } from '../detail/TranscriptPanel'
+import { formatReadingDateTime } from '../reading/readingUtils'
 import type { FeedItem } from '../../lib/types'
 
 interface ItemLeftPanelProps {
@@ -216,7 +217,7 @@ export function ItemLeftPanel({
             )}
             {timeSource && (
               <span className="text-xs text-muted-foreground shrink-0 ml-auto">
-                {relativeTime(timeSource)}
+                {formatReadingDateTime(timeSource)}
               </span>
             )}
           </div>

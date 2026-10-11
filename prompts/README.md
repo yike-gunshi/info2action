@@ -1,6 +1,6 @@
 # AI Prompt 配置中心
 
-本目录存放 info2action 系统中所有 AI 调用的 prompt 模板（**当前 17 个 .md 文件**，含 v15.1 新增 `10_cluster_top10_judge.md` + 标 DEPRECATED 的 `09_cluster_merge_decision.md`）。
+本目录存放 info2action 系统中所有 AI 调用的 prompt 模板（**当前 18 个 .md 文件**（2026-09-19 新增 `17_ai_search_digest.md`），含 v15.1 新增 `10_cluster_top10_judge.md` + 标 DEPRECATED 的 `09_cluster_merge_decision.md`）。
 修改后无需重启服务，下次调用自动生效。
 
 > 调方案 / 看模块对应关系，先看 `docs/产品实现速查.md`。本文件只给文件清单和模板变量。
@@ -58,6 +58,7 @@
 | `02_summary_breakdown_asr.md` | `{category}` | 同上，但视频 ASR 专用（增加 interview/podcast 类目） |
 | `03_enrich_item.md` | `{categories}` | 分类体系（统一路径用） |
 | `03_interest_matching.md` | `{keywords}` | 用户兴趣的关键词列表 |
+| `17_ai_search_digest.md` | `{query}`, `{today}`, `{item_count}`, `{items}` | AI 搜索页整理：≤100 条条目正文 → 结构化带角标文章（GLM-5.3，Coding Plan 端点，异步） |
 | `03b_interest_keywords.md` | — | 无（输入是用户兴趣描述本身） |
 | `03c_interest_action.md` | `{interest_name}`, `{keywords}` | 兴趣方向名称 + 关键词 |
 | `04_action_analysis.md` | `{manifest_text}`, `{pulse_active_work}`, `{pulse_problems}`, `{pulse_learnings}`, `{pulse_content}`, `{user_guidance}`, `{directions_text}`, `{feedback_context}` | WORKSPACE-MANIFEST + WORKSPACE-PULSE + 用户偏好 + directions.yaml + 反馈信号 |

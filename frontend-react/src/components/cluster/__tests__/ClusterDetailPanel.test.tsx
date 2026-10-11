@@ -116,6 +116,7 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     window.location.hash = ''
     document.documentElement.style.overflow = ''
     document.documentElement.style.paddingRight = ''
+    document.documentElement.style.scrollbarGutter = ''
     vi.useRealTimers()
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -157,7 +158,9 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     expect(meta).toHaveTextContent('OpenAI')     // 主来源名
     expect(meta).toHaveTextContent('6 来源')      // unique_source_count
     expect(meta.querySelector('time')).toBeInTheDocument()
+    expect(meta.querySelector('time')).toHaveTextContent(/2026-\d{2}-\d{2} \d{2}:\d{2}/)
     expect(meta.querySelector('svg')).toBeInTheDocument()  // 平台徽标图标
+    expect(screen.getByTestId('cluster-modal-scroll')).toHaveClass('reveal-scroll', 'reading-modal-scroll')
 
     expect(screen.getByLabelText('关闭').parentElement).toHaveClass('w-8')
     expect(screen.getByLabelText('关闭').querySelector('svg')).toHaveClass('h-5', 'w-5')
@@ -364,17 +367,23 @@ describe('ClusterDetailPanel v19 rebuild', () => {
   })
 
   it('打开事件弹窗时锁定背景滚动,与信息弹窗保持一致', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1000 })
+    Object.defineProperty(document.documentElement, 'clientWidth', { configurable: true, value: 985 })
     document.documentElement.style.overflow = ''
     document.documentElement.style.paddingRight = ''
+    document.documentElement.style.scrollbarGutter = 'stable'
 
     const { unmount } = render(<ClusterDetailPanel />)
 
     expect(screen.getByTestId('cluster-detail-panel')).toBeInTheDocument()
     expect(document.documentElement.style.overflow).toBe('hidden')
-    expect(document.documentElement.style.paddingRight).toBe('')
+    expect(document.documentElement.style.scrollbarGutter).toBe('auto')
+    expect(document.documentElement.style.paddingRight).toBe('15px')
 
     unmount()
     expect(document.documentElement.style.overflow).toBe('')
+    expect(document.documentElement.style.scrollbarGutter).toBe('stable')
+    expect(document.documentElement.style.paddingRight).toBe('')
   })
 
   it('事件弹窗使用共享 modal 语义 token,避免暗色模式继续保留浅色纸面', () => {
@@ -414,7 +423,7 @@ describe('ClusterDetailPanel v19 rebuild', () => {
 
     expect(screen.queryByText('原文')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('放大查看事件详情')).not.toBeInTheDocument()
-    expect(screen.getByRole('dialog')).toHaveClass('modal-viewport-shell')
+    expect(screen.getByRole('dialog')).toBe(screen.getByTestId('cluster-detail-panel'))
     const actions = screen.getByTestId('cluster-bottom-actions')
     expect(actions).toHaveClass(
       'modal-safe-footer',
@@ -560,7 +569,8 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     expect(breakdown.querySelector('h3')?.className).toContain('reading-section')
     expect(breakdown.querySelector('ul')?.className).toContain('reading-bullet')
     expect(breakdown.querySelector('ul')?.className).toContain('space-y-1')
-    expect(breakdown.querySelector('article')?.className).toContain('pb-4')
+    expect(Array.from(breakdown.querySelectorAll('article'))).toHaveLength(2)
+    expect(Array.from(breakdown.querySelectorAll('article')).every((article) => !article.className.includes('border-t'))).toBe(true)
     expect(screen.queryByText('【全文拆解】')).not.toBeInTheDocument()
     expect(screen.queryByText(/\*\*能力边界\*\*/)).not.toBeInTheDocument()
   })
@@ -579,7 +589,7 @@ describe('ClusterDetailPanel v19 rebuild', () => {
     expect(screen.getByTestId('cluster-source-platform')).toHaveTextContent('X')
     expect(row).toHaveTextContent('X')
     expect(row).toHaveTextContent('OpenAI')
-    expect(screen.getByTestId('cluster-source-time')).toHaveTextContent(/\d{2}:\d{2}/)
+    expect(screen.getByTestId('cluster-source-time')).toHaveTextContent(/2026-\d{2}-\d{2} \d{2}:\d{2}/)
     expect(row).not.toHaveTextContent('小时前')
     expect(screen.queryByText('来源')).not.toBeInTheDocument()
     expect(screen.queryByText('1 条')).not.toBeInTheDocument()
@@ -825,7 +835,7 @@ describe('ClusterDetailPanel v19 rebuild', () => {
   it('弹窗层级和遮罩对齐 v19 modal,Esc 可关闭', () => {
     render(<ClusterDetailPanel />)
 
-    const backdrop = screen.getByRole('dialog')
+    const backdrop = screen.getByTestId('reading-modal-overlay')
     const panel = screen.getByTestId('cluster-detail-panel')
     expect(backdrop).toHaveClass('z-[900]', 'bg-black/60')
     expect(panel).toHaveClass('animate-modal-in')

@@ -1,20 +1,11 @@
 import type { FeedItem } from '../../lib/types'
 
-export type KeyPointItem = string | { title: string; points: string[] }
-
 export function normalizeSummaryText(summary?: string | null): string | null {
   const value = summary
     ?.replace(/^【精华速览】\s*/, '')
     .replace(/^精华速览[:：]\s*/, '')
     .trim()
   return value || null
-}
-
-export function paragraphLines(text: string): string[] {
-  return text
-    .split(/\n{2,}/)
-    .map((line) => line.trim())
-    .filter(Boolean)
 }
 
 export function collectImages(item: FeedItem): string[] {

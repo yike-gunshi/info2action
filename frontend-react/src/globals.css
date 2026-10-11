@@ -238,6 +238,15 @@ html.highlights-no-scrollbar::-webkit-scrollbar { display: none; width: 0; heigh
       linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0) 36%),
       radial-gradient(circle at 1px 1px, rgba(198,90,30,0.035) 1px, transparent 0);
 
+    /* Shared contextual scrollbar and reading-edge tokens. */
+    --scrollbar-hide-ms: 1000ms;
+    --scrollbar-thumb: color-mix(in srgb, var(--muted-foreground) 44%, var(--background));
+    --scrollbar-modal-thumb: color-mix(in srgb, var(--modal-text-muted) 44%, var(--modal-surface));
+    --scrollbar-w: 8px;
+    --scrollbar-gutter: 16px;
+    --scroll-fade: 32px;
+    --reading-modal-pad-x: 16px;
+
     color-scheme: light;
   }
 
@@ -250,6 +259,7 @@ html.highlights-no-scrollbar::-webkit-scrollbar { display: none; width: 0; heigh
   @media (min-width: 640px) {
     :root {
       --highlights-l2-top: 52px;
+      --reading-modal-pad-x: 40px;
     }
   }
 
@@ -526,6 +536,10 @@ html.highlights-no-scrollbar::-webkit-scrollbar { display: none; width: 0; heigh
     padding: 16px 12px;
   }
 
+  .reading-modal-overlay {
+    height: var(--app-visual-height);
+  }
+
   .modal-safe-footer {
     padding-bottom: var(--app-safe-bottom);
   }
@@ -618,6 +632,13 @@ html.highlights-no-scrollbar::-webkit-scrollbar { display: none; width: 0; heigh
   color: var(--modal-text);
 }
 
+@media (min-width: 640px) {
+  .reading-body,
+  .reading-bullet {
+    text-align: justify;
+  }
+}
+
 /* Utility: hide scrollbar */
 .scrollbar-hide {
   -ms-overflow-style: none;
@@ -627,35 +648,102 @@ html.highlights-no-scrollbar::-webkit-scrollbar { display: none; width: 0; heigh
   display: none;
 }
 
-/* Event detail: keep independent columns scrollable without making the rail a visual element. */
-.event-detail-scrollbar {
+@property --scroll-fade-top {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --scroll-fade-bottom {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+
+@keyframes reveal-scroll-fade-top {
+  from { --scroll-fade-top: 0px; }
+  to { --scroll-fade-top: var(--scroll-fade); }
+}
+
+@keyframes reveal-scroll-fade-bottom {
+  from { --scroll-fade-bottom: var(--scroll-fade); }
+  to { --scroll-fade-bottom: 0px; }
+}
+
+/* Native scrollbars stay in a stable outside channel and only reveal after user input. */
+.reveal-scroll,
+.reading-page-scroll {
+  --scrollbar-thumb-current: var(--scrollbar-thumb);
   scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, #8F877C 24%, transparent) transparent;
+  scrollbar-color: transparent transparent;
+  overscroll-behavior: contain;
 }
-.event-detail-scrollbar::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+
+.reading-modal-scroll {
+  --scrollbar-thumb-current: var(--scrollbar-modal-thumb);
+  padding-left: var(--reading-modal-pad-x);
+  padding-right: max(0px, calc(var(--reading-modal-pad-x) - var(--scrollbar-actual, 0px)));
 }
-.event-detail-scrollbar::-webkit-scrollbar-track {
+
+.reveal-scroll[data-scrollbar='on'],
+.reading-page-scroll[data-scrollbar='on'] {
+  scrollbar-color: var(--scrollbar-thumb-current) transparent;
+}
+
+.reveal-scroll::-webkit-scrollbar,
+.reading-page-scroll::-webkit-scrollbar {
+  width: var(--scrollbar-w);
+  height: var(--scrollbar-w);
+}
+
+.reveal-scroll::-webkit-scrollbar-track,
+.reading-page-scroll::-webkit-scrollbar-track {
   background: transparent;
 }
-.event-detail-scrollbar::-webkit-scrollbar-thumb {
-  min-height: 44px;
-  border: 2px solid transparent;
+
+.reveal-scroll::-webkit-scrollbar-thumb,
+.reading-page-scroll::-webkit-scrollbar-thumb {
+  background-color: transparent;
   border-radius: 999px;
-  background-color: color-mix(in srgb, #8F877C 26%, transparent);
-  background-clip: content-box;
 }
-.event-detail-scrollbar:hover {
-  scrollbar-color: color-mix(in srgb, #8F877C 42%, transparent) transparent;
+
+.reveal-scroll[data-scrollbar='on']::-webkit-scrollbar-thumb,
+.reading-page-scroll[data-scrollbar='on']::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb-current);
 }
-.event-detail-scrollbar:hover::-webkit-scrollbar-thumb {
-  border-width: 1px;
-  background-color: color-mix(in srgb, #8F877C 42%, transparent);
-  background-clip: content-box;
-}
-.event-detail-scrollbar::-webkit-scrollbar-corner {
+
+.reveal-scroll::-webkit-scrollbar-corner,
+.reading-page-scroll::-webkit-scrollbar-corner {
   background: transparent;
+}
+
+@supports (animation-timeline: scroll()) {
+  .reveal-scroll,
+  .reading-page-scroll {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--scroll-fade-top), #000 calc(100% - var(--scroll-fade-bottom)), transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 var(--scroll-fade-top), #000 calc(100% - var(--scroll-fade-bottom)), transparent 100%);
+    animation: reveal-scroll-fade-top linear both, reveal-scroll-fade-bottom linear both;
+    animation-timeline: scroll(self), scroll(self);
+    animation-range: 0 var(--scroll-fade), calc(100% - var(--scroll-fade)) 100%;
+  }
+}
+
+@media (max-width: 1023px) {
+  .reading-page-scroll {
+    -webkit-mask-image: none;
+    mask-image: none;
+    animation: none;
+  }
+}
+
+@media (min-width: 1024px) {
+  .reading-page-scroll-left {
+    padding-right: max(0px, calc(24px - var(--scrollbar-actual, 0px)));
+  }
+
+  .reading-page-scroll-right {
+    padding-right: max(0px, calc(var(--scrollbar-gutter) - var(--scrollbar-actual, 0px)));
+  }
 }
 
 /* Skeleton shimmer gradient */

@@ -215,7 +215,9 @@ describe('DetailPanel v19 modal variants', () => {
     expect(screen.getByTestId('detail-source-line')).toHaveTextContent('DiscusFish')
     expect(screen.getByTestId('detail-source-line')).not.toHaveTextContent('X ·')
     expect(screen.getByTestId('detail-source-line').className).toContain('reading-meta')
-    expect(screen.getByTestId('detail-source-line').querySelector('span')).toHaveClass('rounded-full', 'h-[20px]', 'w-[20px]')
+    expect(screen.getByTestId('detail-source-line').querySelector('[title="X"]')).toHaveClass('rounded-full', 'h-[20px]', 'w-[20px]')
+    expect(screen.getByTestId('detail-source-line')).toHaveTextContent(/2026-05-18 \d{2}:\d{2}/)
+    expect(screen.getByTestId('detail-modal-scroll')).toHaveClass('reveal-scroll', 'reading-modal-scroll')
 
     const summary = screen.getByTestId('detail-ai-summary')
     expect(summary).toHaveTextContent('精华速览：')
@@ -287,7 +289,7 @@ describe('DetailPanel v19 modal variants', () => {
     expect(screen.getByTestId('detail-footer-original-link')).toHaveTextContent('跳转原文')
   })
 
-  it('打开详情弹窗只锁定背景滚动,不再额外补偿 html 右侧 padding', async () => {
+  it('打开详情弹窗收起 stable gutter 并用等宽 padding 保持内容不横移', async () => {
     Object.defineProperty(window, 'innerWidth', {
       configurable: true,
       value: 1000,
@@ -298,13 +300,15 @@ describe('DetailPanel v19 modal variants', () => {
     })
     document.documentElement.style.paddingRight = ''
     document.documentElement.style.overflow = ''
+    document.documentElement.style.scrollbarGutter = 'stable'
 
     openWith(makeItem())
     render(<DetailPanel />)
 
     await screen.findByTestId('detail-panel')
     expect(document.documentElement.style.overflow).toBe('hidden')
-    expect(document.documentElement.style.paddingRight).toBe('')
+    expect(document.documentElement.style.scrollbarGutter).toBe('auto')
+    expect(document.documentElement.style.paddingRight).toBe('15px')
   })
 
   it('信息弹窗和行动弹窗使用共享 modal 语义 token,暗色模式不继承浅色纸面', async () => {
@@ -523,7 +527,8 @@ describe('DetailPanel v19 modal variants', () => {
     expect(panel.className).toContain('border-[var(--modal-border)]')
     expect(panel.className).toContain('shadow-[var(--modal-shadow)]')
 
-    expect(screen.getByTestId('detail-modal-header')).toHaveClass('bg-[var(--modal-surface)]', 'border-[var(--modal-divider)]')
+    expect(screen.getByTestId('detail-modal-header')).toHaveClass('bg-[var(--modal-surface)]', 'px-4', 'sm:px-10')
+    expect(screen.getByTestId('detail-modal-header')).not.toHaveClass('border-b')
     expect(screen.getByTestId('action-modal-title')).toHaveClass('reading-title', 'line-clamp-2')
     expect(screen.getByTestId('action-modal-title')).toHaveTextContent('集成 Claude Code + MiMo-V2.5-Pro 到 cc-switch 工作流')
 
@@ -536,6 +541,7 @@ describe('DetailPanel v19 modal variants', () => {
     expect(meta).not.toHaveTextContent('优先级：')
     expect(meta).not.toHaveTextContent('状态：')
     expect(meta).not.toHaveTextContent('来自 16:16')
+    expect(screen.getByTestId('action-modal-scroll')).toHaveClass('reveal-scroll', 'reading-modal-scroll')
   })
 
   it('行动弹窗内容顺序为理由、行动点、执行、关联信息,来源行新开 tab 跳转', async () => {
@@ -683,6 +689,47 @@ describe('DetailPanel v19 modal variants', () => {
     useDetailStore.setState({ actionDetail: null })
     render(<DetailPanel />)
     expect(await screen.findByText('行动点未找到或加载失败')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
+  })
+
+  it('无列表兜底数据时立即显示加载态,失败后保留关闭与重试', async () => {
+    useFeedStore.setState({ sectionItems: new Map() })
+    useDetailStore.setState({
+      modalStack: [{ type: 'item', id: 'cold-start-item' }],
+      itemDetail: null,
+      itemActions: [],
+      loadError: null,
+      isLoading: true,
+    })
+    mockFetchFeedItem.mockResolvedValue(makeItem({ id: 'cold-start-item' }))
+
+    render(<DetailPanel />)
+
+    const panel = await screen.findByTestId('detail-panel')
+    expect(panel).not.toHaveClass('invisible')
+    expect(screen.getByTestId('detail-modal-loading')).toBeVisible()
+    expect(screen.getByRole('button', { name: '关闭' })).toBeInTheDocument()
+
+    act(() => useDetailStore.setState({ loadError: '原始接口错误不应展示' }))
+    expect(await screen.findByText('加载失败，请重试')).toBeVisible()
+    expect(screen.queryByText('原始接口错误不应展示')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(mockFetchFeedItem).toHaveBeenCalledWith('cold-start-item'))
+  })
+
+  it('行动错误态点击重试会重新请求同一个行动点', async () => {
+    const action = makeAction()
+    mockFetchAction.mockResolvedValueOnce(null).mockResolvedValueOnce(action)
+    openActionWith(action, { mockFetch: false })
+    useDetailStore.setState({ actionDetail: null })
+    render(<DetailPanel />)
+
+    expect(await screen.findByText('行动点未找到或加载失败')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+
+    await waitFor(() => expect(mockFetchAction).toHaveBeenCalledTimes(2))
+    expect(await screen.findByTestId('action-modal-title')).toHaveTextContent(action.title)
   })
 
   it('ArrowDown 在已加载列表内切到下一条,不关闭弹窗', async () => {

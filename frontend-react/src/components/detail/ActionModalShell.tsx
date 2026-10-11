@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useState } from 'react'
-import { ArrowLeft, Ban, CalendarDays, RotateCcw, X } from 'lucide-react'
+import { Ban, CalendarDays, RotateCcw } from 'lucide-react'
 import { toast } from 'sonner'
 import { useDetailStore } from '../../store/detailStore'
 import { useActionStore } from '../../store/actionStore'
 import { fetchAction, setActionStatus } from '../../lib/api'
 import { cn } from '../../lib/utils'
 import type { ActionItem, ActionStatus } from '../../lib/types'
+import {
+  ReadingModalBody,
+  ReadingModalError,
+  ReadingModalHeader,
+  ReadingModalLoading,
+} from '../reading/ReadingModal'
+import { formatReadingDateTime } from '../reading/readingUtils'
 import { ActionDetailContent } from './ActionDetailContent'
-import { paperSurfaceStyle } from './detailShared'
 
 function hasCompleteActionDetailPayload(action: ActionItem | null): boolean {
   if (!action) return false
@@ -35,6 +41,7 @@ export function ActionModalShell({
   const setActionDetail = useDetailStore((s) => s.setActionDetail)
   const [fetchedAction, setFetchedAction] = useState<ActionItem | null>(null)
   const [fetchError, setFetchError] = useState(false)
+  const [retryNonce, setRetryNonce] = useState(0)
 
   const action = fetchedAction ?? (hasCompleteActionDetailPayload(detailAction) ? detailAction : null)
 
@@ -62,7 +69,7 @@ export function ActionModalShell({
     return () => {
       cancelled = true
     }
-  }, [actionId, detailAction, setActionDetail, updateActionInStore])
+  }, [actionId, detailAction, retryNonce, setActionDetail, updateActionInStore])
 
   const patchAction = useCallback((patch: Partial<ActionItem>) => {
     setFetchedAction((prev) => ({ ...(prev ?? action), ...patch }) as ActionItem)
@@ -72,13 +79,29 @@ export function ActionModalShell({
 
   if (!action && fetchError) {
     return (
-      <div className="flex min-h-[220px] flex-1 items-center justify-center px-6 py-12 text-sm text-destructive">
-        行动点未找到或加载失败
-      </div>
+      <ReadingModalError
+        headerTestId="detail-modal-header"
+        message="行动点未找到或加载失败"
+        onClose={handleClose}
+        onRetry={() => setRetryNonce((value) => value + 1)}
+        testId="action-modal-error"
+        title="行动详情"
+        titleId="detail-modal-title"
+      />
     )
   }
 
-  if (!action) return <ActionModalLoading />
+  if (!action) {
+    return (
+      <ReadingModalLoading
+        headerTestId="detail-modal-header"
+        onClose={handleClose}
+        testId="action-modal-loading"
+        title="行动详情"
+        titleId="detail-modal-title"
+      />
+    )
+  }
 
   return (
     <>
@@ -89,9 +112,9 @@ export function ActionModalShell({
         handleClose={handleClose}
       />
       <ActionStatusStepper action={action} onPatchAction={patchAction} />
-      <div className="flex-1 overflow-y-auto px-6 pb-7 pt-0 sm:px-10 sm:pb-8">
+      <ReadingModalBody resetKey={actionId} testId="action-modal-scroll">
         <ActionDetailContent action={action} onPatchAction={patchAction} />
-      </div>
+      </ReadingModalBody>
     </>
   )
 }
@@ -107,60 +130,27 @@ function ActionModalHeader({
   goBack: () => void
   handleClose: () => void
 }) {
+  const meta = (
+    <span className="inline-flex min-w-0 items-center gap-1.5 text-[var(--modal-text-muted)]">
+      <CalendarDays className="h-3.5 w-3.5 shrink-0" />
+      <time className="font-mono tabular-nums" dateTime={action.created_at}>
+        {formatReadingDateTime(action.created_at)}
+      </time>
+    </span>
+  )
+
   return (
-    <header
-      data-testid="detail-modal-header"
-      className="shrink-0 border-b border-[var(--modal-divider)] bg-[var(--modal-surface)] px-6 py-5 sm:px-10"
-      style={paperSurfaceStyle}
-    >
-      <div className="flex items-start gap-4">
-        {canGoBack && (
-          <button
-            type="button"
-            onClick={goBack}
-            aria-label="返回上一条"
-            title="返回"
-            className="mt-0.5 relative flex h-7 w-7 shrink-0 items-center justify-center rounded-[5px] text-[var(--modal-text-faint)] before:absolute before:-inset-2 before:content-[''] transition-colors hover:bg-[var(--modal-hover)] hover:text-[var(--modal-text)]"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-          </button>
-        )}
-
-        <div className="min-w-0 flex-1">
-          <h2
-            id="detail-modal-title"
-            data-testid="action-modal-title"
-            className="reading-title line-clamp-2"
-            title={action.title}
-          >
-            {action.title}
-          </h2>
-          <div
-            data-testid="action-modal-meta"
-            className="reading-meta mt-3 flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1"
-          >
-            <span className="inline-flex min-w-0 items-center gap-1.5 text-[var(--modal-text-muted)]">
-              <CalendarDays className="h-3.5 w-3.5 shrink-0" />
-              <time className="font-mono tabular-nums" dateTime={action.created_at}>
-                {formatActionAbsoluteTime(action.created_at)}
-              </time>
-            </span>
-          </div>
-        </div>
-
-        <div className="flex w-8 shrink-0 items-center justify-end" data-testid="detail-header-actions">
-          <button
-            type="button"
-            onClick={handleClose}
-            aria-label="关闭"
-            title="关闭"
-            className="relative flex h-8 w-8 items-center justify-center rounded-[5px] before:absolute before:-inset-1.5 before:content-[''] border border-[var(--modal-border-soft)] bg-[var(--modal-surface-soft)] text-[var(--modal-text-faint)] transition-colors hover:border-[var(--brand-border)] hover:bg-[var(--modal-hover-soft)] hover:text-[var(--modal-text)]"
-          >
-            <X className="h-5 w-5" />
-          </button>
-        </div>
-      </div>
-    </header>
+    <ReadingModalHeader
+      canGoBack={canGoBack}
+      headerTestId="detail-modal-header"
+      meta={meta}
+      metaTestId="action-modal-meta"
+      onBack={goBack}
+      onClose={handleClose}
+      title={action.title}
+      titleId="detail-modal-title"
+      titleTestId="action-modal-title"
+    />
   )
 }
 
@@ -208,7 +198,7 @@ function ActionStatusStepper({
   return (
     <div
       data-testid="action-status-stepper"
-      className="flex flex-shrink-0 flex-wrap items-center gap-3 border-b border-[var(--modal-divider)] px-6 py-3 sm:px-10"
+      className="flex flex-shrink-0 flex-wrap items-center gap-3 border-b border-[var(--modal-divider)] px-4 py-3 sm:px-10"
     >
       <div className="inline-flex items-center rounded-[9px] border border-[var(--modal-border-soft)] bg-[var(--modal-surface)] p-1">
         {STATUS_STEPS.map((st, i) => (
@@ -257,29 +247,4 @@ function ActionStatusStepper({
       )}
     </div>
   )
-}
-
-function ActionModalLoading() {
-  return (
-    <div className="flex flex-1 flex-col">
-      <div className="shrink-0 border-b border-[var(--modal-divider)] px-6 py-5 sm:px-10">
-        <div className="h-6 w-3/4 animate-skeleton rounded bg-[var(--modal-divider)]" />
-        <div className="mt-3 h-4 w-1/2 animate-skeleton rounded bg-[var(--modal-hover)]" />
-      </div>
-      <div className="flex-1 space-y-4 px-6 py-7 sm:px-10">
-        <div className="h-4 w-20 animate-skeleton rounded bg-[var(--modal-hover)]" />
-        <div className="h-4 w-full animate-skeleton rounded bg-[var(--modal-hover)]" />
-        <div className="h-4 w-5/6 animate-skeleton rounded bg-[var(--modal-hover)]" />
-        <div className="h-16 w-full animate-skeleton rounded bg-[var(--modal-hover)]" />
-      </div>
-    </div>
-  )
-}
-
-function formatActionAbsoluteTime(value?: string): string {
-  if (!value) return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }

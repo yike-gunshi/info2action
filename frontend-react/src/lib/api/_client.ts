@@ -87,13 +87,14 @@ export function serviceUnavailableError(): Error & { status?: number } {
   return e
 }
 
-export async function apiErrorFromResponse(res: Response): Promise<Error & { status?: number }> {
+export async function apiErrorFromResponse(res: Response): Promise<Error & { status?: number; limit?: number }> {
   const body = await res.json().catch(() => ({}))
   const msg = res.status === 401
     ? (body.detail || body.error || '请先登录(顶栏右上角)')
     : (body.detail || body.error || `API error: ${res.status}`)
-  const err = new Error(msg) as Error & { status?: number }
+  const err = new Error(msg) as Error & { status?: number; limit?: number }
   err.status = res.status
+  if (typeof body.limit === 'number') err.limit = body.limit
   return err
 }
 

@@ -1,0 +1,89 @@
+.ai-summary-meta {
+  font-family: var(--mono);
+  font-size: var(--ai-meta-size);
+  color: var(--ai-meta-color);
+}
+
+.ai-summary-article {
+  margin-top: var(--ai-article-mt);
+  font-family: var(--serif);
+  font-size: var(--ai-body-size);
+  line-height: var(--ai-body-lh);
+  overflow-wrap: anywhere;
+}
+
+.ai-summary-article p {
+  margin: 0 0 var(--ai-para-gap);
+}
+
+.ai-summary-article p,
+.ai-summary-article li {
+  text-align: justify; /* fixed: 本轮选择正文两端对齐，前端不读取工作台枚举 */
+  text-autospace: normal; /* fixed: 浏览器支持时使用自然中英文间距 */
+}
+
+.ai-summary-article h4 {
+  font-family: var(--serif);
+  font-size: var(--ai-heading-size);
+  font-weight: var(--ai-heading-weight);
+  line-height: var(--ai-body-lh);
+  margin: var(--ai-heading-mt) 0 var(--ai-heading-mb);
+}
+
+.ai-summary-article ul,
+.ai-summary-article ol {
+  margin: 0 0 var(--ai-para-gap);
+  padding-left: var(--ai-list-indent);
+}
+
+.ai-summary-article ul {
+  list-style: disc;
+}
+
+.ai-summary-article ol {
+  list-style: decimal;
+}
+
+.ai-summary-article ul ul,
+.ai-summary-article ol ul {
+  list-style: circle;
+}
+
+.ai-summary-article li {
+  margin: 0 0 var(--ai-list-gap);
+}
+
+.ai-summary-article strong {
+  font-weight: 600;
+}
+
+
+.ai-summary-skeleton {
+  margin-top: var(--ai-article-mt);
+}
+
+.ai-summary-skeleton .ai-summary-skeleton-bar {
+  display: block;
+  height: var(--ai-sk-bar-h);
+  border-radius: var(--ai-sk-bar-radius);
+  background: var(--ai-skeleton);
+  margin: 0 0 var(--ai-sk-bar-gap);
+  animation-duration: 1.6s;
+  animation-timing-function: ease-in-out;
+}
+
+.ai-summary-skeleton .ai-summary-skeleton-heading {
+  height: var(--ai-sk-head-h);
+  width: var(--ai-sk-head-w);
+}
+
+.ai-summary-state {
+  text-align: center;
+}
+
+.ai-summary-state-title {
+  font-family: var(--sans);
+  font-size: var(--ai-state-title);
+  line-height: var(--ai-body-lh);
+  color: var(--ai-state-line);
+}

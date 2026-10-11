@@ -816,6 +816,7 @@ def _schedule_post_fetch_read_model_refresh(
     run_id: int,
     *,
     highlights_read_model_refresh_min_interval_sec: int | None = None,
+    counts_only: bool = False,
 ):
     # BF-0515-mv-pgcron: refresh read models / materialized views after
     # fetch runs that can publish newly visible rows. Keep platform cache
@@ -824,16 +825,19 @@ def _schedule_post_fetch_read_model_refresh(
     try:
         refresh_skip_reason = _remote_db_pressure_skip_reason()
         platform_prewarm_enabled = (
-            _env_enabled('INFO2ACTION_CACHE_PREWARM', default=True)
+            not counts_only
+            and _env_enabled('INFO2ACTION_CACHE_PREWARM', default=True)
             and _platform_prewarm_enabled()
         )
         read_model_refresh_enabled = (
-            _env_enabled('INFO2ACTION_INFO_READ_MODEL', default=False)
+            not counts_only
+            and _env_enabled('INFO2ACTION_INFO_READ_MODEL', default=False)
             and _env_enabled('INFO2ACTION_INFO_READ_MODEL_REFRESH', default=True)
         )
         read_model_refresh_min_interval_sec = _info_read_model_refresh_min_interval_sec()
         highlights_read_model_refresh_enabled = (
-            _env_enabled('INFO2ACTION_HIGHLIGHTS_READ_MODEL', default=False)
+            not counts_only
+            and _env_enabled('INFO2ACTION_HIGHLIGHTS_READ_MODEL', default=False)
             and _env_enabled('INFO2ACTION_HIGHLIGHTS_READ_MODEL_REFRESH', default=True)
         )
         if highlights_read_model_refresh_min_interval_sec is None:
@@ -844,7 +848,8 @@ def _schedule_post_fetch_read_model_refresh(
                 flush=True,
             )
             return
-        if not (platform_prewarm_enabled or read_model_refresh_enabled or highlights_read_model_refresh_enabled):
+        counts_refresh_enabled = remote_db.remote_authority_enabled()
+        if not (counts_refresh_enabled or platform_prewarm_enabled or read_model_refresh_enabled or highlights_read_model_refresh_enabled):
             return
 
         def _bg_prewarm():
@@ -2396,13 +2401,16 @@ def _run_source_micro_fetch(run_id, platform, source, run_source=None):
         else:
             print(f"[fetch] micro run #{run_id} no-op (0 新增/0 发布),保留 feed 缓存", flush=True)
         _cleanup_run_artifacts()
-        if refresh_after_micro:
-            _schedule_post_fetch_read_model_refresh(
-                run_id,
-                highlights_read_model_refresh_min_interval_sec=(
-                    _micro_highlights_read_model_refresh_min_interval_sec()
-                ),
-            )
+        # Source totals follow every micro fetch, including newly inserted
+        # items that did not publish a cluster and the rolling 90-day expiry.
+        # Preserve the existing publication guard for read models/prewarm.
+        _schedule_post_fetch_read_model_refresh(
+            run_id,
+            counts_only=not refresh_after_micro,
+            highlights_read_model_refresh_min_interval_sec=(
+                _micro_highlights_read_model_refresh_min_interval_sec()
+            ),
+        )
         with _fetch_lock:
             finished_progress = copy.deepcopy(
                 (_fetch_active_runs.get(run_id) or {}).get('progress') or _fetch_progress

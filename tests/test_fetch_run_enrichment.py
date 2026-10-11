@@ -18,6 +18,11 @@ def _force_local_fetch_backend(monkeypatch):
     monkeypatch.setenv('INFO2ACTION_DATA_AUTHORITY', 'local')
     monkeypatch.setenv('INFO2ACTION_STORAGE_MODE', 'local')
     monkeypatch.setenv('INFO2ACTION_FETCH_WRITE_BACKEND', 'sqlite')
+    # Tests that exercise refresh enable it explicitly and run inline. Other
+    # fetch tests must not leave a daemon warming caches in the next test.
+    monkeypatch.setenv('INFO2ACTION_CACHE_PREWARM', '0')
+    monkeypatch.setenv('INFO2ACTION_INFO_READ_MODEL', '0')
+    monkeypatch.setenv('INFO2ACTION_HIGHLIGHTS_READ_MODEL', '0')
 
 
 def test_run_fetch_enrichment_uses_bounded_run_limit(monkeypatch):
@@ -1294,25 +1299,27 @@ def test_run_source_micro_fetch_uses_run_scoped_ingest_enrich_and_cluster(monkey
 
 
 @pytest.mark.parametrize(
-    ('published_clusters', 'expected_refresh_calls', 'expected_cache_clears'),
+    ('new_count', 'published_clusters', 'expected_refresh_calls', 'expected_cache_clears'),
     [
         (
             # Wave1: _bg_prewarm 不再于预热后二次清缓存;内容变更的失效由 run
             # 收尾 finally 块 (feed_content_changed) 承担,故仅剩 1 次清理。
-            1,
+            2, 1,
             [{'min_interval_sec': 0}],
             [{'clear_remote_snapshots': True}],
         ),
         (
-            0,
+            2, 0,
             [],
             [{'clear_remote_snapshots': True}],
         ),
+        (0, 0, [], []),
     ],
 )
 def test_run_source_micro_fetch_refreshes_highlights_read_model_after_success(
     monkeypatch,
     tmp_path,
+    new_count,
     published_clusters,
     expected_refresh_calls,
     expected_cache_clears,
@@ -1320,6 +1327,7 @@ def test_run_source_micro_fetch_refreshes_highlights_read_model_after_success(
     run_id = 3112
     refresh_calls = []
     cache_clears = []
+    count_refreshes = []
 
     monkeypatch.setattr(fetch_route, 'BASE', str(tmp_path))
     monkeypatch.setenv('INFO2ACTION_CACHE_PREWARM', '1')
@@ -1330,7 +1338,9 @@ def test_run_source_micro_fetch_refreshes_highlights_read_model_after_success(
     monkeypatch.setenv('INFO2ACTION_MICRO_HIGHLIGHTS_READ_MODEL_REFRESH_MIN_INTERVAL_SEC', '0')
     monkeypatch.setattr(fetch_route, '_start_fetch_run_heartbeat', lambda _run_id: None)
     monkeypatch.setattr(fetch_route, '_run_source_fetch_step', lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(fetch_route, '_count_inserted_run_items', lambda _run_id: 2)
+    monkeypatch.setattr(fetch_route, '_count_inserted_run_items', lambda _run_id: new_count)
+    monkeypatch.setattr(fetch_route.remote_db, 'remote_authority_enabled', lambda: True)
+    monkeypatch.setattr(fetch_route.remote_db, 'refresh_info_pill_counts', lambda: count_refreshes.append(True) or {'ok': True})
     monkeypatch.setattr(fetch_route, '_fetch_run_stats_current_backend', lambda: {})
     monkeypatch.setattr(fetch_route, '_per_platform_new_counts_current_backend', lambda _started_at: {'twitter': 2})
     monkeypatch.setattr(fetch_route, '_remote_db_pressure_skip_reason', lambda: None)
@@ -1388,6 +1398,7 @@ def test_run_source_micro_fetch_refreshes_highlights_read_model_after_success(
 
     assert refresh_calls == expected_refresh_calls
     assert cache_clears == expected_cache_clears
+    assert count_refreshes == [True]
     fetch_route._fetch_active_runs.clear()
     fetch_route._fetch_running = False
 

@@ -65,7 +65,7 @@ describe('SectionFront（v24.1 板块壳：v24 板块眉 + 瀑布流白卡身体
     vi.restoreAllMocks()
   })
 
-  it('板块眉：brand 短标线压通栏 hairline + 22px/700 衬线板块名 + body-cjk 13px 计数 + 桌面 sticky（移动不 sticky）', () => {
+  it('板块眉：22px/700 衬线板块名 + body-cjk 13px 计数 + 桌面 sticky（移动不 sticky），不重复绘制顶部线', () => {
     render(
       <SectionFront
         {...baseProps}
@@ -81,12 +81,7 @@ describe('SectionFront（v24.1 板块壳：v24 板块眉 + 瀑布流白卡身体
     expect(head.className).not.toMatch(/(^|\s)sticky(\s|$)/)
     expect(head.className).toContain('bg-background')
 
-    const rule = screen.getByTestId('section-front-rule')
-    const shortLine = rule.querySelector('.bg-\\[var\\(--brand\\)\\]')
-    expect(shortLine).not.toBeNull()
-    expect(shortLine!.className).toContain('w-[26px]')
-    expect(shortLine!.className).toContain('h-[2px]')
-    expect(rule.querySelector('.bg-border')).not.toBeNull()
+    expect(screen.queryByTestId('section-front-rule')).toBeNull()
 
     const name = screen.getByRole('heading', { name: '产品' })
     expect(name.className).toContain('font-event-title')

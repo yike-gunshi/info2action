@@ -86,3 +86,43 @@ def test_index_stays_consistent_after_overwrite_and_delete():
     assert remote_db._cache_get(key) is None
     # 索引里不残留
     assert key not in remote_db._CACHE_TOKEN_INDEX.get('user-a', set())
+
+
+def test_batch_snapshot_preserves_limits_accounting_and_invalidation(monkeypatch):
+    monkeypatch.setenv(remote_db.REMOTE_CACHE_MAX_ENTRIES_ENV, '64')
+    key = ('platform_more_count', 'schema', 'user-a')
+    remote_db._cache_set(key, 500)
+    entries = {('platform_more_count', 'schema', i): i for i in range(80)}
+    entries[key] = 501
+    remote_db._cache_set_many(entries)
+    assert len(remote_db._CACHE) == 64
+    assert remote_db._cache_get(key) == 501
+    assert remote_db._CACHE_TOTAL_BYTES == sum(e['size'] for e in remote_db._CACHE.values())
+    assert remote_db.clear_user_cache_keys('user-a') == 1
+    assert remote_db._cache_get(key) is None
+    assert key not in remote_db._CACHE_TOKEN_INDEX.get('user-a', set())
+
+
+def test_batch_snapshot_checks_environment_once_per_batch(monkeypatch):
+    original = remote_db._runtime_env
+    calls = []
+    def runtime_env():
+        calls.append(True)
+        return original()
+    monkeypatch.setattr(remote_db, '_runtime_env', runtime_env)
+    remote_db._cache_set_many({('platform_more_count', i): i for i in range(432)})
+    assert len(calls) == 3
+
+
+def test_batch_snapshot_honors_disabled_cache_and_expiry(monkeypatch):
+    monkeypatch.setenv(remote_db.REMOTE_CACHE_TTL_ENV, '0')
+    remote_db._cache_set_many({('platform_more_count', 'disabled'): 42})
+    assert not remote_db._CACHE
+    monkeypatch.setenv(remote_db.REMOTE_CACHE_TTL_ENV, '1')
+    clock = [100.0]
+    monkeypatch.setattr(remote_db.time, 'monotonic', lambda: clock[0])
+    key = ('platform_more_count', 'expiry')
+    remote_db._cache_set_many({key: 42})
+    assert remote_db._cache_get(key) == 42
+    clock[0] += 2
+    assert remote_db._cache_get(key) is None

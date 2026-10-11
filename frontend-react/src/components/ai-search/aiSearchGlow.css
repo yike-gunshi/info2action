@@ -1,0 +1,132 @@
+/* The inner panel covers the moving blob, leaving the container's border visible. */
+.ai-search-input-wrap {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--ai-search-radius);
+  padding: 0; /* fixed: textarea 的 48px 包含光晕边框，不额外撑高 */
+  background: var(--border);
+  transition: transform var(--ai-search-move-ms) ease-out;
+}
+
+.ai-search-input-wrap:focus-within {
+  box-shadow: 0 0 0 2px var(--brand-border); /* fixed: site focus ring */
+}
+
+.ai-search-orbit {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--ai-glow-fade-ms) ease-out;
+}
+
+.ai-search-blob {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--ai-glow-size);
+  height: var(--ai-glow-size);
+  opacity: var(--ai-glow-opacity);
+  background: radial-gradient(var(--ai-glow-color) calc(var(--ai-glow-core) * 1%), transparent calc(var(--ai-glow-edge) * 1%));
+  offset-path: rect(0 100% 100% 0 round var(--ai-search-radius));
+  offset-rotate: 0deg;
+  offset-anchor: 50% 50%;
+  animation: ai-search-orbit var(--ai-glow-sweep-ms) linear infinite;
+}
+
+.ai-search-form[data-glow='true'] .ai-search-orbit { opacity: 1; }
+.ai-search-form[data-loading='true'] .ai-search-blob { animation-duration: var(--ai-glow-loading-ms); }
+
+@keyframes ai-search-orbit {
+  from { offset-distance: 0%; }
+  to { offset-distance: 100%; }
+}
+
+.ai-search-input-inner {
+  position: relative;
+  display: flex;
+  align-items: start; /* fixed: 多行时以第一行对齐 */
+  gap: var(--ai-search-gap);
+  border-radius: inherit; /* fixed: 胶囊随 textarea 自动增高 */
+  min-height: var(--ai-search-h);
+  padding: 0 calc(var(--ai-search-pad) + var(--ai-search-bw));
+}
+
+.ai-search-input-inner::before {
+  content: ''; /* fixed: 内面板盖住光球中心，保留边框轨道 */
+  position: absolute; /* fixed: 面板不参与 textarea 高度计算 */
+  inset: var(--ai-search-bw);
+  border-radius: calc(var(--ai-search-radius) - var(--ai-search-bw));
+  background: var(--background);
+  pointer-events: none; /* fixed: 不挡输入 */
+}
+
+.ai-search-input {
+  position: relative; /* fixed: 输入文字位于内面板之上 */
+  flex: 1;
+  min-width: 0;
+  min-height: var(--ai-search-h);
+  box-sizing: border-box; /* fixed: scrollHeight 已包含上下内距 */
+  border: 0;
+  padding: calc((var(--ai-search-h) - var(--ai-search-size) * var(--ai-search-lh)) / 2) 0;
+  background: none;
+  outline: 0;
+  font-family: var(--sans);
+  font-size: var(--ai-search-size);
+  line-height: var(--ai-search-lh);
+  color: var(--foreground);
+  white-space: pre-wrap; /* fixed: 长问题自动软换行 */
+  overflow-wrap: anywhere; /* fixed: 连续英文也显示全文 */
+  overflow: hidden; /* fixed: 所有行可见，不出现内部滚动条 */
+  resize: none; /* fixed: 高度由 layout 测量管理 */
+}
+
+.ai-search-placeholder {
+  position: absolute;
+  left: calc(var(--ai-search-pad) + var(--ai-search-bw));
+  right: calc(var(--ai-search-pad) + var(--ai-search-bw));
+  top: calc((var(--ai-search-h) - var(--ai-search-size) * var(--ai-search-lh)) / 2);
+  display: flex;
+  align-items: center;
+  pointer-events: none;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: var(--sans);
+  font-size: var(--ai-placeholder-size);
+  line-height: calc(var(--ai-search-size) * var(--ai-search-lh));
+  color: var(--muted-foreground);
+}
+
+/* A shrinking text child gives the flex overlay a real ellipsis on narrow screens. */
+.ai-search-placeholder > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ai-search-form[data-typed='true'] .ai-search-placeholder { display: none; }
+.ai-search-placeholder[data-transition='in'] { animation: ai-search-ph-in var(--ai-ph-dur) linear both; }
+.ai-search-placeholder[data-transition='out'] { animation: ai-search-ph-out var(--ai-ph-dur) linear both; }
+.ai-search-placeholder[data-transition='gap'] { opacity: 0; }
+
+@keyframes ai-search-ph-in {
+  from { transform: translateY(var(--ai-ph-in-y)); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes ai-search-ph-out {
+  from { transform: translateY(0); opacity: 1; }
+  to { transform: translateY(calc(-1 * var(--ai-ph-out-y))); opacity: 0; }
+}
+
+@supports not (offset-path: rect(0 100% 100% 0 round 6px)) { /* fixed: literal feature probe */
+  .ai-search-blob { display: none; }
+  .ai-search-orbit { background: var(--brand-border); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-search-blob { animation: none; offset-distance: 12%; }
+  .ai-search-placeholder[data-transition='in'],
+  .ai-search-placeholder[data-transition='out'] { animation: none; }
+}

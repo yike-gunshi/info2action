@@ -1,20 +1,22 @@
-import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { toast } from 'sonner'
 import { useDetailStore } from '../../store/detailStore'
 import { useFeedStore } from '../../store/feedStore'
 import { setItemStatus } from '../../lib/api'
-import { cn } from '../../lib/utils'
 import { requireAuth } from '../shared/AuthGate'
+import { ReadingLightbox } from '../reading/ReadingLightbox'
+import {
+  ReadingModalBody,
+  ReadingModalError,
+  ReadingModalLoading,
+  ReadingModalShell,
+} from '../reading/ReadingModal'
 import { clearItemDetailHash } from '../../lib/itemDeepLink'
 import { ActionModalShell } from './ActionModalShell'
 import { DetailContent } from './DetailContent'
 import { DetailFooterActions } from './DetailFooterActions'
-import { DetailLightbox } from './DetailLightbox'
-import { DetailSkeleton } from './DetailSkeleton'
 import { ItemModalHeader } from './ItemModalHeader'
 import { getDetailModalVariant } from './detailContentUtils'
-import { paperSurfaceStyle } from './detailShared'
-import { useBodyScrollLock, useDetailHotkeys } from './useDetailHotkeys'
 import { useLightboxState } from './useLightboxState'
 
 /**
@@ -42,8 +44,6 @@ export function DetailPanel() {
   const [isClosing, setIsClosing] = useState(false)
   const [starOverrides, setStarOverrides] = useState<Record<string, string | null>>({})
 
-  const backdropRef = useRef<HTMLDivElement>(null)
-  const panelRef = useRef<HTMLDivElement>(null)
   const loadedSideDataKeyRef = useRef<string | null>(null)
 
   const sectionItems = useFeedStore((s) => s.sectionItems)
@@ -100,8 +100,6 @@ export function DetailPanel() {
     setContentExpanded(false)
   }, [topEntry?.id])
 
-  useBodyScrollLock(isOpen)
-
   const handleClose = useCallback(() => {
     setIsClosing(true)
     setTimeout(() => {
@@ -125,14 +123,20 @@ export function DetailPanel() {
     openItem(nextId)
   }, [item, openItem, sectionItems, topEntry?.type])
 
-  useDetailHotkeys({
-    isOpen,
-    lightboxSrc,
-    setLightboxSrc,
-    lightboxImages,
-    handleClose,
-    navigateAdjacentItem,
-  })
+  useEffect(() => {
+    if (!isOpen || lightboxSrc) return
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        navigateAdjacentItem('next')
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        navigateAdjacentItem('previous')
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [isOpen, lightboxSrc, navigateAdjacentItem])
 
   const handleStar = useCallback(async () => {
     if (!displayItem) return
@@ -153,71 +157,20 @@ export function DetailPanel() {
     }
   }, [displayItem, handleClose, toggleStar, toggleItemStar])
 
-  // Measure-before-paint: render hidden → layout → show with animation.
-  // List data is enough to show the shell immediately; full detail hydrates in
-  // place when the remote item request returns.
-  const hasDisplayData = !!item || topEntry?.type === 'action'
-  const [ready, setReady] = useState(false)
-  useLayoutEffect(() => {
-    if (isOpen && !isClosing && hasDisplayData && panelRef.current) {
-      panelRef.current.getBoundingClientRect()
-      setReady(true)
-    }
-  })
-  // Reset ready when modal closes or item changes
-  useEffect(() => {
-    if (!isOpen) setReady(false)
-  }, [isOpen])
-  useEffect(() => {
-    setReady(false)
-  }, [topEntry?.id])
-
   if (!isOpen) return null
 
-  const animClass = isClosing
-    ? 'animate-modal-out'
-    : ready ? 'animate-modal-in' : ''
-  const backdropAnimClass = isClosing
-    ? 'animate-backdrop-out'
-    : ready ? 'animate-backdrop-in' : ''
-  const displayReady = topEntry?.type === 'action' || ready
   const detailVariant = topEntry?.type === 'item' && displayItem ? getDetailModalVariant(displayItem) : 'no-media'
-  const isItemModal = topEntry?.type === 'item'
   const isActionModal = topEntry?.type === 'action'
-  const itemPanelClasses = 'modal-viewport-panel flex w-[calc(100vw-24px)] max-w-[720px] flex-col overflow-hidden rounded-[10px] border border-[var(--modal-border)] bg-[var(--modal-surface)] text-[var(--modal-text)] shadow-[var(--modal-shadow)] pointer-events-auto'
-  const actionPanelClasses = itemPanelClasses
 
   return (
     <>
-      {/* Backdrop */}
-      <div
-        ref={backdropRef}
-        className={cn(
-          'fixed inset-0 z-[900] bg-black/60',
-          backdropAnimClass,
-          !displayReady && !isClosing && 'opacity-0',
-        )}
-        onClick={handleClose}
-      />
-
-      {/* Centering container — flexbox centering is height-independent */}
-      <div
-        className="modal-viewport-shell fixed inset-0 z-[901] flex pointer-events-none"
-        onClick={handleClose}
-      >
-      {/* Panel — invisible until layout measured, then animate in */}
-      <div
-        ref={panelRef}
-        data-testid="detail-panel"
-        data-modal-theme="editorial"
-        data-detail-variant={detailVariant}
-        className={cn(
-          isActionModal ? actionPanelClasses : itemPanelClasses,
-          animClass,
-          !displayReady && !isClosing && 'invisible',
-        )}
-        style={isItemModal || isActionModal ? paperSurfaceStyle : undefined}
-        onClick={(e) => e.stopPropagation()}
+      <ReadingModalShell
+        ariaLabelledby="detail-modal-title"
+        dataAttributes={{ 'data-detail-variant': detailVariant }}
+        escapeDisabled={!!lightboxSrc}
+        isClosing={isClosing}
+        onClose={handleClose}
+        panelTestId="detail-panel"
       >
         {isActionModal && topEntry ? (
           <ActionModalShell
@@ -226,59 +179,55 @@ export function DetailPanel() {
             goBack={goBack}
             handleClose={handleClose}
           />
-        ) : (
+        ) : displayItem ? (
           <>
-            {displayItem && (
-              <ItemModalHeader
-                item={displayItem}
-                canGoBack={canGoBack}
-                goBack={goBack}
-                handleClose={handleClose}
-              />
-            )}
-
-            {/* Scrollable content */}
-            <div className="flex-1 overflow-y-auto px-4 pb-7 pt-0 sm:px-10 sm:pb-8">
-              {displayItem ? (
-            <DetailContent
+            <ItemModalHeader
               item={displayItem}
-              contentExpanded={contentExpanded}
-              setContentExpanded={setContentExpanded}
-              setLightboxSrc={setLightboxSrc}
-              setLightboxImages={setLightboxImages}
+              canGoBack={canGoBack}
+              goBack={goBack}
+              handleClose={handleClose}
             />
-              ) : loadError ? (
-                /* UX-3(B8): 失败态 + 重试,替代无限骨架屏 */
-                <div className="flex flex-col items-center justify-center gap-3 py-16 text-center" data-testid="detail-error-state">
-                  <p className="text-[14px] text-muted-foreground">{loadError}</p>
-                  <button
-                    type="button"
-                    onClick={() => { if (topEntry?.type === 'item') openItem(topEntry.id) }}
-                    className="rounded-[4px] border border-border bg-card px-4 py-2 text-[13px] font-medium text-foreground transition-colors hover:border-[var(--brand-border)]"
-                  >
-                    重试
-                  </button>
-                </div>
-              ) : (
-                <DetailSkeleton />
-              )}
-            </div>
 
-            {displayItem && (
-              <DetailFooterActions item={displayItem} handleStar={handleStar} />
-            )}
+            <ReadingModalBody resetKey={topEntry?.id} testId="detail-modal-scroll">
+              <DetailContent
+                item={displayItem}
+                contentExpanded={contentExpanded}
+                setContentExpanded={setContentExpanded}
+                setLightboxSrc={setLightboxSrc}
+                setLightboxImages={setLightboxImages}
+              />
+            </ReadingModalBody>
+
+            <DetailFooterActions item={displayItem} handleStar={handleStar} />
           </>
+        ) : loadError ? (
+          <ReadingModalError
+            headerTestId="detail-modal-header"
+            message="加载失败，请重试"
+            onClose={handleClose}
+            onRetry={() => { if (topEntry?.type === 'item') openItem(topEntry.id) }}
+            testId="detail-error-state"
+            title="信息详情"
+            titleId="detail-modal-title"
+          />
+        ) : (
+          <ReadingModalLoading
+            headerTestId="detail-modal-header"
+            onClose={handleClose}
+            testId="detail-modal-loading"
+            title="信息详情"
+            titleId="detail-modal-title"
+          />
         )}
-      </div>
-      </div>
+      </ReadingModalShell>
 
-      {/* Lightbox with prev/next navigation */}
       {lightboxSrc && (
-        <DetailLightbox
+        <ReadingLightbox
           src={lightboxSrc}
           images={lightboxImages}
           onClose={() => setLightboxSrc(null)}
           onNavigate={setLightboxSrc}
+          testId="detail-lightbox"
         />
       )}
     </>

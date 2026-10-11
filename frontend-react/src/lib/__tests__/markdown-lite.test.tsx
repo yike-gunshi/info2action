@@ -9,6 +9,20 @@ function assertRenderedContains(text: string, needle: string) {
 }
 
 describe('markdown-lite', () => {
+  it('can disable links in block and inline rendering while the default still linkifies', () => {
+    const text = '[官网](https://example.com/docs) https://example.com/path'
+    const { container } = render(<>
+      <div data-testid="blocks">{renderMarkdownLite(text, { links: false })}</div>
+      <div data-testid="inline">{renderMarkdownInline(text, { links: false })}</div>
+      <div data-testid="default">{renderMarkdownLite(text)}</div>
+    </>)
+    for (const name of ['blocks', 'inline']) {
+      const section = container.querySelector(`[data-testid="${name}"]`)!
+      expect(section.querySelectorAll('a')).toHaveLength(0)
+      expect(section.textContent).toBe(text)
+    }
+    expect(container.querySelectorAll('[data-testid="default"] a')).toHaveLength(2)
+  })
   it('**X** 渲染为 <strong>', () => {
     assertRenderedContains('我是 **加粗** 的', '<strong class="font-semibold">加粗</strong>')
   })
@@ -338,5 +352,24 @@ describe('markdown-lite', () => {
   it('BF-0420-13 > 引用剥前缀当普通段落', () => {
     const { container } = render(<>{renderMarkdownLite('> 这是引用')}</>)
     expect(container.textContent).toBe('这是引用')
+  })
+})
+
+describe('路径不当作域名', () => {
+  const html = (text: string) => render(<>{renderMarkdownLite(text)}</>).container.innerHTML
+
+  it('不把 /docs/architecture.md 这类路径转成链接', () => {
+    // .md 是真实顶级域（摩尔多瓦），而句中的「文档」「链接」正好是放行裸域名的语境，
+    // 所以唯一可靠的区分信号是紧邻的斜杠（用户 2026-09-22 反馈）。
+    expect(html('CLAUDE.md 里可以只链接外部文档（如 /docs/architecture.md、/docs/api-standards.md）'))
+      .not.toContain('<a')
+  })
+
+  it('仍然给真正的裸域名加链接', () => {
+    expect(html('官网 example.com/docs')).toContain('<a')
+  })
+
+  it('仍然给显式 http 链接加链接', () => {
+    expect(html('见 https://example.com/a.md')).toContain('<a')
   })
 })

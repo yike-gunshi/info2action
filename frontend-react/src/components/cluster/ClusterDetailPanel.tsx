@@ -1,63 +1,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, MouseEvent } from 'react'
-import { Bookmark, ChevronLeft, ChevronRight, ExternalLink, EyeOff, Share2, ThumbsDown, X } from 'lucide-react'
+import { Bookmark, ChevronLeft, ChevronRight, ExternalLink, EyeOff, Share2, ThumbsDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { useClusterDetailStore } from '../../store/clusterDetailStore'
 import type { ClusterDetail, ClusterMedia, ClusterSource } from '../../lib/types'
 import { cn, eventPlatformName, platformClass, safeExternalUrl, stripMd } from '../../lib/utils'
 import { parseClusterBreakdownSections, parseClusterSummary } from '../../lib/cluster-summary-parser'
-import { renderMarkdownInline, renderMarkdownLite } from '../../lib/markdown-lite'
 import { proxiedImageUrl } from '../../lib/media'
 import { PlatformBrandIcon } from '../shared/PlatformIcon'
 import { requireAuth } from '../shared/AuthGate'
+import { ReadingLightbox } from '../reading/ReadingLightbox'
+import {
+  ReadingModalBody,
+  ReadingModalError,
+  ReadingModalFooter,
+  ReadingModalHeader,
+  ReadingModalLoading,
+  ReadingModalShell,
+  readingModalFooterButtonClass,
+} from '../reading/ReadingModal'
+import { ReadingSummary } from '../reading/ReadingSummary'
+import { formatReadingDateTime } from '../reading/readingUtils'
+import type { ReadingKeyPoint } from '../reading/readingUtils'
 import { buildInfoItemHref } from '../../lib/itemDeepLink'
 import { ClusterActionZone } from './ClusterActionZone'
 import { YoutubePlayer } from '../detail/YoutubePlayer'
+import { copyTextToClipboard, mediaCapStyle } from '../detail/detailShared'
 
-type KeyPointItem = string | { title: string; points: string[] }
 type ModalVariant = 'no-media' | 'single-media' | 'multi-media'
 
-const paperSurfaceStyle: CSSProperties = {
-  backgroundImage: 'var(--modal-paper-texture)',
-  backgroundSize: 'auto, 6px 6px',
-}
-
-const mediaCapStyle: CSSProperties = {
-  aspectRatio: '16 / 9',
-  maxHeight: 'min(180px, calc((var(--app-visual-height) - 32px - var(--modal-bottom-clearance)) * 0.25))',
-}
-
 const INFO2ACT_SHARE_BASE_URL = 'https://www.info2act.com'
-
-async function copyTextToClipboard(text: string): Promise<void> {
-  if (copyTextWithTextarea(text)) return
-
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text)
-    return
-  }
-
-  throw new Error('copy failed')
-}
-
-function copyTextWithTextarea(text: string): boolean {
-  const textarea = document.createElement('textarea')
-  textarea.value = text
-  textarea.setAttribute('readonly', '')
-  textarea.style.position = 'fixed'
-  textarea.style.left = '0'
-  textarea.style.top = '0'
-  textarea.style.opacity = '0'
-  document.body.appendChild(textarea)
-  textarea.focus()
-  textarea.select()
-  textarea.setSelectionRange(0, text.length)
-  try {
-    return Boolean(document.execCommand?.('copy'))
-  } finally {
-    document.body.removeChild(textarea)
-  }
-}
 
 function compactClusterShareSummary(cluster: ClusterDetail): string {
   const parsed = parseClusterSummary(cluster.ai_summary)
@@ -124,38 +95,6 @@ function modalVariantFor(mediaCount: number): ModalVariant {
   if (mediaCount <= 0) return 'no-media'
   if (mediaCount === 1) return 'single-media'
   return 'multi-media'
-}
-
-function sourceClockTime(value?: string | null): string | null {
-  if (!value) return null
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return null
-  return new Intl.DateTimeFormat('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(date)
-}
-
-// D1: 头部题注日期时间,格式 MM-DD HH:mm(如 07-04 04:30)。
-function eventMetaDateTime(value?: string | null): string | null {
-  if (!value) return null
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return null
-  return new Intl.DateTimeFormat('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(date).replace(/\//g, '-')
-}
-
-function paragraphLines(text: string): string[] {
-  return text
-    .split(/\n{2,}/)
-    .map((line) => line.trim())
-    .filter(Boolean)
 }
 
 function youtubeVideoId(media: ClusterMedia | null | undefined): string | null {
@@ -439,142 +378,33 @@ function ClusterMediaBlock({
   )
 }
 
-function SummaryLead({ text }: { text: string | null }) {
-  if (!text) return null
-  const lines = paragraphLines(text)
-  if (lines.length === 0) return null
-
-  return (
-    <div
-      data-testid="cluster-speed-review"
-      className="reading-body border-b border-[var(--modal-divider)] pb-5"
-    >
-      <p>
-        <strong className="mr-1.5 !text-[var(--brand)]">精华速览：</strong>
-        {renderMarkdownInline(lines[0])}
-      </p>
-      {lines.slice(1).map((line, index) => (
-        <p key={index} className="mt-2.5">
-          {renderMarkdownInline(line)}
-        </p>
-      ))}
-    </div>
-  )
-}
-
-function BreakdownSections({ fullBreakdown }: { fullBreakdown: string | null }) {
-  if (!fullBreakdown) return null
-
-  const sections = parseClusterBreakdownSections(fullBreakdown)
-  if (sections.length === 0) {
-    return (
-      <div
-        data-testid="cluster-full-breakdown"
-        className="reading-bullet py-4 [&_ul]:my-2.5 [&_ul]:space-y-1"
-      >
-        {renderMarkdownLite(fullBreakdown)}
-      </div>
-    )
-  }
-
-  return (
-    <section data-testid="cluster-full-breakdown" className="py-4">
-      <div className="space-y-0">
-        {sections.map((section, index) => (
-          <article
-            key={`${section.title}-${index}`}
-            className={cn(
-              index > 0 && 'border-t border-[var(--modal-divider)] pt-3.5',
-              index < sections.length - 1 && 'pb-4',
-            )}
-          >
-            <div className="mb-2 flex items-baseline gap-2.5">
-              <span
-                data-testid="cluster-breakdown-number"
-                className="reading-section leading-none text-[var(--brand)]"
-              >
-                {String(index + 1).padStart(2, '0')}
-              </span>
-              <h3 className="reading-section min-w-0">
-                {renderMarkdownInline(section.title)}
-              </h3>
-            </div>
-            {section.points.length > 0 && (
-              <ul className="reading-bullet space-y-1 pl-6 sm:pl-[38px]">
-                {section.points.map((point, pointIndex) => (
-                  <li key={`${point}-${pointIndex}`} className="relative">
-                    <span
-                      data-testid="cluster-breakdown-bullet-dot"
-                      className="absolute -left-3.5 top-[0.8em] h-1 w-1 rounded-full bg-[var(--modal-text)] sm:-left-4"
-                      aria-hidden="true"
-                    />
-                    {renderMarkdownInline(point)}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </article>
-        ))}
-      </div>
-    </section>
-  )
-}
-
-function KeyPointsFallback({ keyPoints }: { keyPoints?: KeyPointItem[] | null }) {
-  if (!keyPoints?.length) return null
-
-  return (
-    <ul data-testid="cluster-key-points" className="reading-bullet border-b border-[var(--modal-divider)] py-5">
-      {keyPoints.map((point, index) => {
-        if (typeof point === 'string') {
-          return (
-            <li key={index} className="relative mb-1.5 pl-4 last:mb-0">
-              <span className="absolute left-0 top-[0.8em] h-1 w-1 rounded-full bg-[var(--modal-text)]" aria-hidden="true" />
-              {renderMarkdownInline(point)}
-            </li>
-          )
-        }
-        return (
-          <li key={index} className="mb-3 last:mb-0">
-            <div className="reading-section">{renderMarkdownInline(point.title)}</div>
-            <ul className="mt-1.5 space-y-1.5">
-              {point.points.map((subPoint, subIndex) => (
-                <li key={subIndex} className="relative pl-4">
-                  <span className="absolute left-0 top-[0.8em] h-1 w-1 rounded-full bg-[var(--modal-text)]" aria-hidden="true" />
-                  {renderMarkdownInline(subPoint)}
-                </li>
-              ))}
-            </ul>
-          </li>
-        )
-      })}
-    </ul>
-  )
-}
-
 function ModalSummary({
   summary,
   keyPoints,
 }: {
   summary?: string | null
-  keyPoints?: KeyPointItem[] | null
+  keyPoints?: ReadingKeyPoint[] | null
 }) {
   const hasSummary = !!summary
-  const hasPoints = !!keyPoints?.length
-  if (!hasSummary && !hasPoints) return null
-
   const parts = parseClusterSummary(summary)
   const speedReview = parts.speedReview || (!parts.fullBreakdown ? summary || null : null)
+  const sections = parseClusterBreakdownSections(parts.fullBreakdown)
 
   return (
-    <section
-      data-testid="cluster-summary-block"
-      className="mb-6 text-[var(--modal-text-soft)]"
-    >
-      <SummaryLead text={speedReview} />
-      <BreakdownSections fullBreakdown={parts.fullBreakdown} />
-      {!hasSummary && hasPoints && <KeyPointsFallback keyPoints={keyPoints} />}
-    </section>
+    <ReadingSummary
+      fallbackBreakdown={sections.length === 0 ? parts.fullBreakdown : null}
+      keyPoints={hasSummary ? null : keyPoints}
+      lead={speedReview}
+      sections={sections}
+      testIds={{
+        container: 'cluster-summary-block',
+        lead: 'cluster-speed-review',
+        sections: 'cluster-full-breakdown',
+        keyPoints: 'cluster-key-points',
+        sectionNumber: 'cluster-breakdown-number',
+        bulletDot: 'cluster-breakdown-bullet-dot',
+      }}
+    />
   )
 }
 
@@ -582,7 +412,7 @@ function SourceCard({ source }: { source: ClusterSource }) {
   const originalUrl = safeExternalUrl(source.url)
   const href = originalUrl || buildInfoItemHref(source.item_id)
   const external = !!originalUrl
-  const time = sourceClockTime(source.published_at)
+  const time = formatReadingDateTime(source.published_at)
   const platformLabel = eventPlatformName(source.platform)
 
   return (
@@ -646,10 +476,11 @@ function SourceCard({ source }: { source: ClusterSource }) {
 
 export function ClusterDetailPanel() {
   const modalState = useClusterDetailStore((s) => s.modalState)
+  const modalClusterId = useClusterDetailStore((s) => s.modalClusterId)
   const cluster = useClusterDetailStore((s) => s.cluster)
   const sources = useClusterDetailStore((s) => s.sources)
-  const error = useClusterDetailStore((s) => s.error)
   const closeModal = useClusterDetailStore((s) => s.closeModal)
+  const openModal = useClusterDetailStore((s) => s.openModal)
   const toggleClusterStar = useClusterDetailStore((s) => s.toggleClusterStar)
   const submitClusterFeedback = useClusterDetailStore((s) => s.submitClusterFeedback)
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
@@ -695,40 +526,6 @@ export function ClusterDetailPanel() {
   }, [cluster?.id])
 
   useEffect(() => {
-    if (modalState === 'closed') return
-    const html = document.documentElement
-    const prevOverflow = html.style.overflow
-    html.style.overflow = 'hidden'
-    return () => {
-      html.style.overflow = prevOverflow
-    }
-  }, [modalState])
-
-  useEffect(() => {
-    if (modalState === 'closed') return
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') {
-        if (lightboxSrc) setLightboxSrc(null)
-        else handleClose()
-      }
-      if (lightboxSrc && lightboxImages.length > 1) {
-        const idx = lightboxImages.indexOf(lightboxSrc)
-        if (idx < 0) return
-        if (e.key === 'ArrowLeft' && idx > 0) {
-          e.preventDefault()
-          setLightboxSrc(lightboxImages[idx - 1])
-        }
-        if (e.key === 'ArrowRight' && idx < lightboxImages.length - 1) {
-          e.preventDefault()
-          setLightboxSrc(lightboxImages[idx + 1])
-        }
-      }
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [modalState, handleClose, lightboxSrc, lightboxImages])
-
-  useEffect(() => {
     if (modalState !== 'open') {
       setLightboxSrc(null)
       setLightboxImages([])
@@ -737,10 +534,6 @@ export function ClusterDetailPanel() {
       setIsClosing(false)
     }
   }, [modalState])
-
-  const handleBackdropClick = (e: MouseEvent<HTMLDivElement>) => {
-    if (e.target === e.currentTarget) handleClose()
-  }
 
   const handleJumpDetail = useCallback(() => {
     if (!cluster) return
@@ -811,136 +604,91 @@ export function ClusterDetailPanel() {
   const primarySource = sources.find((s) => s.is_primary_source) ?? sources[0]
   const metaPlatform = primarySource?.platform ?? platforms[0] ?? ''
   const metaSourceName = primarySource?.author?.trim() || (metaPlatform ? eventPlatformName(metaPlatform) : '')
-  const metaTime = eventMetaDateTime(cluster?.first_doc_at)
+  const metaTime = formatReadingDateTime(cluster?.first_doc_at)
   const metaSourceCount = cluster?.unique_source_count ?? sources.length
   const isStarred = !!cluster?.viewer_status?.starred_at
   const feedbackKind = cluster?.viewer_status?.feedback_kind ?? null
-  const bottomActionClass = 'flex h-12 w-full items-center justify-center gap-1.5 text-[13px] font-medium text-[var(--modal-text-muted)] transition-colors hover:bg-[var(--modal-hover)] hover:text-[var(--modal-text)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)] focus-visible:ring-inset disabled:cursor-not-allowed disabled:opacity-60'
-  const lightboxIndex = lightboxSrc ? lightboxImages.indexOf(lightboxSrc) : -1
-  const hasLightboxNavigation = lightboxImages.length > 1 && lightboxIndex >= 0
+  const meta = (
+    <>
+      {metaSourceName && (
+        <span className="flex min-w-0 items-center gap-1.5">
+          {metaPlatform && (
+            <span
+              className={cn(
+                'inline-flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded-full border-2 border-[var(--modal-surface)] text-[10px] leading-none shadow-[0_1px_2px_rgba(26,25,23,0.16)]',
+                platformClass(metaPlatform),
+              )}
+              title={eventPlatformName(metaPlatform)}
+              aria-hidden="true"
+            >
+              <PlatformBrandIcon platform={metaPlatform} className="h-[66%] w-[66%]" />
+            </span>
+          )}
+          <span className="min-w-0 truncate">{metaSourceName}</span>
+        </span>
+      )}
+      {metaTime && (
+        <>
+          {metaSourceName && <span className="shrink-0 text-[var(--modal-text-subtle)]">·</span>}
+          <time className="shrink-0 font-mono tabular-nums" dateTime={cluster?.first_doc_at}>
+            {metaTime}
+          </time>
+        </>
+      )}
+      {metaSourceCount > 0 && (
+        <>
+          <span className="shrink-0 text-[var(--modal-text-subtle)]">·</span>
+          <span className="shrink-0 tabular-nums">{metaSourceCount} 来源</span>
+        </>
+      )}
+    </>
+  )
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="cluster-modal-title"
-      onClick={handleBackdropClick}
-      className={cn(
-        'modal-viewport-shell fixed inset-0 z-[900] flex bg-black/60',
-        isClosing ? 'animate-backdrop-out' : 'animate-backdrop-in',
-      )}
-    >
-      <div
-        data-testid="cluster-detail-panel"
-        data-modal-theme="editorial"
-        data-modal-variant={variant}
-        className={cn(
-          'modal-viewport-panel flex w-[calc(100vw-24px)] max-w-[720px] flex-col overflow-hidden rounded-[10px] border border-[var(--modal-border)] bg-[var(--modal-surface)] text-[var(--modal-text)] shadow-[var(--modal-shadow)]',
-          isClosing ? 'animate-modal-out' : 'animate-modal-in',
-        )}
-        style={paperSurfaceStyle}
-        onClick={(e) => e.stopPropagation()}
+    <>
+      <ReadingModalShell
+        ariaLabelledby="cluster-modal-title"
+        dataAttributes={{ 'data-modal-variant': variant }}
+        escapeDisabled={!!lightboxSrc}
+        isClosing={isClosing}
+        onClose={handleClose}
+        panelTestId="cluster-detail-panel"
       >
-        {/* v24.0 §21.6: 裸「加载中…」文本 → modal-token 骨架(对齐 ActionModalLoading 样板) */}
         {modalState === 'loading' && (
-          <div className="min-h-[220px] px-4 py-5 sm:px-10" data-testid="cluster-modal-loading" aria-label="加载中">
-            <div className="h-6 w-3/4 animate-skeleton rounded bg-[var(--modal-hover)]" />
-            <div className="mt-3 h-4 w-1/2 animate-skeleton rounded bg-[var(--modal-hover)]" />
-            <div className="mt-6 space-y-3">
-              <div className="h-4 w-full animate-skeleton rounded bg-[var(--modal-hover)]" />
-              <div className="h-4 w-11/12 animate-skeleton rounded bg-[var(--modal-hover)]" />
-              <div className="h-4 w-4/5 animate-skeleton rounded bg-[var(--modal-hover)]" />
-            </div>
-          </div>
+          <ReadingModalLoading
+            headerTestId="cluster-modal-header"
+            onClose={handleClose}
+            testId="cluster-modal-loading"
+            title="精选详情"
+            titleId="cluster-modal-title"
+          />
         )}
 
         {modalState === 'error' && (
-          <div className="flex min-h-[220px] flex-col items-center justify-center gap-2 p-6">
-            <div className="text-sm text-foreground">加载失败</div>
-            <div className="text-xs text-muted-foreground">{error}</div>
-            <button
-              type="button"
-              onClick={handleClose}
-              className="mt-2 rounded-[6px] bg-[var(--brand)] px-4 py-2 text-sm font-medium text-[var(--brand-foreground)]"
-            >
-              关闭
-            </button>
-          </div>
+          <ReadingModalError
+            headerTestId="cluster-modal-header"
+            message="加载失败，请重试"
+            onClose={handleClose}
+            onRetry={() => { if (modalClusterId != null) void openModal(modalClusterId) }}
+            testId="cluster-modal-error"
+            title="精选详情"
+            titleId="cluster-modal-title"
+          />
         )}
 
         {modalState === 'open' && cluster && (
           <>
-            <header
-              data-testid="cluster-modal-header"
-              className="shrink-0 bg-[var(--modal-surface)] px-4 py-5 sm:px-10"
-              style={paperSurfaceStyle}
-            >
-              <div className="flex items-start gap-2">
-                <div className="min-w-0 flex-1">
-                  <h2
-                    id="cluster-modal-title"
-                    data-testid="cluster-modal-title"
-                    className="reading-title min-w-0"
-                  >
-                    <span className="line-clamp-2">{cluster.ai_title}</span>
-                  </h2>
-                  {/* D1: 标题下题注行 —— 主来源(平台徽标+来源名) · 事件时间 · 来源数。
-                      平台图标从标题行挪到这里,标题得以安心两行不被挤。 */}
-                  <div
-                    data-testid="cluster-modal-meta"
-                    className="reading-meta mt-2 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"
-                  >
-                    {metaSourceName && (
-                      <span className="flex min-w-0 items-center gap-1.5">
-                        {metaPlatform && (
-                          <span
-                            className={cn(
-                              'inline-flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full border-2 border-[var(--modal-surface)] text-[10px] leading-none shadow-[0_1px_2px_rgba(26,25,23,0.16)]',
-                              platformClass(metaPlatform),
-                            )}
-                            title={eventPlatformName(metaPlatform)}
-                            aria-hidden="true"
-                          >
-                            <PlatformBrandIcon platform={metaPlatform} className="h-[62%] w-[62%]" />
-                          </span>
-                        )}
-                        <span className="min-w-0 truncate">{metaSourceName}</span>
-                      </span>
-                    )}
-                    {metaTime && (
-                      <>
-                        {metaSourceName && <span className="shrink-0 text-[var(--modal-text-subtle)]">·</span>}
-                        <time className="shrink-0 font-mono tabular-nums" dateTime={cluster.first_doc_at}>
-                          {metaTime}
-                        </time>
-                      </>
-                    )}
-                    {metaSourceCount > 0 && (
-                      <>
-                        <span className="shrink-0 text-[var(--modal-text-subtle)]">·</span>
-                        <span className="shrink-0 tabular-nums">{metaSourceCount} 来源</span>
-                      </>
-                    )}
-                  </div>
-                </div>
+            <ReadingModalHeader
+              headerTestId="cluster-modal-header"
+              meta={meta}
+              metaTestId="cluster-modal-meta"
+              onClose={handleClose}
+              title={cluster.ai_title}
+              titleId="cluster-modal-title"
+              titleTestId="cluster-modal-title"
+            />
 
-                <div className="flex w-8 shrink-0 items-center justify-end gap-0.5">
-                  <button
-                    type="button"
-                    onClick={handleClose}
-                    aria-label="关闭"
-                    title="关闭"
-                    className="relative flex h-7 w-7 items-center justify-center rounded-[5px] text-[var(--modal-text-faint)] transition-colors before:absolute before:-inset-2 before:content-[''] hover:bg-[var(--modal-hover)] hover:text-[var(--modal-text)]"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-              </div>
-            </header>
-
-            {/* bf-0711 #2: overscroll-contain 阻断滚动链——弹窗滚到边界时不再把滚轮/触摸
-                滚动传导到背景精选页(配合 LatestEvents 弹窗打开时禁用下拉刷新监听)。 */}
-            <div className="flex-1 overflow-y-auto overscroll-contain px-4 pb-7 pt-0 sm:px-10 sm:pb-8">
+            <ReadingModalBody resetKey={cluster.id} testId="cluster-modal-scroll">
               <ClusterMediaBlock
                 urls={mediaUrls}
                 video={primaryVideo}
@@ -1010,19 +758,15 @@ export function ClusterDetailPanel() {
                   {feedbackKind === 'low_quality' ? '✓ 质量差' : '质量差'}
                 </button>
               </div>
-            </div>
+            </ReadingModalBody>
 
-            <div
-              className="modal-safe-footer grid flex-shrink-0 grid-cols-3 overflow-hidden border-t border-[var(--modal-border-soft)] bg-[var(--modal-surface)]"
-              data-testid="cluster-bottom-actions"
-              style={paperSurfaceStyle}
-            >
+            <ReadingModalFooter className="grid-cols-3" testId="cluster-bottom-actions">
               <button
                 type="button"
                 onClick={handleStar}
                 disabled={starPending}
                 data-testid="cluster-footer-star-button"
-                className={cn(bottomActionClass, isStarred && 'text-[var(--brand)]')}
+                className={cn(readingModalFooterButtonClass, isStarred && 'text-[var(--brand)]')}
               >
                 <Bookmark className={cn('h-3.5 w-3.5', isStarred && 'fill-current')} />
                 {isStarred ? '已收藏' : '收藏'}
@@ -1031,7 +775,7 @@ export function ClusterDetailPanel() {
                 type="button"
                 onClick={handleJumpDetail}
                 data-testid="cluster-footer-detail-button"
-                className={bottomActionClass}
+                className={readingModalFooterButtonClass}
               >
                 <ExternalLink className="h-3.5 w-3.5" />
                 跳转详情
@@ -1040,82 +784,25 @@ export function ClusterDetailPanel() {
                 type="button"
                 onClick={handleShare}
                 data-testid="cluster-footer-share-button"
-                className={bottomActionClass}
+                className={readingModalFooterButtonClass}
               >
                 <Share2 className="h-3.5 w-3.5" />
                 分享
               </button>
-            </div>
+            </ReadingModalFooter>
           </>
         )}
-      </div>
+      </ReadingModalShell>
 
       {lightboxSrc && (
-        <div
-          data-testid="cluster-cover-lightbox"
-          className="fixed inset-0 z-[920] flex items-center justify-center bg-black/85 p-4"
-          onClick={(e) => {
-            e.stopPropagation()
-            closeLightbox()
-          }}
-        >
-          <button
-            type="button"
-            aria-label="关闭图片预览"
-            className="absolute right-5 top-5 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-black/50 text-white shadow-lg backdrop-blur-sm transition-colors hover:bg-black/65"
-            onClick={(e) => {
-              e.stopPropagation()
-              closeLightbox()
-            }}
-          >
-            <X className="h-[18px] w-[18px]" />
-          </button>
-          {hasLightboxNavigation && lightboxIndex > 0 && (
-            <button
-              type="button"
-              aria-label="上一张图片"
-              title="上一张图片"
-              className="group absolute left-4 top-1/2 z-10 flex h-14 w-14 -translate-y-1/2 items-center justify-center rounded-full text-white outline-none transition-colors focus-visible:ring-2 focus-visible:ring-white/70"
-              onClick={(e) => {
-                e.stopPropagation()
-                setLightboxSrc(lightboxImages[lightboxIndex - 1])
-              }}
-            >
-              <span className="flex h-11 w-11 items-center justify-center rounded-full bg-black/50 shadow-lg backdrop-blur-sm transition-colors group-hover:bg-black/65 group-focus-visible:bg-black/65">
-                <ChevronLeft className="h-6 w-6" />
-              </span>
-            </button>
-          )}
-          {hasLightboxNavigation && lightboxIndex < lightboxImages.length - 1 && (
-            <button
-              type="button"
-              aria-label="下一张图片"
-              title="下一张图片"
-              className="group absolute right-4 top-1/2 z-10 flex h-14 w-14 -translate-y-1/2 items-center justify-center rounded-full text-white outline-none transition-colors focus-visible:ring-2 focus-visible:ring-white/70"
-              onClick={(e) => {
-                e.stopPropagation()
-                setLightboxSrc(lightboxImages[lightboxIndex + 1])
-              }}
-            >
-              <span className="flex h-11 w-11 items-center justify-center rounded-full bg-black/50 shadow-lg backdrop-blur-sm transition-colors group-hover:bg-black/65 group-focus-visible:bg-black/65">
-                <ChevronRight className="h-6 w-6" />
-              </span>
-            </button>
-          )}
-          {hasLightboxNavigation && (
-            <span className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-full bg-black/40 px-3 py-1 font-mono text-[12px] text-white/80">
-              {lightboxIndex + 1} / {lightboxImages.length}
-            </span>
-          )}
-          <img
-            src={proxiedImageUrl(lightboxSrc)}
-            alt=""
-            referrerPolicy="no-referrer"
-            className="max-h-[90vh] max-w-[92vw] rounded-[6px] object-contain"
-            onClick={(e) => e.stopPropagation()}
-          />
-        </div>
+        <ReadingLightbox
+          images={lightboxImages}
+          onClose={closeLightbox}
+          onNavigate={setLightboxSrc}
+          src={lightboxSrc}
+          testId="cluster-cover-lightbox"
+        />
       )}
-    </div>
+    </>
   )
 }

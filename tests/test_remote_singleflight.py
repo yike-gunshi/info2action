@@ -132,3 +132,56 @@ def test_singleflight_no_thread_starvation_after_exception():
 
     result = remote_db._singleflight_sync(("test_key_recover",), succeeding)
     assert result == "second call ok"
+
+
+def test_cancelled_search_follower_stops_without_cancelling_shared_leader():
+    from feed_search import SearchBudget, SearchExpired, current_search
+
+    leader_started, leader_release = threading.Event(), threading.Event()
+    follower_done = threading.Event()
+    budget = SearchBudget(timeout=5)
+    outcomes = []
+    key = ("cancelled_search_follower",)
+
+    def compute():
+        leader_started.set()
+        assert leader_release.wait(2)
+        return "shared result"
+
+    def leader():
+        outcomes.append(remote_db._singleflight_sync(key, compute))
+
+    def follower():
+        token = current_search.set(budget)
+        try:
+            outcomes.append(remote_db._singleflight_sync(key, lambda: pytest.fail("duplicated leader work")))
+        except BaseException as exc:
+            outcomes.append(exc)
+        finally:
+            current_search.reset(token)
+            follower_done.set()
+
+    leader_thread = threading.Thread(target=leader)
+    follower_thread = threading.Thread(target=follower)
+    leader_thread.start()
+    try:
+        assert leader_started.wait(1)
+        follower_thread.start()
+        until = time.monotonic() + 1
+        while time.monotonic() < until:
+            with remote_db._INFLIGHT_LOCK:
+                if remote_db._INFLIGHT[key]["waiters"] == 2:
+                    break
+            time.sleep(.005)
+        budget.cancel("search_cancelled")
+        stopped_promptly = follower_done.wait(.3)
+        leader_survived = leader_thread.is_alive() and key in remote_db._INFLIGHT
+    finally:
+        leader_release.set()
+        leader_thread.join(2)
+        follower_thread.join(2)
+    assert stopped_promptly, "cancelled follower held its worker until shared leader completed"
+    assert leader_survived, "one follower cancelled another user's shared computation"
+    errors = [value for value in outcomes if isinstance(value, SearchExpired)]
+    assert len(errors) == 1 and str(errors[0]) == "search_cancelled"
+    assert outcomes.count("shared result") == 1

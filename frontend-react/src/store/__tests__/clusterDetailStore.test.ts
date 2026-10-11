@@ -68,7 +68,11 @@ const emptyBundle = (cluster: ClusterDetail = makeDetail()): ClusterBundleRespon
   sources_next_cursor: null,
 })
 
-beforeEach(() => {
+beforeEach(async () => {
+  // openModal 的 click 链先动态加载 eventsStore；单跑时也要先完成加载，
+  // 不能依赖其他测试预热模块，或把 setTimeout(0) 当成模块加载完成信号。
+  const { useEventsStore } = await import('../eventsStore')
+  useEventsStore.getState().reset()
   useClusterDetailStore.getState().closeModal()
   vi.mocked(fetchClusterBundle).mockReset()
   vi.mocked(fetchClusterDetail).mockReset()

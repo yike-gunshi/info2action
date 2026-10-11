@@ -8,6 +8,7 @@ status-write surface is still pointing at SQLite.
 from __future__ import annotations
 
 import json
+from feed_search import current_search, optional_search_count, SearchBusy, SearchExpired
 import logging
 import math
 import os
@@ -20,6 +21,7 @@ import time
 import threading
 import copy
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -738,6 +740,23 @@ def _cache_set(key: tuple[Any, ...], value: Any) -> Any:
     return _cache_set_with_ttl(key, value, _remote_cache_ttl())
 
 
+def _cache_set_many(entries: dict[tuple[Any, ...], Any]) -> None:
+    """Publish count snapshots together; resolve cache policy once per batch."""
+    global _CACHE_TOTAL_BYTES
+    if _remote_cache_ttl() <= 0:
+        return
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        for key, value in entries.items():
+            _cache_remove_locked(key)
+            size = _estimate_size(value)
+            _CACHE[key] = {"ts": now, "value": value, "size": size}
+            _CACHE_TOTAL_BYTES += size
+            for token in set(_key_tokens(key)):
+                _CACHE_TOKEN_INDEX.setdefault(token, set()).add(key)
+        _cache_evict_locked()
+
+
 def _cache_set_with_ttl(key: tuple[Any, ...], value: Any, ttl: int) -> Any:
     global _CACHE_TOTAL_BYTES
     if ttl <= 0:
@@ -966,7 +985,16 @@ def _singleflight_sync(key: tuple[Any, ...], compute_fn):
                 _INFLIGHT.pop(key, None)
             holder['event'].set()
     else:
-        if not holder['event'].wait(timeout=_SINGLEFLIGHT_TIMEOUT_SEC):
+        budget = current_search.get()
+        if budget is not None:
+            # A follower owns only its wait. Cancelling it must not cancel the
+            # leader's connection or remove the shared computation for others.
+            while True:
+                budget.check()
+                if holder['event'].wait(timeout=min(.05, max(0, budget.remaining()))):
+                    budget.check()
+                    break
+        elif not holder['event'].wait(timeout=_SINGLEFLIGHT_TIMEOUT_SEC):
             # leader hung; do not block forever, fall back to fresh compute
             with _INFLIGHT_LOCK:
                 _INFLIGHT.pop(key, None)
@@ -1028,6 +1056,69 @@ def _write_local_read_cache_async(name: str, payload: Any) -> None:
     threading.Thread(target=_write, daemon=True).start()
 
 
+_SEARCH_POOL_CHECKOUT: ContextVar[dict[str, Any] | None] = ContextVar(
+    'search_pool_checkout', default=None,
+)
+
+
+def _check_pool_connection(conn: Any) -> None:
+    from psycopg_pool import ConnectionPool
+
+    budget = current_search.get()
+    checkout = _SEARCH_POOL_CHECKOUT.get()
+    if budget is None or checkout is None:
+        ConnectionPool.check_connection(conn)
+        return
+
+    try:
+        with budget.connection(conn):
+            try:
+                deadline = checkout['deadline']
+                remaining = budget.remaining()
+                remaining = min(remaining, deadline - time.monotonic())
+                if remaining <= 0:
+                    budget.check()
+                    raise SearchBusy()
+                # The pool check runs before connect() receives the connection.
+                # Register cancellation first and isolate this probe transaction
+                # so SET LOCAL cannot leak through the transaction-mode pooler.
+                timeout_ms = min(budget.statement_ms, max(1, int(remaining * 1000)))
+                # psycopg starts an implicit transaction when autocommit=False;
+                # a second BEGIN would only warn and ignore READ ONLY.
+                conn.execute('SET TRANSACTION READ ONLY')
+                conn.execute(f"SET LOCAL statement_timeout = '{timeout_ms}ms'")
+                conn.execute('SELECT 1')
+                budget.check()
+                if time.monotonic() >= deadline:
+                    raise SearchBusy()
+            finally:
+                try:
+                    conn.rollback()
+                except Exception:
+                    # The driver must discard a connection whose probe state
+                    # cannot be cleared before another transaction uses it.
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    except (SearchExpired, SearchBusy) as exc:
+        # Old pool versions leak a checkout when a check raises outside their
+        # retry exception boundary. Hand it back to connection() normally, then
+        # connect() raises this before executing any search query; its finally
+        # returns (or discards) the connection exactly once on every version.
+        checkout['error'] = exc
+    except Exception as exc:
+        try:
+            budget.check()
+        except SearchExpired as cancelled:
+            checkout['error'] = cancelled
+        else:
+            if getattr(exc, 'sqlstate', None) == '57014':
+                checkout['error'] = SearchBusy()
+            else:
+                raise
+
+
 def _get_pool(psycopg_module: Any, dict_row: Any) -> Any | None:
     env = _runtime_env()
     if _truthy(env.get(REMOTE_DB_POOL_DISABLED_ENV)):
@@ -1064,7 +1155,7 @@ def _get_pool(psycopg_module: Any, dict_row: Any) -> Any | None:
             # connection and the first query fails with EDBHANDLEREXITED. Only the
             # 30-minute /api/auth/refresh path stayed idle long enough to hit it,
             # which is why it alone returned 500. See BF-0708-1.
-            check=ConnectionPool.check_connection,
+            check=_check_pool_connection,
             # Retire connections above min_size before the pooler's idle window
             # closes them. min_size connections stay resident, so `check` above
             # remains the load-bearing guard, not this.
@@ -1243,8 +1334,30 @@ def connect() -> Iterator[Any]:
 
     pool = _get_pool(psycopg, dict_row)
     if pool is not None:
+        budget = current_search.get()
+        checkout_token = None
+        checkout_state = None
         try:
-            with pool.connection() as conn:
+            if budget is not None:
+                budget.check()
+                timeout = min(float(getattr(pool, 'timeout', 2)), budget.remaining())
+                checkout_state = {'deadline': time.monotonic() + timeout, 'error': None}
+                checkout_token = _SEARCH_POOL_CHECKOUT.set(checkout_state)
+                checkout = pool.connection(timeout=timeout)
+            else:
+                checkout = pool.connection()
+            with checkout as conn:
+                if checkout_state is not None and checkout_state['error'] is not None:
+                    raise checkout_state['error']
+                if budget is not None:
+                    try:
+                        with budget.connection(conn) as search_conn:
+                            search_conn.execute("SET TRANSACTION READ ONLY")
+                            search_conn.execute(f"SET LOCAL search_path TO {remote_schema()}, extensions, public")
+                            yield search_conn
+                    finally:
+                        _rollback_safely(conn)
+                    return
                 if _force_writable_on_connect():
                     conn.execute("set default_transaction_read_only=off")
                     conn.commit()
@@ -1261,10 +1374,20 @@ def connect() -> Iterator[Any]:
                     _rollback_safely(conn)
                     raise
                 return
-        except RemoteDBError:
+        except (RemoteDBError, SearchBusy, SearchExpired):
             raise
         except Exception as exc:
+            if checkout_state is not None and checkout_state['error'] is not None:
+                raise checkout_state['error'] from exc
+            if budget is not None:
+                from psycopg_pool import PoolTimeout
+                if isinstance(exc, PoolTimeout):
+                    budget.check()
+                    raise SearchBusy() from exc
             raise _wrap_remote_db_exception(exc) from exc
+        finally:
+            if checkout_token is not None:
+                _SEARCH_POOL_CHECKOUT.reset(checkout_token)
 
     env = _runtime_env()
     connect_timeout = _env_int(env, REMOTE_DB_CONNECT_TIMEOUT_ENV, 2, min_value=1)
@@ -1289,6 +1412,16 @@ def connect() -> Iterator[Any]:
         raise RemoteDBError(f"Remote DB connection failed: {last_exc}") from last_exc
 
     try:
+        budget = current_search.get()
+        if budget is not None:
+            try:
+                with budget.connection(conn) as search_conn:
+                    search_conn.execute("SET TRANSACTION READ ONLY")
+                    search_conn.execute(f"SET LOCAL search_path TO {remote_schema()}, extensions, public")
+                    yield search_conn
+            finally:
+                _rollback_safely(conn)
+            return
         if _force_writable_on_connect():
             conn.execute("set default_transaction_read_only=off")
             conn.commit()
@@ -1296,7 +1429,7 @@ def connect() -> Iterator[Any]:
         conn.commit()
         with conn:
             yield conn
-    except RemoteDBError:
+    except (RemoteDBError, SearchBusy, SearchExpired):
         raise
     except Exception as exc:
         raise _wrap_remote_db_exception(exc) from exc

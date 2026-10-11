@@ -57,7 +57,10 @@ export function FeedSection({
 
   // 展开态下可见条数上限（折叠态恒 BATCH）
   const [showCount, setShowCount] = useState(BATCH)
+  const [pageError, setPageError] = useState<string | null>(null)
+  const [pageHasMore, setPageHasMore] = useState<boolean | null>(null)
   const [keywordFilter, setKeywordFilter] = useState<string | null>(null)
+  const [filterRetry, setFilterRetry] = useState(0)
   const searchQuery = useUIStore((s) => s.searchQuery)
   const isGlobalSearchActive = useFeedStore((s) => s.searchResults !== null)
   const activeSearch = isGlobalSearchActive ? searchQuery.trim() : ''
@@ -85,7 +88,8 @@ export function FeedSection({
   // Server-side filter results (full-DB match, not just loaded batch)
   const [keywordResults, setKeywordResults] = useState<{
     items: FeedItem[]
-    total: number
+    total: number | null
+    hasMore: boolean
     nextCursor?: InfoReadModelCursor | null
   } | null>(null)
   const [keywordLoading, setKeywordLoading] = useState(false)
@@ -115,11 +119,15 @@ export function FeedSection({
     promise
       .then((res) => {
         if (cancelled) return
-        if (res.degraded) return
-        setKeywordResults({ items: res.items, total: res.total ?? res.items.length, nextCursor: res.next_cursor ?? null })
+        if (res.degraded) throw new Error('搜索暂时不可用，请重试')
+        setPageError(null)
+        setKeywordResults({ items: res.items, total: res.total ?? null, hasMore: res.has_more ?? res.items.length >= BATCH, nextCursor: res.next_cursor ?? null })
       })
-      .catch(() => {
-        if (!cancelled) setKeywordResults(null)
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setKeywordResults(null)
+          if (activeSearch) setPageError(error instanceof Error ? error.message : '加载失败，请重试')
+        }
       })
       .finally(() => {
         if (!cancelled) setKeywordLoading(false)
@@ -128,9 +136,13 @@ export function FeedSection({
     return () => {
       cancelled = true
     }
-  }, [keywordFilter, section.key, classification, activeSearch])
+  }, [keywordFilter, section.key, classification, activeSearch, filterRetry])
 
-  const filteredItems = keywordFilter ? (keywordResults?.items ?? section.items) : section.items
+  const filterFailed = Boolean(activeSearch && keywordFilter && pageError && !keywordResults)
+  const filteredItems = useMemo(
+    () => filterFailed ? [] : keywordFilter ? (keywordResults?.items ?? section.items) : section.items,
+    [filterFailed, keywordFilter, keywordResults, section.items],
+  )
   const filteredTotal = keywordFilter
     ? (keywordResults?.total ?? section.count)
     : section.count
@@ -144,8 +156,10 @@ export function FeedSection({
   )
 
   const effectiveTotal = filteredTotal
-  const hasMore = filteredItems.length > limit || filteredItems.length < filteredTotal
-  const remaining = Math.max(effectiveTotal - visibleItems.length, 0)
+  const countKnown = !filterFailed && (keywordResults ? keywordResults.total !== null : section.countKnown !== false)
+  const remoteHasMore = keywordResults?.hasMore ?? pageHasMore ?? (countKnown ? filteredItems.length < filteredTotal : filteredItems.length >= BATCH)
+  const hasMore = !filterFailed && (filteredItems.length > limit || remoteHasMore)
+  const remaining = countKnown ? Math.max(effectiveTotal - visibleItems.length, 0) : 0
 
   const handleCollapse = () => {
     const rect = document.getElementById(`s-${section.key}`)?.getBoundingClientRect()
@@ -173,6 +187,8 @@ export function FeedSection({
   const loadMoreScopeRef = useRef(loadMoreScopeKey)
 
   useEffect(() => {
+    setPageError(null)
+    setPageHasMore(null)
     loadMoreScopeRef.current = loadMoreScopeKey
     loadingMoreRef.current = false
     loadMoreRequestSeqRef.current += 1
@@ -187,6 +203,7 @@ export function FeedSection({
     const offset = section.items.length
     if (offset >= filteredTotal) return
     const scopeKey = loadMoreScopeKey
+    if (activeSearch) return
     const existing = prefetchedRef.current
     if (existing && existing.scopeKey === scopeKey && existing.offset === offset) return
     const inFlight = prefetchRef.current
@@ -222,9 +239,19 @@ export function FeedSection({
       setExpandedKey(section.key)
     }
     if (loadingMoreRef.current) return
-    if (keywordFilter && keywordResults === null) return
+    if (keywordFilter && keywordResults === null) {
+      if (filterFailed) {
+        setPageError(null)
+        setFilterRetry((previous) => previous + 1)
+      }
+      return
+    }
+    if (filteredItems.length > limit) {
+      setShowCount((previous) => previous + BATCH)
+      return
+    }
     const offset = filteredItems.length
-    if (offset >= filteredTotal) return
+    if (!remoteHasMore) return
     const scopeKey = loadMoreScopeKey
     const requestSeq = ++loadMoreRequestSeqRef.current
     loadingMoreRef.current = true
@@ -242,18 +269,20 @@ export function FeedSection({
           : fetchFeedSectionMore(section.key, offset, BATCH, keywordFilter, undefined, activeSearch || undefined)
       promise.then((res) => {
         if (loadMoreScopeRef.current !== scopeKey || loadMoreRequestSeqRef.current !== requestSeq) return
-        if (res.degraded) return
+        if (res.degraded) throw new Error('搜索暂时不可用，请重试')
+        setPageError(null)
         const baseItems = keywordResults?.items ?? []
         const merged = mergeUniqueItems(baseItems, res.items)
         setKeywordResults({
           items: merged.items,
-          total: res.total ?? keywordResults?.total ?? merged.items.length,
+          total: res.total ?? null,
+          hasMore: res.has_more ?? res.items.length >= BATCH,
           nextCursor: res.next_cursor ?? null,
         })
         if (merged.added > 0) {
           setShowCount((prev) => prev + merged.added)
         }
-      }).catch(() => {})
+      }).catch((error: unknown) => { if (loadMoreScopeRef.current === scopeKey) setPageError(error instanceof Error ? error.message : '加载失败，请重试') })
         .finally(() => {
           if (loadMoreScopeRef.current === scopeKey && loadMoreRequestSeqRef.current === requestSeq) {
             loadingMoreRef.current = false
@@ -285,7 +314,9 @@ export function FeedSection({
     pagePromise
       .then((res) => {
         if (loadMoreScopeRef.current !== scopeKey || loadMoreRequestSeqRef.current !== requestSeq) return
-        if (res.degraded) return
+        if (res.degraded) throw new Error('搜索暂时不可用，请重试')
+        setPageError(null)
+        setPageHasMore(res.has_more ?? res.items.length >= BATCH)
         const merged = mergeUniqueItems(section.items, res.items)
         if (merged.added > 0) {
           useFeedStore.getState().appendCategoryItems(section.key, res.items)
@@ -293,7 +324,7 @@ export function FeedSection({
         }
         setSectionCursor(res.next_cursor ?? null)
       })
-      .catch(() => {})
+      .catch((error: unknown) => { if (loadMoreScopeRef.current === scopeKey) setPageError(error instanceof Error ? error.message : '加载失败，请重试') })
       .finally(() => {
         if (loadMoreScopeRef.current === scopeKey && loadMoreRequestSeqRef.current === requestSeq) {
           loadingMoreRef.current = false
@@ -319,7 +350,8 @@ export function FeedSection({
     <SectionFront
       sectionKey={section.key}
       label={showHeader ? section.label : undefined}
-      count={showHeader ? effectiveTotal : undefined}
+      count={showHeader && countKnown ? effectiveTotal : undefined}
+      pageError={pageError}
       items={visibleItems}
       hasMore={hasMore}
       remaining={remaining}
