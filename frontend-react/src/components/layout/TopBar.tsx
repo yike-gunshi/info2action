@@ -1,3 +1,5 @@
+import { useAiSearchStore } from '../../store/aiSearchStore'
+import { getAiSearchStatus } from '../../lib/api/aiSearch'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Search, Sun, Moon, Settings, Shield, LogOut, LogIn, Star, Clock, CircleUserRound, X } from 'lucide-react'
 import { cn } from '../../lib/utils'
@@ -12,12 +14,23 @@ import { useHash } from '../../hooks/useHash'
 import { authLogout } from '../../lib/api'
 import { resetClientSessionState } from '../../store/sessionReset'
 import { SubmitPanel } from './SubmitPanel'
+import { ChangelogButton } from './ChangelogButton'
 import { BrandWordmark } from '../shared/BrandWordmark'
 import { PlatformBrandIcon } from '../shared/PlatformIcon'
 import type { L1View } from '../../lib/types'
 
 // oss-release v20.0 F1: 开源仓库外链（编译期常量，不走运行时配置）
 const GITHUB_REPO_URL = 'https://github.com/yike-gunshi/info2action'
+
+let aiSearchEnabled: boolean | null = null
+let aiSearchEnabledRequest: Promise<boolean> | undefined
+
+function loadAiSearchEnabled(): Promise<boolean> {
+  aiSearchEnabledRequest ??= getAiSearchStatus()
+    .then(status => { aiSearchEnabled = status.enabled; return aiSearchEnabled })
+    .catch(() => { aiSearchEnabled = true; return true })
+  return aiSearchEnabledRequest
+}
 
 // v18.0 nav-merge §Spec-1: 6 tab → 3 tab；删 requiresAuth 标记（D2 锁定 3 tab 全可见）
 const L1_TABS: { key: L1View; label: string }[] = [
@@ -37,9 +50,10 @@ export interface TopBarProps {
    * any dashboard L1 tab look selected.
    */
   activeL1?: L1View | null
+  showSearch?: boolean
 }
 
-export function TopBar({ activeL1 }: TopBarProps = {}) {
+export function TopBar({ activeL1, showSearch = true }: TopBarProps = {}) {
   const l1 = useUIStore((s) => s.l1)
   const highlightedL1 = activeL1 === undefined ? l1 : activeL1
   const setL1 = useUIStore((s) => s.setL1)
@@ -83,8 +97,8 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
   }, [searchQuery])
 
   useEffect(() => {
-    if (searchExpanded) searchInputRef.current?.focus()
-  }, [searchExpanded])
+    if (showSearch && searchExpanded) searchInputRef.current?.focus()
+  }, [searchExpanded, showSearch])
 
   const handleSearch = useCallback((query: string) => {
     setLocalSearch(query)
@@ -116,7 +130,10 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
       data-v19-module="topbar"
     >
       <div
-        className="mx-auto grid min-h-[84px] max-w-[1440px] grid-cols-[1fr_auto] grid-rows-[48px_36px] items-center gap-x-3 px-4 sm:h-[52px] sm:min-h-0 sm:grid-cols-[minmax(150px,1fr)_auto_minmax(150px,1fr)] sm:grid-rows-1 sm:gap-3 sm:px-5"
+        className={cn(
+          'mx-auto grid min-h-[84px] max-w-[1440px] grid-cols-[1fr_auto] grid-rows-[48px_36px] items-center gap-x-2 px-3 min-[360px]:px-4 sm:h-[52px] sm:min-h-0 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:grid-rows-1 sm:gap-3 sm:px-5',
+          (!showSearch || !searchExpanded) && 'lg:grid-cols-[minmax(150px,1fr)_auto_minmax(150px,1fr)]',
+        )}
         data-testid="topbar-grid"
       >
         {/* Brand */}
@@ -132,7 +149,7 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
 
         {/* L1 Tabs */}
         <nav
-          className="col-span-2 row-start-2 flex h-full w-full items-center justify-center gap-8 justify-self-stretch border-t border-border/80 sm:col-span-1 sm:row-start-auto sm:h-auto sm:w-auto sm:justify-self-center sm:gap-1 sm:border-t-0"
+          className="col-span-2 row-start-2 flex h-full w-full items-center justify-center gap-8 justify-self-stretch border-t border-border/80 sm:col-span-1 sm:row-start-auto sm:h-auto sm:w-auto sm:justify-self-center sm:gap-0 sm:border-t-0 lg:gap-1"
           aria-label="主导航"
           data-testid="topbar-nav"
         >
@@ -156,14 +173,13 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
           ))}
         </nav>
 
-        <div className="col-start-2 row-start-1 flex items-center justify-self-end gap-2 sm:col-start-auto sm:row-start-auto">
-          {/* v24.0 §21.6: <640px 此前无任何搜索入口(功能缺口) — 补 icon 按钮,
-              点击后在 TopBar 下方展开输入行(见 header 尾部),复用同一套搜索状态/逻辑 */}
-          {!searchExpanded && (
+        <div className="col-start-2 row-start-1 flex items-center justify-self-end gap-0 sm:col-start-auto sm:row-start-auto sm:gap-2">
+          {/* Compact screens expand search below the bar to keep navigation and account controls clear. */}
+          {showSearch && !searchExpanded && (
             <button
               type="button"
               onClick={() => setSearchExpanded(true)}
-              className={cn(iconButtonClass, 'sm:hidden')}
+              className={cn(iconButtonClass, 'lg:hidden')}
               aria-label="搜索"
               title="搜索"
               data-testid="topbar-search-mobile-trigger"
@@ -173,9 +189,9 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
           )}
 
           {/* Search */}
-          <div
+          {showSearch && <div
             className={cn(
-              'hidden h-9 shrink-0 items-center overflow-hidden transition-[width,opacity] duration-300 ease-out sm:flex',
+              'hidden h-9 shrink-0 items-center overflow-hidden transition-[width,opacity] duration-300 ease-out lg:flex',
               searchExpanded ? 'w-[180px] md:w-[220px] lg:w-[260px]' : 'w-9',
             )}
             data-testid="topbar-search"
@@ -215,9 +231,11 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
                 <Search className="h-[19px] w-[19px]" strokeWidth={1.6} />
               </button>
             )}
-          </div>
+          </div>}
 
-          <div className="flex items-center gap-1.5">
+          <AiEntryButton query={localSearch} />
+
+          <div className="flex items-center gap-0 sm:gap-1.5">
             <SubmitPanel />
             <button
               type="button"
@@ -246,13 +264,14 @@ export function TopBar({ activeL1 }: TopBarProps = {}) {
 
           <span className="hidden h-5 w-px bg-border sm:block" aria-hidden="true" />
 
+          <ChangelogButton />
           <UserMenu />
         </div>
       </div>
 
-      {/* v24.0 §21.6: <640px 搜索展开行 — 与桌面同款下划线输入,只做入口不碰搜索语义 */}
-      {searchExpanded && (
-        <div className="border-t border-border/80 px-4 py-2 sm:hidden" data-testid="topbar-search-mobile">
+      {/* Search on screens below 1024px shares the existing query and server search semantics. */}
+      {showSearch && searchExpanded && (
+        <div className="border-t border-border/80 px-4 py-2 lg:hidden" data-testid="topbar-search-mobile">
           <div className="flex h-9 w-full items-center border-b-2 border-[var(--brand-border)] text-foreground transition-colors focus-within:border-[var(--brand)]">
             <Search className="h-[18px] w-[18px] shrink-0 text-muted-foreground" strokeWidth={1.6} />
             <input
@@ -462,4 +481,26 @@ function UserMenu() {
 function useClusterModalOpen(): boolean {
   const modalState = useClusterDetailStore((s) => s.modalState)
   return modalState === 'open' || modalState === 'loading'
+}
+
+function AiEntryButton({ query }: { query: string }) {
+  const unavailable = useAiSearchStore((s) => s.unavailable)
+  const [enabled, setEnabled] = useState(aiSearchEnabled)
+  useEffect(() => {
+    let active = true
+    void loadAiSearchEnabled().then(value => { if (active) setEnabled(value) })
+    return () => { active = false }
+  }, [])
+  if (enabled === false || unavailable) return null
+  return (
+    <button
+      type="button"
+      aria-label="AI 搜索"
+      data-testid="topbar-ai-entry"
+      disabled={enabled === null}
+      style={{ visibility: enabled === null ? 'hidden' : undefined }}
+      onClick={() => { window.location.hash = 'ai-search' + (query.trim() ? '?q=' + encodeURIComponent(query.trim()) : '') }}
+      className="relative order-[var(--ai-entry-order)] min-h-11 min-w-11 font-brand text-[length:var(--ai-entry-size)] font-[number:var(--ai-entry-weight)] tracking-[.02em] text-[var(--ai-entry-color)] after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-[var(--brand)] after:opacity-0 hover:after:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-border)]"
+    >AI</button>
+  )
 }

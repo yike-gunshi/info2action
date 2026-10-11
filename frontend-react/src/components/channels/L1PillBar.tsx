@@ -21,6 +21,7 @@ export interface L1PillBarProps {
   sectionKey?: string
   /** {l1_id: count} from feedStore.platformCategoryCounts[platform] */
   categoryCounts: Record<string, number>
+  countsAvailable?: boolean
   /** L1 id → 显示名 map (来自 classification.categories[].id/name) */
   categoryLabels: Record<string, string>
   /**
@@ -41,6 +42,7 @@ export function L1PillBar({
   platform,
   sectionKey = platform,
   categoryCounts,
+  countsAvailable = true,
   categoryLabels,
   categoryOrder,
   selectedCategory,
@@ -51,7 +53,9 @@ export function L1PillBar({
   // 用户决策：所有遵守 L1 分类的频道 pill 排序应跟推荐页一致，避免心智跳跃
   // BF-0512-6: 「未分类」pill 强制排在最末（不参与 categoryOrder）
   const sortedCategories = useMemo(() => {
-    const nonEmpty = Object.entries(categoryCounts).filter(([, count]) => count > 0)
+    const nonEmpty: Array<[string, number]> = countsAvailable
+      ? Object.entries(categoryCounts).filter(([, count]) => count > 0)
+      : Array.from(new Set([...(categoryOrder ?? Object.keys(categoryLabels)), ...(selectedCategory ? [selectedCategory] : [])])).map((id) => [id, 0])
     // BF-0512-6: 拆出 「未分类」单独处理，保证它永远在最末
     const uncategorized = nonEmpty.filter(([id]) => id === UNCATEGORIZED_SENTINEL)
     const regular = nonEmpty.filter(([id]) => id !== UNCATEGORIZED_SENTINEL)
@@ -71,7 +75,7 @@ export function L1PillBar({
       })
     }
     return [...sortedRegular, ...uncategorized]
-  }, [categoryCounts, categoryOrder])
+  }, [categoryCounts, categoryOrder, categoryLabels, countsAvailable, selectedCategory])
 
   // 只有「全部」一个 pill 时不渲染(没有过滤选择)
   if (sortedCategories.length === 0) return null
@@ -89,7 +93,7 @@ export function L1PillBar({
           return {
             key: id,
             label,
-            title: isUncategorized
+            title: !countsAvailable ? undefined : isUncategorized
               ? `${count} 条历史 item 还没跑 AI 分类（含 v4.0+ 之前 / enrich 失败的）。可在「全部」pill 看到。`
               : `${count} 条`,
           }

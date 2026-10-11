@@ -12,6 +12,7 @@ import type { ClusterSource, FeedItem } from '../../lib/types'
 import { fetchFeedItem } from '../../lib/api'
 import { platformName, platformClass, cn } from '../../lib/utils'
 import { renderMarkdownInline } from '../../lib/markdown-lite'
+import { formatReadingDateTime } from '../reading/readingUtils'
 import { ItemLeftPanel } from '../item/ItemLeftPanel'
 
 interface ClusterLeftPanelProps {
@@ -197,12 +198,7 @@ export function ClusterLeftPanel({ sources }: ClusterLeftPanelProps) {
                   <div className="mt-1.5 flex items-center gap-2 text-[12px] text-warm-500">
                     {src.published_at && (
                       <time>
-                        {new Date(src.published_at).toLocaleString('zh-CN', {
-                          month: '2-digit',
-                          day: '2-digit',
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
+                        {formatReadingDateTime(src.published_at)}
                       </time>
                     )}
                     {src.author && (

@@ -1,0 +1,200 @@
+@property --ai-colfade-t { syntax: '<length>'; inherits: false; initial-value: 0px; }
+@property --ai-colfade-b { syntax: '<length>'; inherits: false; initial-value: 0px; }
+@keyframes ai-colfade-t { from { --ai-colfade-t: 0px; } to { --ai-colfade-t: var(--ai-col-fade-t); } }
+@keyframes ai-colfade-b { from { --ai-colfade-b: var(--ai-col-fade-b); } to { --ai-colfade-b: 0px; } }
+
+.ai-search-cards {
+  --scrollbar-hide-ms: var(--ai-sb-hide-ms);
+  min-width: 0;
+  overflow-anchor: none;
+  padding: var(--ai-mob-pad-t) var(--ai-mob-pad-x) var(--ai-mob-col-pb);
+}
+
+.ai-citation-card {
+  display: flex;
+  gap: var(--ai-card-thumb-gap);
+  width: 100%;
+  margin: 0 0 var(--ai-card-gap);
+  padding: var(--ai-card-pad);
+  border: var(--ai-card-border-w) solid var(--ai-card-border);
+  border-radius: var(--ai-card-radius);
+  background: var(--ai-card-bg);
+  color: var(--foreground);
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  outline: var(--ai-highlight-w) solid transparent;
+  transition: outline-color var(--ai-outline-ms), border-color .15s;
+}
+
+.ai-citation-card:hover,
+.ai-citation-card:focus-visible {
+  border-color: var(--ai-card-hover-border);
+}
+
+.ai-citation-card:focus-visible {
+  outline-color: var(--ai-highlight);
+}
+
+.ai-citation-card-highlighted {
+  animation: ai-citation-pulse var(--ai-highlight-ms) ease-out 1;
+}
+
+/* Fill only, no outline. The column scrolls vertically, which makes its
+   overflow-x compute to auto, and an outline drawn outside the border box gets
+   clipped left and right — leaving just two stray horizontal bars. Filling the
+   card avoids that geometry entirely and reads better peripherally anyway
+   (user feedback 2026-09-22). */
+@keyframes ai-citation-pulse {
+  from {
+    background-color: var(--ai-highlight-pulse-bg);
+  }
+  to {
+    background-color: var(--ai-card-bg);
+  }
+}
+
+.ai-citation-card-thumbnail {
+  /* The saved workbench uses the source line plus clamped title height. */
+  width: var(--ai-card-thumb-auto);
+  height: var(--ai-card-thumb-auto);
+  border-radius: var(--ai-card-thumb-radius);
+  flex: none;
+  object-fit: cover;
+  object-position: center;
+}
+
+.ai-citation-card-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.ai-citation-card-skeleton {
+  cursor: default; /* fixed: 加载卡片不能点击 */
+  transition: none; /* fixed: 骨架不响应悬停 */
+}
+.ai-citation-card-skeleton:hover { border-color: var(--ai-card-border); }
+.ai-citation-skeleton-source {
+  height: calc(var(--ai-card-src-size) * 1.5); /* fixed: 沿用来源行的既有行高 */
+  display: flex; /* fixed: 短条在来源行内垂直居中 */
+  align-items: center; /* fixed: 与真实来源文字居中对齐 */
+}
+.ai-citation-skeleton-source > span {
+  width: 40%; /* fixed: 模拟较短的来源行 */
+  height: var(--ai-card-src-size);
+}
+.ai-citation-skeleton-title {
+  margin-top: var(--ai-card-title-mt);
+}
+.ai-citation-skeleton-title > span {
+  height: var(--ai-card-title-size);
+  margin-bottom: calc(var(--ai-card-title-size) * (var(--ai-card-title-lh) - 1)); /* fixed: 每条占一行标题高度 */
+}
+.ai-citation-skeleton-title > span:last-child { width: 75%; /* fixed: 模拟第二行短标题 */ }
+.ai-citation-skeleton-bar {
+  display: block; /* fixed: 无文字骨架条 */
+  border-radius: var(--ai-sk-bar-radius);
+  background: var(--ai-skeleton);
+}
+
+.ai-citation-card-source {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--ai-card-src-gap);
+  font-family: var(--mono);
+  font-size: var(--ai-card-src-size);
+  color: var(--ai-card-src-color);
+  white-space: nowrap;
+}
+
+.ai-citation-card-origin {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ai-citation-card-source time {
+  flex: none;
+}
+
+.ai-citation-card-source b {
+  color: var(--ai-card-num-color);
+  font-weight: 500;
+  margin-right: var(--ai-card-num-gap);
+}
+
+.ai-citation-card-title {
+  display: -webkit-box;
+  overflow: hidden;
+  margin-top: var(--ai-card-title-mt);
+  font-family: var(--serif);
+  font-size: var(--ai-card-title-size);
+  line-height: var(--ai-card-title-lh);
+  font-weight: var(--ai-card-title-weight);
+  -webkit-line-clamp: var(--ai-card-title-lines);
+  -webkit-box-orient: vertical;
+}
+
+.ai-citation-card[data-read='true'] .ai-citation-card-title {
+  color: var(--muted-foreground);
+}
+
+.ai-citation-card[data-read='true'] .ai-citation-card-thumbnail {
+  filter: saturate(.6);
+  opacity: .85;
+}
+
+@media (min-width: 1024px) {
+  .ai-search-cards {
+    position: static;
+    /* 同正文：向右伸出滚动条通道，卡片宽仍是 --ai-col-w，整组居中不受影响。 */
+    flex: 0 0 calc(var(--ai-col-w) + var(--ai-sb-gutter));
+    width: calc(var(--ai-col-w) + var(--ai-sb-gutter));
+    margin-right: calc(-1 * var(--ai-sb-gutter));
+    overflow-y: auto;
+    scrollbar-width: thin; /* fixed: 原生细滚动条保持占位，显示与隐藏不改变布局 */
+    scrollbar-color: transparent transparent; /* fixed: 静止时隐藏原生滑块与轨道 */
+    overscroll-behavior: contain;
+    /* 顶部留白放在容器外（用户 2026-10-09 选乙）：滚动容器与正文同从 y=84 起，
+       两根滚动条顶边对齐，内容滚出时都在离顶栏一段距离处收住。 */
+    margin-top: var(--ai-col-pt);
+    padding: 0 max(0px, calc(var(--ai-sb-gutter) - var(--scrollbar-actual, 0px))) var(--ai-col-pb) 0;
+  }
+
+  /* 上下渐隐（设计 s.col-fade-t / s.col-fade-b）：卡片滚出顶边或底边时淡出；
+     滚到顶时顶部遮罩收回、滚到底时底部收回，首末卡完整可见。 */
+  .ai-search-cards {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--ai-colfade-t), #000 calc(100% - var(--ai-colfade-b)), transparent 100%); /* fixed: 遮罩不透明端，非颜色 */
+    mask-image: linear-gradient(to bottom, transparent 0, #000 var(--ai-colfade-t), #000 calc(100% - var(--ai-colfade-b)), transparent 100%); /* fixed: 同上 */
+  }
+  @supports (animation-timeline: scroll()) {
+    .ai-search-cards {
+      animation: ai-colfade-t linear both, ai-colfade-b linear both;
+      animation-timeline: scroll(self), scroll(self);
+      animation-range: 0 var(--ai-col-fade-t), calc(100% - var(--ai-col-fade-b)) 100%;
+    }
+  }
+  @supports not (animation-timeline: scroll()) {
+    .ai-search-cards { --ai-colfade-t: var(--ai-col-fade-t); --ai-colfade-b: var(--ai-col-fade-b); }
+  }
+
+  .ai-search-cards[data-scrollbar='on'] {
+    scrollbar-color: var(--ai-sb-thumb) transparent; /* fixed: 轨道始终透明 */
+  }
+  .ai-search-cards::-webkit-scrollbar { width: var(--ai-sb-w); }
+  .ai-search-cards::-webkit-scrollbar-thumb {
+    background-color: transparent; /* fixed: Safari 静止时隐藏原生滑块 */
+    border-radius: calc(var(--ai-sb-w) / 2);
+  }
+  .ai-search-cards[data-scrollbar='on']::-webkit-scrollbar-thumb { background-color: var(--ai-sb-thumb); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-citation-card {
+    transition: none;
+  }
+
+  .ai-citation-card-highlighted {
+    animation: none;
+    outline-color: var(--ai-highlight);
+  }
+}

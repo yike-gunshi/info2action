@@ -1,5 +1,6 @@
-import type { DailyDigestsResponse, FeedItem, StatsResponse, HealthStatus, ClassificationConfig, InfoReadModelCursor } from '../types'
+import type { DailyDigestsResponse, FeedItem, StatsResponse, HealthStatus, ClassificationConfig, InfoReadModelCursor, InfoFeedCursor } from '../types'
 import { apiFetch } from './_client'
+import { searchFetch, type SearchRequest } from './_search'
 
 // ── Feed ──
 
@@ -106,9 +107,10 @@ export async function setItemStatus(itemId: string, action: 'clicked' | 'starred
 
 // ── Feed (pre-grouped) ──
 
-export async function fetchFeedSections(params?: { search?: string }): Promise<{
+export async function fetchFeedSections(params?: { search?: string; request?: SearchRequest }): Promise<{
   sections: Record<string, FeedItem[]>
-  total: number
+  total: number | null
+  counts_available?: boolean
   cat_counts?: Record<string, number>
   read_model_version_id?: string | null
   section_next_cursors?: Record<string, InfoReadModelCursor | null>
@@ -119,7 +121,8 @@ export async function fetchFeedSections(params?: { search?: string }): Promise<{
   const qs = new URLSearchParams()
   if (params?.search) qs.set('search', params.search)
   const query = qs.toString()
-  return apiFetch(`/api/feed/sections${query ? `?${query}` : ''}`)
+  const url = `/api/feed/sections${query ? `?${query}` : ''}`
+  return params?.search ? searchFetch(url, undefined, params.request) : apiFetch(url)
 }
 
 export async function fetchFeedSectionMore(
@@ -133,7 +136,7 @@ export async function fetchFeedSectionMore(
 ): Promise<{
   items: FeedItem[]
   category: string
-  total?: number
+  total?: number | null
   offset?: number
   limit?: number
   has_more?: boolean
@@ -152,40 +155,46 @@ export async function fetchFeedSectionMore(
   if (cursor?.version_id && cursor.scope_key && cursor.rank_after != null) {
     qs.set('cursor', JSON.stringify(cursor))
   }
-  return apiFetch(`/api/feed/sections/more?${qs}`)
+  return search ? searchFetch(`/api/feed/sections/more?${qs}`) : apiFetch(`/api/feed/sections/more?${qs}`)
 }
 
-export async function fetchFeedPlatforms(params?: { search?: string }): Promise<{
+export async function fetchFeedPlatforms(params?: { search?: string; force?: boolean; request?: SearchRequest }): Promise<{
   sections: Record<string, FeedItem[]>
+  counts_available?: boolean
   platform_counts: Record<string, number>
   source_counts: Record<string, Record<string, number>>
   /** v16.0 W3.T7: 每 platform 的 L1 分布 {l1_id: count}, 仅在 GitHub/Reddit/RSS/HN/WayToAGI/Manual 等以 L1 维度 pill 的 section 使用 */
   category_counts?: Record<string, Record<string, number>>
   overview_generated_at?: string
+  counts_generated_at?: string | null
+  stale?: boolean
   overview_max_fetched_at?: string | null
   sample_limit?: number | null
   read_model_version_id?: string | null
-  platform_next_cursors?: Record<string, InfoReadModelCursor | null>
+  platform_next_cursors?: Record<string, InfoFeedCursor | null>
   degraded?: boolean
   fallback_reason?: string | null
   degraded_reason?: string | null
 }> {
   const qs = new URLSearchParams()
   if (params?.search) qs.set('search', params.search)
-  const query = qs.toString()
-  return apiFetch(`/api/feed/platforms${query ? `?${query}` : ''}`)
+  if (params?.force) qs.set('refresh', '1')
+  const platformQuery = qs.toString()
+  const url = `/api/feed/platforms${platformQuery ? `?${platformQuery}` : ''}`
+  const options = params?.force ? { cache: 'reload' as const } : undefined
+  return params?.search ? searchFetch(url, options, params.request) : apiFetch(url, options)
 }
 
-export async function fetchFeedPlatformMore(platform: string, offset: number, limit = 50, source?: string, group?: string, category?: string, search?: string, excludeIds?: string[], cursor?: InfoReadModelCursor | null): Promise<{
+export async function fetchFeedPlatformMore(platform: string, offset: number, limit = 50, source?: string, group?: string, category?: string, search?: string, excludeIds?: string[], cursor?: InfoFeedCursor | null): Promise<{
   items: FeedItem[]
   platform: string
   category?: string | null
-  total?: number
+  total?: number | null
   offset?: number
   limit?: number
   has_more?: boolean
   next_offset?: number | null
-  next_cursor?: InfoReadModelCursor | null
+  next_cursor?: InfoFeedCursor | null
   read_model_version_id?: string | null
   scope_key?: string | null
   degraded?: boolean
@@ -198,10 +207,11 @@ export async function fetchFeedPlatformMore(platform: string, offset: number, li
   if (category) qs.set('category', category)
   if (search) qs.set('search', search)
   if (excludeIds?.length) qs.set('exclude_ids', excludeIds.slice(0, 200).join(','))
-  if (cursor?.version_id && cursor.scope_key && cursor.rank_after != null) {
+  if (cursor && (('kind' in cursor && cursor.kind === 'live' && cursor.v === 1 && cursor.scope_key && cursor.after.id)
+    || ('version_id' in cursor && cursor.version_id && cursor.scope_key && cursor.rank_after != null))) {
     qs.set('cursor', JSON.stringify(cursor))
   }
-  return apiFetch(`/api/feed/platforms/more?${qs}`)
+  return search ? searchFetch(`/api/feed/platforms/more?${qs}`) : apiFetch(`/api/feed/platforms/more?${qs}`)
 }
 
 /** BF-0419-10/11: 拿公众号订阅分组列表 + 每组 item 数 + 未分组桶 */

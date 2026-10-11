@@ -24,6 +24,7 @@ function makeItem(overrides: Partial<FeedItem> = {}): FeedItem {
 describe('feedStore.serverSearch remote performance behavior', () => {
   beforeEach(() => {
     vi.useFakeTimers()
+    useFeedStore.getState().clearSearch()
     vi.mocked(fetchFeedSections).mockReset()
     vi.mocked(fetchFeedPlatforms).mockReset()
     useFeedStore.setState({
@@ -142,7 +143,7 @@ describe('feedStore.serverSearch remote performance behavior', () => {
     expect(state.searchPlatformSectionItems).toBeNull()
   })
 
-  it('keeps prior search data instead of publishing fake zero when section search returns degraded', async () => {
+  it('does not label old keyword results as matches for a failed new query', async () => {
     const previous = makeItem({ id: 'previous-doc' })
     useFeedStore.setState({
       searchResults: new Map([['products', [previous]]]),
@@ -165,9 +166,9 @@ describe('feedStore.serverSearch remote performance behavior', () => {
     const state = useFeedStore.getState()
     expect(state.isSearching).toBe(false)
     expect(state.searchPlatformLoading).toBe(false)
-    expect(state.searchResults?.get('products')?.[0]?.id).toBe('previous-doc')
-    expect(state.searchTotal).toBe(9)
-    expect(state.searchCatCounts).toEqual({ products: 9 })
+    expect(state.searchResults?.size).toBe(0)
+    expect(state.searchTotal).toBeNull()
+    expect(state.searchCatCounts).toEqual({})
     expect(state.searchPlatformSectionItems).toBeNull()
     expect(fetchFeedPlatforms).not.toHaveBeenCalled()
   })
@@ -238,5 +239,40 @@ describe('feedStore.serverSearch remote performance behavior', () => {
     const state = useFeedStore.getState()
     expect(state.platformSectionsLoaded).toBe(false)
     expect(state.platformSectionItems.size).toBe(0)
+  })
+})
+
+describe('bounded search recovery', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    useFeedStore.getState().clearSearch()
+    vi.mocked(fetchFeedSections).mockReset()
+    vi.mocked(fetchFeedPlatforms).mockReset()
+  })
+  afterEach(() => { useFeedStore.getState().clearSearch(); vi.useRealTimers() })
+
+  it('preserves matching cards when retrying the same failed keyword', async () => {
+    const item = makeItem({ id: 'matching-design' })
+    vi.mocked(fetchFeedSections).mockResolvedValueOnce({ sections: { products: [item] }, total: 9, cat_counts: { products: 9 } })
+    vi.mocked(fetchFeedPlatforms).mockResolvedValue({ sections: {}, platform_counts: {}, source_counts: {} })
+    useFeedStore.getState().serverSearch('设计')
+    await vi.advanceTimersByTimeAsync(310)
+    vi.mocked(fetchFeedSections).mockRejectedValueOnce(new Error('搜索繁忙，请稍后重试'))
+    useFeedStore.getState().serverSearch('设计')
+    await vi.advanceTimersByTimeAsync(310)
+    const state = useFeedStore.getState()
+    expect(state.searchResults?.get('products')?.[0].id).toBe('matching-design')
+    expect(state.searchTotal).toBe(9)
+    expect(state.searchError).toBe('搜索繁忙，请稍后重试')
+  })
+
+  it('keeps unknown counts explicit while publishing matching cards', async () => {
+    vi.mocked(fetchFeedSections).mockResolvedValue({ sections: { products: [makeItem()] }, total: null, cat_counts: {}, counts_available: false })
+    vi.mocked(fetchFeedPlatforms).mockRejectedValue(new Error('来源搜索超时，请重试'))
+    useFeedStore.getState().serverSearch('设计')
+    await vi.advanceTimersByTimeAsync(310)
+    expect(useFeedStore.getState().searchTotal).toBeNull()
+    expect(useFeedStore.getState().searchCountsAvailable).toBe(false)
+    expect(useFeedStore.getState().searchPlatformError).toBe('来源搜索超时，请重试')
   })
 })

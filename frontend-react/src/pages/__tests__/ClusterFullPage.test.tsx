@@ -167,6 +167,10 @@ describe('ClusterFullPage', () => {
     expect(kicker.className).toContain('text-[12px]')
     expect(kicker).toHaveTextContent('2 个来源')
     expect(kicker).toHaveTextContent('5 条报道')
+    expect(kicker).toHaveTextContent(/2026-\d{2}-\d{2} \d{2}:\d{2}/)
+
+    const sourceTimes = screen.getAllByText(/2026-\d{2}-\d{2} \d{2}:\d{2}/)
+    expect(sourceTimes.length).toBeGreaterThanOrEqual(3)
 
     const heading = screen.getByRole('heading', { level: 1 })
     expect(heading).toHaveTextContent('本周 HN 热文')
@@ -190,8 +194,8 @@ describe('ClusterFullPage', () => {
       'lg:h-[calc(100dvh-104px)]',
       'lg:overflow-hidden',
     )
-    expect(screen.getByTestId('cluster-source-scroll')).toHaveClass('event-detail-scrollbar', 'lg:overflow-y-auto')
-    expect(screen.getByTestId('cluster-summary-scroll')).toHaveClass('event-detail-scrollbar', 'lg:overflow-y-auto', 'lg:border-l', 'lg:border-dashed')
+    expect(screen.getByTestId('cluster-source-scroll')).toHaveClass('reading-page-scroll', 'reading-page-scroll-left', 'lg:overflow-y-auto')
+    expect(screen.getByTestId('cluster-summary-scroll')).toHaveClass('reading-page-scroll', 'reading-page-scroll-right', 'lg:overflow-y-auto', 'lg:border-l', 'lg:border-dashed')
     expect(screen.getByRole('complementary')).toHaveClass('h-full')
   })
 
@@ -231,8 +235,8 @@ describe('ClusterFullPage', () => {
       'lg:h-[calc(100dvh-104px)]',
       'lg:overflow-hidden',
     )
-    expect(screen.getByTestId('cluster-source-scroll')).toHaveClass('event-detail-scrollbar', 'lg:overflow-y-auto')
-    expect(screen.getByTestId('cluster-summary-scroll')).toHaveClass('event-detail-scrollbar', 'lg:overflow-y-auto')
+    expect(screen.getByTestId('cluster-source-scroll')).toHaveClass('reading-page-scroll', 'reading-page-scroll-left', 'lg:overflow-y-auto')
+    expect(screen.getByTestId('cluster-summary-scroll')).toHaveClass('reading-page-scroll', 'reading-page-scroll-right', 'lg:overflow-y-auto')
     expect(screen.getByRole('complementary')).toHaveClass('h-full')
   })
 

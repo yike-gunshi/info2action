@@ -88,7 +88,7 @@ def refresh_info_pill_counts() -> dict[str, Any]:
     模块表头的「N 条」按产品决策要显示全保留期(90 天)总量。这里在
     post-fetch 一次性 GROUP BY 出快照落表,读路径只查小表——绝不在请求时
     对大表实时 count(count(*) 是本库的经典性能陷阱)。
-    当前只算 section_category(信息默认页表头);其余 pill 维度按需扩展。
+    来源计数同时保存公开、各用户增量和管理员口径,读请求只读小表。
     """
     if not remote_authority_enabled():
         return {"ok": True, "skipped": "not_remote"}
@@ -135,9 +135,79 @@ def refresh_info_pill_counts() -> dict[str, Any]:
                         AND pc.value NOT IN (SELECT value FROM upserted)""",
                 params,
             )
-            _commit_safely(conn)
+            # One batch timestamp and transaction: failed source aggregation must
+            # not publish half a snapshot or erase the previous successful batch.
+            source_min_stars = _source_display_min_stars()
+            source_where, source_params = _base_item_where(
+                min_github_stars=source_min_stars,
+            )
+            source_where.append("i.visible = 1")
+            source_where.append("i.fetched_at >= now() - interval '90 days'")
+            _add_ai_relevance_filter(source_where)
+            source_params["stars"] = str(source_min_stars)
+            source_params["uncategorized"] = UNCATEGORIZED_SENTINEL
+            conn.execute(
+                f"""WITH eligible AS MATERIALIZED (
+                       SELECT i.id, i.platform, i.source, i.user_id,
+                              i.ai_categories, i.ai_category
+                         FROM {schema}.items i {_where_sql(source_where)}
+                     ), audiences AS MATERIALIZED (
+                       SELECT 'public'::text AS audience, e.* FROM eligible e
+                        WHERE e.platform != 'manual' AND e.user_id IS NULL
+                       UNION ALL
+                       SELECT 'user:' || e.user_id::text, e.* FROM eligible e
+                        WHERE e.user_id IS NOT NULL
+                       UNION ALL
+                       SELECT 'admin', e.* FROM eligible e
+                     ), category_tags AS (
+                       SELECT DISTINCT a.audience, a.platform, a.id, cat.value AS category
+                         FROM audiences a
+                         CROSS JOIN LATERAL jsonb_array_elements_text(
+                           CASE WHEN jsonb_typeof(a.ai_categories) = 'array'
+                                THEN a.ai_categories ELSE '[]'::jsonb END
+                         ) cat(value)
+                       UNION ALL
+                       SELECT a.audience, a.platform, a.id,
+                              %(uncategorized)s
+                         FROM audiences a WHERE a.ai_categories IS NULL
+                     ), counts AS (
+                       SELECT 'platform:' || %(stars)s AS kind,
+                              jsonb_build_array(audience, platform)::text AS value,
+                              count(*)::integer AS n FROM audiences GROUP BY audience, platform
+                       UNION ALL
+                       SELECT 'platform_source:' || %(stars)s,
+                              jsonb_build_array(audience, platform, coalesce(source, ''))::text,
+                              count(*)::integer FROM audiences GROUP BY audience, platform, source
+                       UNION ALL
+                       SELECT 'platform_category:' || %(stars)s,
+                              jsonb_build_array(audience, platform, category)::text,
+                              count(*)::integer FROM category_tags GROUP BY audience, platform, category
+                       UNION ALL SELECT 'platform_meta', %(stars)s, 1
+                     ), upserted AS (
+                       INSERT INTO {schema}.info_pill_counts(kind, value, n, computed_at)
+                       SELECT kind, value, n, now() FROM counts
+                       ON CONFLICT(kind, value) DO UPDATE SET n = excluded.n,
+                         computed_at = excluded.computed_at
+                       RETURNING kind, value
+                     )
+                     DELETE FROM {schema}.info_pill_counts pc
+                      WHERE pc.kind IN ('platform:' || %(stars)s,
+                        'platform_source:' || %(stars)s, 'platform_category:' || %(stars)s)
+                        AND NOT EXISTS (SELECT 1 FROM upserted u
+                                         WHERE u.kind = pc.kind AND u.value = pc.value)""",
+                source_params,
+            )
+            conn.commit()
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200], "elapsed_ms": int((time.time() - t0) * 1000)}
+    # Counts may be refreshed without platform prewarm (notably no-op micro
+    # fetches). Evict source responses/counts only after the batch commits;
+    # preserve type-page caches and the 24-hour successful fallback.
+    with _CACHE_LOCK:
+        for prefix in ("feed_platforms_result", "feed_platform_page_count"):
+            for key in list(_CACHE_TOKEN_INDEX.get(prefix, ())):
+                if isinstance(key, tuple) and key and key[0] == prefix:
+                    _cache_remove_locked(key)
     return {"ok": True, "elapsed_ms": int((time.time() - t0) * 1000)}
 
 
@@ -152,6 +222,12 @@ def _info_pill_counts_overlay(conn: Any, schema: str, kind: str) -> dict[str, in
         _rollback_safely(conn)
         return {}
     return {str(r["value"]): int(r["n"]) for r in (dict(row) for row in rows) if r.get("value")}
+
+
+def _source_display_min_stars() -> int:
+    # Share the exact route display policy; type read-model policy remains 50.
+    from db import github_min_stars_for_display
+    return github_min_stars_for_display(INFO_READ_MODEL_MIN_GITHUB_STARS)
 
 
 def _info_read_model_freshness(
@@ -1763,6 +1839,9 @@ def _remote_feed_live_circuit_open() -> bool:
 
 
 def _mark_remote_feed_live_circuit_open() -> None:
+    budget = current_search.get()
+    if budget is not None and budget.reason:
+        return
     global _REMOTE_FEED_LIVE_CIRCUIT_OPEN_UNTIL
     hold_sec = _env_int(_runtime_env(), REMOTE_FEED_LIVE_CIRCUIT_SEC_ENV, 60, min_value=1)
     with _REMOTE_FEED_LIVE_CIRCUIT_LOCK:
@@ -3274,6 +3353,8 @@ def query_feed(
                 offset=offset,
                 status_user_id=user_id,
             )
+    except (SearchBusy, SearchExpired):
+        raise
     except Exception as exc:
         if search:
             # BF-0704-6: 搜索失败只降级搜索本身,不熔断整个 feed live 读
@@ -3750,7 +3831,10 @@ def query_feed_sections(
         try:
             with connect() as conn:
                 live_conn = conn
-                _set_short_statement_timeout(conn, _remote_feed_live_timeout_ms())
+                _set_short_statement_timeout(
+                    conn,
+                    _remote_feed_search_timeout_ms() if search else _remote_feed_live_timeout_ms(),
+                )
                 item_params = dict(params)
                 status_join, status_params, status_alias = _item_status_join(schema, user_id)
                 item_params.update(status_params)
@@ -3785,11 +3869,14 @@ def query_feed_sections(
                     raw = dict(row)
                     category = raw.get("section_category") or "_uncategorized"
                     sections.setdefault(category, []).append(_normalize_item(raw))
-                cat_counts = _section_counts_from_items(conn, schema, where, params, category_expr)
+                cat_counts = {}
+                with optional_search_count(conn, bool(search)) as count_state:
+                    cat_counts = _section_counts_from_items(conn, schema, where, params, category_expr)
                 result = {
                     "sections": sections,
-                    "total": sum(cat_counts.values()),
+                    "total": sum(cat_counts.values()) if count_state['available'] else None,
                     "cat_counts": cat_counts,
+                    **({'counts_available': count_state['available']} if search else {}),
                     "personalized": False,
                     "data_backend": feed_read_backend(),
                     "overview_generated_at": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -3804,11 +3891,13 @@ def query_feed_sections(
                         ),
                         result,
                     )
+        except (SearchBusy, SearchExpired):
+            raise
         except Exception:
             if live_conn is not None:
                 _rollback_safely(live_conn)
             raise RemoteDBError("sections live path failed")
-        return _cache_set_copy(result_cache_key, result)
+        return result if result.get('counts_available') is False else _cache_set_copy(result_cache_key, result)
 
     try:
         return _singleflight_sync(result_cache_key, _compute)
@@ -3949,7 +4038,7 @@ def query_feed_by_category(
     )
     if live_blocked:
         return _degraded_feed_category_result(category)
-    live_timeout_ms = _remote_feed_live_timeout_ms()
+    live_timeout_ms = _remote_feed_search_timeout_ms() if search else _remote_feed_live_timeout_ms()
     if subcategory:
         # 子板块视图不再物化、只此一条路;热门子板块冷缓存 @> count 实测 ~4s,
         # 给独立更宽预算(请求级 30s 墙钟仍兜底),count 命中缓存后秒回
@@ -3961,7 +4050,7 @@ def query_feed_by_category(
         with connect() as conn:
             _set_short_statement_timeout(conn, live_timeout_ms)
             count = _cache_get(count_cache_key)
-            if count is None:
+            def fetch_count():
                 count_params = dict(params)
                 count_join, count_status_params, _ = _item_status_join(schema, user_id)
                 count_params.update(count_status_params)
@@ -3969,8 +4058,11 @@ def query_feed_by_category(
                     f"SELECT count(*) AS n FROM {schema}.items i {count_join} {_where_sql(where)}",
                     count_params,
                 ).fetchone()
-                count = int(total_row["n"] if total_row else 0)
-                _cache_set(count_cache_key, count)
+                value = int(total_row["n"] if total_row else 0)
+                _cache_set(count_cache_key, value)
+                return value
+            if count is None and not search:
+                count = fetch_count()
             items = _fetch_items(
                 conn,
                 schema,
@@ -3985,19 +4077,23 @@ def query_feed_by_category(
                 offset=safe_offset,
                 status_user_id=user_id,
             )
+            if count is None and search:
+                with optional_search_count(conn, True):
+                    count = fetch_count()
     except RemoteDBError:
         _mark_remote_feed_live_circuit_open()
         return _degraded_feed_category_result(category)
     return {
         "items": items,
         "category": category,
-        "total": int(count),
+        "total": int(count) if count is not None else None,
+        **({"counts_available": count is not None} if search else {}),
         "offset": safe_offset,
         "limit": safe_limit,
-        "has_more": safe_offset + len(items) < int(count),
+        "has_more": (safe_offset + len(items) < int(count) if count is not None else len(items) == safe_limit),
         "next_offset": (
             safe_offset + len(items)
-            if safe_offset + len(items) < int(count)
+            if (safe_offset + len(items) < int(count) if count is not None else len(items) == safe_limit)
             else None
         ),
         "data_backend": feed_read_backend(),
@@ -4232,8 +4328,11 @@ def _warm_platform_page_count_cache(
     user_id: str | None,
     min_github_stars: int,
 ) -> None:
+    entries = {}
+    def add(key, value):
+        entries[key] = value
     for platform, total in platform_counts.items():
-        _cache_set(
+        add(
             _platform_page_count_cache_key(
                 schema=schema,
                 platform=platform,
@@ -4247,7 +4346,7 @@ def _warm_platform_page_count_cache(
         )
     for platform, per_source in source_counts.items():
         for source, total in per_source.items():
-            _cache_set(
+            add(
                 _platform_page_count_cache_key(
                     schema=schema,
                     platform=platform,
@@ -4262,7 +4361,7 @@ def _warm_platform_page_count_cache(
             )
     for platform, per_category in category_counts.items():
         for category, total in per_category.items():
-            _cache_set(
+            add(
                 _platform_page_count_cache_key(
                     schema=schema,
                     platform=platform,
@@ -4275,6 +4374,7 @@ def _warm_platform_page_count_cache(
                 ),
                 int(total),
             )
+    _cache_set_many(entries)
 
 
 def _estimate_platform_page_total(*, offset: int, limit: int, item_count: int) -> int:
@@ -6494,6 +6594,193 @@ def _query_feed_by_platform_search_read_model(
     return result
 
 
+_SOURCE_PLATFORM_IDS = (
+    "twitter", "lingowhale", "waytoagi", "github", "reddit", "rss",
+    "hackernews", "manual", "bilibili", "xiaohongshu",
+)
+_PLATFORM_LIVE_ORDER = (
+    "ORDER BY COALESCE(i.published_at, i.fetched_at) DESC NULLS LAST, "
+    "i.fetched_at DESC NULLS LAST, i.relevance_score DESC NULLS LAST, i.id DESC"
+)
+
+
+def _platform_snapshot_counts(conn: Any, schema: str, *, public_only: bool,
+                              manual_owner_user_id: str | None,
+                              min_github_stars: int) -> dict[str, Any]:
+    stars = str(int(min_github_stars))
+    result = {"platform_counts": {}, "source_counts": {}, "category_counts": {},
+              "counts_generated_at": None}
+    try:
+        # A savepoint keeps an unavailable optional snapshot from rolling back
+        # the cards query or poisoning the caller's transaction.
+        conn.execute("SAVEPOINT source_counts")
+        rows = conn.execute(
+            f"SELECT kind, value, n, computed_at FROM {schema}.info_pill_counts "
+            "WHERE kind = ANY(%(kinds)s)",
+            {"kinds": ["platform_meta", f"platform:{stars}",
+                       f"platform_source:{stars}", f"platform_category:{stars}"]},
+        ).fetchall()
+        conn.execute("RELEASE SAVEPOINT source_counts")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT source_counts")
+            conn.execute("RELEASE SAVEPOINT source_counts")
+        except Exception:
+            _rollback_safely(conn)
+        return result
+    marker = next((dict(r) for r in rows if r.get("kind") == "platform_meta"
+                   and str(r.get("value")) == stars), None)
+    if marker is None:
+        return result
+    result["counts_generated_at"] = _timestamp_value(marker.get("computed_at"))
+    audiences = {"public"}
+    if not public_only:
+        audiences = ({"public", f"user:{manual_owner_user_id}"}
+                     if manual_owner_user_id else {"admin"})
+    for raw in rows:
+        row = dict(raw)
+        if row.get("kind") == "platform_meta":
+            continue
+        try:
+            keys = json.loads(row["value"])
+            audience, platform = keys[:2]
+            if audience not in audiences:
+                continue
+            n = int(row["n"])
+            if row["kind"] == f"platform:{stars}":
+                result["platform_counts"][platform] = result["platform_counts"].get(platform, 0) + n
+            else:
+                bucket = "source_counts" if row["kind"] == f"platform_source:{stars}" else "category_counts"
+                counts = result[bucket].setdefault(platform, {})
+                counts[keys[2]] = counts.get(keys[2], 0) + n
+        except (ValueError, TypeError, KeyError, IndexError):
+            # Corrupt snapshots are unavailable, never partially trusted totals.
+            return {"platform_counts": {}, "source_counts": {}, "category_counts": {},
+                    "counts_generated_at": None}
+    return result
+
+
+def _platform_live_scope(*, platform: str, source: str | None, group: str | None,
+                         category: str | None, search: str | None, user_id: str | None,
+                         public_only: bool, manual_owner_user_id: str | None,
+                         min_github_stars: int) -> str:
+    # A cursor never supplies permissions; these server-derived values bind it
+    # to the query and authenticated caller that created it.
+    import hashlib
+    values = [platform, source or "", group or "", category or "", search or "",
+              user_id or "", bool(public_only), manual_owner_user_id or "", int(min_github_stars)]
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()
+
+
+def _platform_live_cursor(item: dict[str, Any], scope_key: str) -> dict[str, Any]:
+    return {"kind": "live", "v": 1, "scope_key": scope_key, "after": {
+        "sort_at": _source_timestamp_value(item.get("published_at") or item.get("fetched_at")),
+        "fetched_at": _source_timestamp_value(item.get("fetched_at")),
+        "relevance_score": item.get("relevance_score"), "id": str(item["id"]),
+    }}
+
+
+def _source_timestamp_value(value: Any) -> str | None:
+    dt = parse_datetime(value)
+    return dt.isoformat().replace("+00:00", "Z") if dt is not None else None
+
+
+def _normalize_source_item(raw: dict[str, Any]) -> dict[str, Any]:
+    # General feed timestamps intentionally have second precision. Source
+    # keyset positions must retain PostgreSQL's complete timestamp precision.
+    item = _normalize_item(raw)
+    for key in ("published_at", "fetched_at"):
+        item[key] = _source_timestamp_value(raw.get(key))
+    return item
+
+
+def _validate_platform_live_cursor(cursor: dict[str, Any], scope_key: str) -> dict[str, Any]:
+    if cursor.get("kind") != "live" or cursor.get("v") != 1:
+        raise ValueError("invalid live cursor version")
+    if cursor.get("scope_key") != scope_key:
+        raise ValueError("live cursor scope does not match this request")
+    after = cursor.get("after")
+    if not isinstance(after, dict) or set(after) != {"sort_at", "fetched_at", "relevance_score", "id"}:
+        raise ValueError("invalid live cursor position")
+    if not isinstance(after["id"], str) or not after["id"].strip() or len(after["id"]) > 512:
+        raise ValueError("invalid live cursor id")
+    for key in ("sort_at", "fetched_at"):
+        value = after[key]
+        if value is not None and (not isinstance(value, str) or parse_datetime(value) is None):
+            raise ValueError("invalid live cursor timestamp")
+    score = after["relevance_score"]
+    if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score)):
+        raise ValueError("invalid live cursor score")
+    return after
+
+
+def _add_platform_live_after(where: list[str], params: dict[str, Any], after: dict[str, Any]) -> None:
+    # DESC NULLS LAST needs explicit null branches: a tuple comparison loses
+    # rows as soon as any preceding sort field is NULL.
+    fields = [("COALESCE(i.published_at, i.fetched_at)", "sort_at", "timestamptz"),
+              ("i.fetched_at", "fetched_at", "timestamptz"),
+              ("i.relevance_score", "relevance_score", "double precision"),
+              ("i.id", "id", "text")]
+    earlier_equal, branches = [], []
+    for expression, field, cast in fields:
+        value = after[field]
+        key = f"cursor_{field}"
+        params[key] = value
+        placeholder = f"%({key})s" + (f"::{cast}" if cast != "text" else "")
+        if value is not None:
+            lower = f"{expression} < {placeholder}"
+            if field != "id":
+                lower = f"({lower} OR {expression} IS NULL)"
+            branches.append("(" + " AND ".join(earlier_equal + [lower]) + ")")
+            earlier_equal.append(f"{expression} IS NOT DISTINCT FROM {placeholder}")
+        else:
+            earlier_equal.append(f"{expression} IS NULL")
+    where.append("(" + " OR ".join(branches) + ")")
+
+
+def _validated_platforms_fallback(fallback: Any, *, schema: str, where: list[str],
+                                  params: dict[str, Any], user_id: str | None) -> dict | None:
+    if not isinstance(fallback, dict) or fallback.get("degraded") or fallback.get("stale"):
+        return None
+    generated = parse_datetime(fallback.get("overview_generated_at"))
+    if generated is None or (datetime.now(timezone.utc) - generated).total_seconds() > 86400:
+        return None
+    sections = fallback.get("sections")
+    if not isinstance(sections, dict) or any(
+        not isinstance(items, list) or any(not isinstance(item, dict) or not item.get("id") for item in items)
+        for items in sections.values()
+    ):
+        return None
+    ids = [str(item.get("id")) for items in sections.values()
+           for item in items if item.get("id")]
+    if not ids or len(ids) > 2000:
+        return None
+    try:
+        with connect() as conn:
+            _set_short_statement_timeout(conn, _remote_feed_live_timeout_ms())
+            status_join, status_params, status_alias = _item_status_join(schema, user_id)
+            rows = conn.execute(
+                f"SELECT {_feed_cols(status_alias, include_heavy_json=False)} "
+                f"FROM {schema}.items i {status_join} "
+                f"{_where_sql(where + ['i.id = ANY(%(fallback_ids)s)'])} {_PLATFORM_LIVE_ORDER}",
+                {**params, **status_params, "fallback_ids": ids},
+            ).fetchall()
+            safe_rows = [_normalize_source_item(dict(row)) for row in rows]
+    except Exception:
+        return None
+    allowed = {str(item["id"]): item for item in safe_rows}
+    result = copy.deepcopy(fallback)
+    result["sections"] = {platform: [allowed[str(item["id"])] for item in items
+                                      if str(item["id"]) in allowed]
+                          for platform, items in fallback.get("sections", {}).items()}
+    # Cached totals cannot prove current visibility. Cards are rehydrated but
+    # totals are deliberately unknown until a current snapshot is available.
+    result.update(platform_counts={}, source_counts={}, category_counts={}, counts_generated_at=None,
+                  platform_next_cursors={}, stale=True, degraded=True,
+                  degraded_reason="platforms_last_success")
+    return result if any(result["sections"].values()) else None
+
+
 def query_feed_platforms(
     *,
     per_platform: int | None = 50,
@@ -6502,6 +6789,7 @@ def query_feed_platforms(
     public_only: bool = False,
     manual_owner_user_id: str | None = None,
     min_github_stars: int = 50,
+    force_refresh: bool = False,
 ) -> dict:
     """v18.0 nav-merge: 信息 tab 复用本函数；强制 AI 相关性过滤（D3）。
 
@@ -6517,6 +6805,8 @@ def query_feed_platforms(
     where.append("i.visible = 1")
     # v18.0 PRD §Spec-2: 强制 AI 相关性过滤（OR 双字段口径）
     _add_ai_relevance_filter(where)
+    if not search:
+        where.append("i.fetched_at >= now() - interval '90 days'")
     _add_search_filter(where, params, search)
     # BF-0515-singleflight: cache full /api/feed/platforms response (no result
     # cache existed before — every call ran 5 SQLs). Singleflight prevents N
@@ -6532,7 +6822,7 @@ def query_feed_platforms(
         manual_owner_user_id or "",
         int(min_github_stars),
     )
-    cached_result = _cache_get_copy_with_ttl(result_cache_key, result_cache_ttl)
+    cached_result = None if force_refresh else _cache_get_copy_with_ttl(result_cache_key, result_cache_ttl)
     if cached_result is not None:
         return cached_result
     if search:
@@ -6546,15 +6836,9 @@ def query_feed_platforms(
             min_github_stars=min_github_stars,
         )
     else:
-        read_model_result = _query_feed_platforms_read_model(
-            schema=schema,
-            per_platform=per_platform,
-            search=search,
-            user_id=user_id,
-            public_only=public_only,
-            manual_owner_user_id=manual_owner_user_id,
-            min_github_stars=min_github_stars,
-        )
+        # Source scopes are no longer materialized; the indexed live path is
+        # authoritative for source first paint and 90-day browsing.
+        read_model_result = None
     if read_model_result is not None:
         cache_ttl = _feed_result_cache_ttl(read_model_result)
         if cache_ttl > 0:
@@ -6573,21 +6857,24 @@ def query_feed_platforms(
         user_id=user_id,
         manual_owner_user_id=manual_owner_user_id,
     )
-    if _remote_feed_live_circuit_open():
-        if use_platforms_fast_path:
-            fallback = _read_local_read_cache(
-                _feed_platforms_local_cache_name(
-                    per_platform=per_platform,
-                    public_only=public_only,
-                    min_github_stars=min_github_stars,
-                )
-            )
-            if fallback is not None:
-                return _cache_set_copy(result_cache_key, fallback)
-        return _degraded_feed_platforms_result()
+    def _fallback() -> dict:
+        fallback = _cache_get_copy_with_ttl(("platforms_last_success", result_cache_key), 86400)
+        if fallback is None and use_platforms_fast_path and public_only:
+            fallback = _read_local_read_cache(_feed_platforms_local_cache_name(
+                per_platform=per_platform, public_only=True, min_github_stars=min_github_stars,
+            ), max_age_sec=86400)
+        validated = _validated_platforms_fallback(
+            fallback, schema=schema, where=where, params=params, user_id=user_id,
+        )
+        return validated or _degraded_feed_platforms_result()
+
+    if _remote_feed_live_circuit_open() and (
+        not force_refresh or _truthy(_runtime_env().get(REMOTE_FEED_LIVE_DISABLED_ENV))
+    ):
+        return _fallback()
 
     def _compute() -> dict:
-        cached_inside = _cache_get_copy_with_ttl(result_cache_key, result_cache_ttl)
+        cached_inside = None if force_refresh else _cache_get_copy_with_ttl(result_cache_key, result_cache_ttl)
         if cached_inside is not None:
             return cached_inside
         return _query_feed_platforms_uncached(
@@ -6607,21 +6894,87 @@ def query_feed_platforms(
         return _singleflight_sync(result_cache_key, _compute)
     except RemoteDBError:
         _mark_remote_feed_live_circuit_open()
-        if use_platforms_fast_path:
-            fallback = _read_local_read_cache(
-                _feed_platforms_local_cache_name(
-                    per_platform=per_platform,
-                    public_only=public_only,
-                    min_github_stars=min_github_stars,
-                )
-            )
-            if fallback is not None:
-                return _cache_set_copy(result_cache_key, fallback)
-            return _degraded_feed_platforms_result()
-        return _degraded_feed_platforms_result()
+        return _fallback()
 
 
 def _query_feed_platforms_uncached(
+    *, schema: str, per_platform: int | None, search: str | None,
+    user_id: str | None, public_only: bool, manual_owner_user_id: str | None,
+    min_github_stars: int, where: list[str], params: dict[str, Any],
+    result_cache_key: tuple[Any, ...],
+) -> dict:
+    if search or per_platform is None:
+        return _query_feed_platforms_legacy_uncached(
+            schema=schema, per_platform=per_platform, search=search, user_id=user_id,
+            public_only=public_only, manual_owner_user_id=manual_owner_user_id,
+            min_github_stars=min_github_stars, where=where, params=params,
+            result_cache_key=result_cache_key,
+        )
+    limit = max(1, min(int(per_platform), 100))
+    try:
+        with connect() as conn:
+            _set_short_statement_timeout(conn, _remote_feed_live_timeout_ms())
+            # Each lateral branch seeks one platform index and stops at N+1.
+            # Card/status hydration occurs only after candidate IDs are bounded.
+            status_join, status_params, status_alias = _item_status_join(schema, user_id)
+            rows = conn.execute(
+                f"""WITH candidates AS MATERIALIZED (
+                       SELECT page.id FROM unnest(%(platforms)s::text[]) p(platform)
+                       CROSS JOIN LATERAL (
+                         SELECT i.id FROM {schema}.items i
+                         {_where_sql(where + ['i.platform = p.platform'])}
+                         {_PLATFORM_LIVE_ORDER} LIMIT %(probe_limit)s
+                       ) page
+                     )
+                     SELECT {_feed_cols(status_alias, include_heavy_json=False)}
+                       FROM candidates c JOIN {schema}.items i ON i.id = c.id
+                       {status_join}
+                     ORDER BY i.platform, COALESCE(i.published_at, i.fetched_at) DESC NULLS LAST,
+                       i.fetched_at DESC NULLS LAST, i.relevance_score DESC NULLS LAST, i.id DESC""",
+                {**params, **status_params, "platforms": list(_SOURCE_PLATFORM_IDS), "probe_limit": limit + 1},
+            ).fetchall()
+            counts = _platform_snapshot_counts(
+                conn, schema, public_only=public_only, manual_owner_user_id=manual_owner_user_id,
+                min_github_stars=min_github_stars,
+            )
+    except Exception as exc:
+        if 'conn' in locals():
+            _rollback_safely(conn)
+        raise RemoteDBError("platforms live path failed") from exc
+    samples: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = _normalize_source_item(dict(row))
+        samples.setdefault(item.get("platform") or "_unknown", []).append(item)
+    sections, cursors = {}, {}
+    for platform, items in samples.items():
+        sections[platform] = items[:limit]
+        if len(items) > limit:
+            scope_key = _platform_live_scope(
+                platform=platform, source=None, group=None, category=None, search=None,
+                user_id=user_id, public_only=public_only, manual_owner_user_id=manual_owner_user_id,
+                min_github_stars=min_github_stars,
+            )
+            cursors[platform] = _platform_live_cursor(items[limit - 1], scope_key)
+    result = {
+        "sections": sections, **counts, "platform_next_cursors": cursors,
+        "data_backend": feed_read_backend(), "stale": False,
+        "overview_generated_at": datetime.now(timezone.utc).isoformat(),
+        "overview_max_fetched_at": _max_fetched_at([item for items in sections.values() for item in items]),
+        "sample_limit": limit,
+    }
+    # Live source pages read snapshot counts directly. Warming hundreds of
+    # legacy per-source count keys here adds CPU work to every cold first paint.
+    _cache_set_copy_with_ttl(("platforms_last_success", result_cache_key), result, 86400)
+    if public_only and _can_use_platforms_mv_fast_path(
+        per_platform=per_platform, search=search, user_id=user_id, manual_owner_user_id=manual_owner_user_id,
+    ):
+        _write_local_read_cache_async(_feed_platforms_local_cache_name(
+            per_platform=per_platform, public_only=True, min_github_stars=min_github_stars,
+        ), result)
+    return _cache_set_copy_with_ttl(result_cache_key, result, _feed_result_cache_ttl_sec())
+
+
+def _query_feed_platforms_legacy_uncached(
     *,
     schema: str,
     per_platform: int | None,
@@ -6640,7 +6993,10 @@ def _query_feed_platforms_uncached(
         if per_platform is not None:
             item_params["per_platform"] = per_platform
             item_limit_sql = "WHERE rn <= %(per_platform)s"
-        _set_short_statement_timeout(conn, _remote_feed_live_timeout_ms())
+        _set_short_statement_timeout(
+            conn,
+            _remote_feed_search_timeout_ms() if search else _remote_feed_live_timeout_ms(),
+        )
         try:
             status_join, status_params, status_alias = _item_status_join(schema, user_id)
             item_params.update(status_params)
@@ -6667,12 +7023,11 @@ def _query_feed_platforms_uncached(
                               id DESC""",
                 item_params,
             ).fetchall()
-            platform_counts, source_counts, category_counts = _platform_overview_counts_from_items(
-                conn,
-                schema,
-                where,
-                params,
-            )
+            platform_counts, source_counts, category_counts = {}, {}, {}
+            with optional_search_count(conn, bool(search)) as count_state:
+                platform_counts, source_counts, category_counts = _platform_overview_counts_from_items(
+                    conn, schema, where, params,
+                )
             _warm_platform_page_count_cache(
                 schema=schema,
                 platform_counts=platform_counts,
@@ -6684,6 +7039,8 @@ def _query_feed_platforms_uncached(
                 user_id=user_id,
                 min_github_stars=min_github_stars,
             )
+        except (SearchBusy, SearchExpired):
+            raise
         except Exception:
             _rollback_safely(conn)
             raise RemoteDBError("platforms live path failed")
@@ -6698,6 +7055,7 @@ def _query_feed_platforms_uncached(
         "platform_counts": platform_counts,
         "source_counts": source_counts,
         "category_counts": category_counts,
+        **({'counts_available': count_state['available'], 'total': sum(platform_counts.values()) if count_state['available'] else None} if search else {}),
         "data_backend": feed_read_backend(),
         "overview_generated_at": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "overview_max_fetched_at": _max_fetched_at(all_section_items),
@@ -6717,7 +7075,70 @@ def _query_feed_platforms_uncached(
             ),
             result,
         )
-    return _cache_set_copy(result_cache_key, result)
+    return result if result.get("counts_available") is False else _cache_set_copy(result_cache_key, result)
+
+
+def _query_platform_live_page(
+    *, schema: str, platform: str, category: str | None, offset: int, limit: int,
+    cursor: dict[str, Any] | None, user_id: str | None, public_only: bool,
+    manual_owner_user_id: str | None, min_github_stars: int,
+    where: list[str], params: dict[str, Any],
+) -> dict:
+    scope_key = _platform_live_scope(
+        platform=platform, source=None, group=None, category=category, search=None,
+        user_id=user_id, public_only=public_only, manual_owner_user_id=manual_owner_user_id,
+        min_github_stars=min_github_stars,
+    )
+    page_where, page_params = list(where), dict(params)
+    page_where.append("i.fetched_at >= now() - interval '90 days'")
+    if cursor is not None:
+        after = _validate_platform_live_cursor(cursor, scope_key)
+        _add_platform_live_after(page_where, page_params, after)
+        if after["sort_at"] is not None:
+            # The 90-day fetched_at predicate guarantees a non-null sort key.
+            # This redundant bound lets PostgreSQL seek the expression index;
+            # the full null-aware predicate still handles all tie breakers.
+            page_where.append("COALESCE(i.published_at, i.fetched_at) <= %(cursor_sort_at)s::timestamptz")
+    offset_sql = ""
+    if cursor is None and offset:
+        offset_sql = "OFFSET %(offset)s"
+        page_params["offset"] = offset
+    try:
+        with connect() as conn:
+            _set_short_statement_timeout(conn, _remote_feed_live_timeout_ms())
+            status_join, status_params, status_alias = _item_status_join(schema, user_id)
+            rows = conn.execute(
+                f"""WITH candidates AS MATERIALIZED (
+                       SELECT i.id FROM {schema}.items i
+                       {_where_sql(page_where)} {_PLATFORM_LIVE_ORDER}
+                       LIMIT %(probe_limit)s {offset_sql}
+                     )
+                     SELECT {_feed_cols(status_alias, include_heavy_json=False)}
+                       FROM candidates c JOIN {schema}.items i ON i.id = c.id
+                       {status_join} {_PLATFORM_LIVE_ORDER}""",
+                {**page_params, **status_params, "probe_limit": limit + 1},
+            ).fetchall()
+            counts = _platform_snapshot_counts(
+                conn, schema, public_only=public_only, manual_owner_user_id=manual_owner_user_id,
+                min_github_stars=min_github_stars,
+            )
+    except Exception as exc:
+        raise RemoteDBError("platform page query failed") from exc
+    items = [_normalize_source_item(dict(row)) for row in rows[:limit]]
+    has_more = len(rows) > limit
+    total = None
+    if counts["counts_generated_at"] is not None:
+        total = (counts["category_counts"].get(platform, {}).get(category, 0)
+                 if category else counts["platform_counts"].get(platform, 0))
+    next_offset = offset + len(items)
+    return {
+        "items": items, "platform": platform, "category": category, "total": total,
+        "offset": offset, "limit": limit, "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+        "next_cursor": _platform_live_cursor(items[-1], scope_key) if has_more and items else None,
+        "counts_generated_at": counts["counts_generated_at"], "stale": False,
+        "data_backend": feed_read_backend(),
+    }
 
 
 def query_feed_by_platform(
@@ -6771,6 +7192,15 @@ def query_feed_by_platform(
         params["exclude_ids"] = clean_exclude_ids
     safe_offset = max(0, int(offset or 0))
     safe_limit = max(1, min(int(limit or 50), 200))
+    if cursor and cursor.get("kind") == "live" and (search or source or group):
+        raise ValueError("live cursor scope is not supported for this filter")
+    if not search and not source and not group and (cursor is None or cursor.get("kind") == "live"):
+        return _query_platform_live_page(
+            schema=schema, platform=platform, category=category, offset=safe_offset,
+            limit=safe_limit, cursor=cursor, user_id=user_id, public_only=public_only,
+            manual_owner_user_id=manual_owner_user_id, min_github_stars=min_github_stars,
+            where=where, params=params,
+        )
     if search:
         search_read_model_result = _query_feed_by_platform_search_read_model(
             schema=schema,
@@ -6826,6 +7256,18 @@ def query_feed_by_platform(
     )
     if read_model_result is not None:
         return read_model_result
+    if cursor:
+        scope = _info_platform_scope(platform=platform, source=source, group=group, category=category)
+        legacy_cursor = _normalize_info_read_model_cursor(cursor, expected_scope_key=scope[2]) if scope else None
+        if legacy_cursor is not None:
+            safe_offset = int(legacy_cursor["rank_after"])
+            if not search and not source and not group:
+                return _query_platform_live_page(
+                    schema=schema, platform=platform, category=category, offset=safe_offset,
+                    limit=safe_limit, cursor=None, user_id=user_id, public_only=public_only,
+                    manual_owner_user_id=manual_owner_user_id, min_github_stars=min_github_stars,
+                    where=where, params=params,
+                )
     count_cache_key = _platform_page_count_cache_key(
         schema=schema,
         platform=platform,
@@ -6843,7 +7285,7 @@ def query_feed_by_platform(
     total_is_estimate = False
     try:
         with connect() as conn:
-            _set_short_statement_timeout(conn, 4500)
+            _set_short_statement_timeout(conn, _remote_feed_search_timeout_ms() if search else 4500)
             items = _fetch_items(
                 conn,
                 schema,
@@ -6859,8 +7301,13 @@ def query_feed_by_platform(
             )
             if total is None:
                 try:
-                    total = _count_items(conn, schema, count_where, count_params)
-                    _cache_set(count_cache_key, total)
+                    if search:
+                        with optional_search_count(conn, True):
+                            total = _count_items(conn, schema, count_where, count_params)
+                            _cache_set(count_cache_key, total)
+                    else:
+                        total = _count_items(conn, schema, count_where, count_params)
+                        _cache_set(count_cache_key, total)
                 except Exception:
                     _rollback_safely(conn)
                     total = _estimate_platform_page_total(
@@ -6869,6 +7316,8 @@ def query_feed_by_platform(
                         item_count=len(items),
                     )
                     total_is_estimate = True
+    except (SearchBusy, SearchExpired):
+        raise
     except Exception:
         raise RemoteDBError("platform page query failed")
     next_offset = safe_offset + len(items)
@@ -6879,8 +7328,9 @@ def query_feed_by_platform(
         "total": total,
         "offset": safe_offset,
         "limit": safe_limit,
-        "has_more": next_offset < total,
-        "next_offset": next_offset if next_offset < total else None,
+        "has_more": next_offset < total if total is not None else len(items) == safe_limit,
+        **({"counts_available": total is not None} if search else {}),
+        "next_offset": next_offset if (next_offset < total if total is not None else len(items) == safe_limit) else None,
         "data_backend": feed_read_backend(),
     }
     if total_is_estimate:

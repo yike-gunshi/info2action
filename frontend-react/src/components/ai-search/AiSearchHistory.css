@@ -1,0 +1,65 @@
+.ai-search-history.hist {
+  width: 100%;
+  margin-top: var(--ai-hist-mt);
+  /* 两侧等距内缩：左缘对齐框内文字，右侧同距，整块居中（用户 2026-10-09）。 */
+  padding-inline: calc(var(--ai-search-pad) + var(--ai-search-bw));
+}
+
+.ai-search-history .anon,
+.ai-search-history .none,
+.ai-search-history .hist-error {
+  font-family: var(--sans);
+  font-size: var(--ai-hist-date);
+  color: var(--ai-hist-date-color);
+  text-align: center;
+  padding-top: var(--ai-hist-empty-pt);
+}
+
+.ai-search-history .anon a {
+  color: var(--brand);
+  font-weight: 400; /* fixed: the skeleton's inline login link is regular weight. */
+}
+.ai-search-history .anon a:hover { text-decoration: underline; }
+
+.ai-search-history .hlab {
+  display: block;
+  font-family: var(--mono);
+  font-size: var(--ai-hist-label);
+  color: var(--ai-hist-date-color);
+  letter-spacing: .06em; /* fixed: section-label tracking from the skeleton. */
+  margin-bottom: var(--ai-hist-label-mb);
+}
+
+.ai-search-history .hrow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--ai-hist-gap);
+  padding: var(--ai-hist-row-py) 0;
+  border-top: var(--ai-search-bw) solid var(--ai-hist-divider);
+  cursor: pointer;
+}
+.ai-search-history .hrow:first-child { border-top: 0; }
+
+.ai-search-history .hq {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--serif);
+  font-size: var(--ai-hist-q);
+  color: var(--ai-hist-q-color);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-search-history .hd {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--ai-hist-date);
+  color: var(--ai-hist-date-color);
+}
+
+.ai-search-history .hrow:hover .hq { color: var(--brand); }
+.ai-search-history .hrow.fail .hq,
+.ai-search-history .hrow.fail:hover .hq { color: var(--muted-foreground); }
+
+.ai-search-history .hist-more { margin: var(--ai-hist-label-mb) 0 0; }

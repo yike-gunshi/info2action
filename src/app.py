@@ -59,7 +59,7 @@ from backend_fetch_scheduler import (
 # ── Route imports ───────────────────────────────────────────
 from routes import feed, actions, submit, fetch, config, briefing, interests, health, terminal, context
 from routes import auth, admin, user, asr, media, sources
-from routes import clusters  # v15.0 event aggregation
+from routes import clusters, ai_search  # v15.0 event aggregation; AI search jobs
 
 
 # ── Lifespan ────────────────────────────────────────────────
@@ -269,6 +269,7 @@ async def lifespan(app: FastAPI):
     # Startup
     fetch_scheduler = None
     dynamic_fetch_scheduler = None
+    ai_search_sweeper = None
 
     # P0-1: 同步路由跑在 anyio 线程池(默认 40 tokens),100 并发下这是
     # 与 DB 连接池并列的瓶颈之一;仅当显式配置时才调整。
@@ -392,9 +393,16 @@ async def lifespan(app: FastAPI):
     elif remote_db.remote_authority_enabled():
         print('   Cache prewarm: disabled')
 
+    ai_search_sweeper = ai_search.start_ai_search_sweeper(
+        is_leader=is_scheduler_leader and _web_leader_lock_handle is not None)
+
     try:
         yield
     finally:
+        ai_search.stop_ai_search_sweeper()
+        if ai_search_sweeper is not None:
+            ai_search_sweeper.cancel()
+            await asyncio.gather(ai_search_sweeper, return_exceptions=True)
         if fetch_scheduler:
             fetch_scheduler.stop()
         if dynamic_fetch_scheduler:
@@ -450,18 +458,6 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 
-def _limiter_default_limits() -> list[str]:
-    """RATELIMIT_DEFAULT 允许运维调全局默认限额而不发版。
-
-    默认 600/minute(10 rps/IP)是"防洪水"底线而非功能性限流:真实用户(哪怕图多的
-    首屏突发 + 状态轮询)都远够不到,而失控的重试循环 / 朴素爬虫会被挡下。刻意放宽
-    以避免运营商级 NAT(多用户共享出口 IP)下的误伤。要收紧到 per-route 严格限额,
-    单独给昂贵端点(search/submit-url/export/generate)加 @limiter.limit 并配
-    RATELIMIT_STORAGE_URL 走 Redis(多 worker 共享计数)。见 docs 加固 backlog。
-    """
-    return [(os.environ.get('RATELIMIT_DEFAULT') or '600/minute').strip()]
-
-
 # P1-5(C 端放量):限流计数默认在进程内存——多 worker/多机后各进程独立
 # 计数,限流形同虚设。共享存储用 slowapi 原生 env(所有 Limiter 实例在
 # import 时各自读取,包括 routes/auth.py:24 的第二个实例——不要在这里传
@@ -469,7 +465,7 @@ def _limiter_default_limits() -> list[str]:
 #   RATELIMIT_STORAGE_URL=redis://127.0.0.1:6379
 #   RATELIMIT_IN_MEMORY_FALLBACK_ENABLED=true   # Redis 挂了退化为进程内
 #   RATELIMIT_ENABLED=false                     # 测试关闭限流(须在 import 前)
-limiter = Limiter(key_func=get_remote_address, default_limits=_limiter_default_limits())
+limiter = ai_search.limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -494,6 +490,10 @@ app.add_middleware(MaxBodySizeMiddleware)
 from slowapi.middleware import SlowAPIMiddleware
 app.add_middleware(SlowAPIMiddleware)
 
+# 安全头后加在最外层,确保限流 429 和 body 上限 413 的提前返回也带上默认安全头。
+from middleware.security_headers import SecurityHeadersMiddleware
+app.add_middleware(SecurityHeadersMiddleware)
+
 # ── API routes ──────────────────────────────────────────────
 app.include_router(feed.router)
 app.include_router(actions.router)
@@ -512,6 +512,15 @@ app.include_router(asr.router)
 app.include_router(media.router)
 app.include_router(sources.router)
 app.include_router(clusters.router)  # v15.0 /api/feed/events, /api/clusters/..., /api/search
+if ai_search.enabled():
+    app.include_router(ai_search.router)
+else:
+    # Feature status stays available so clients can hide the disabled entry.
+    app.add_api_route('/api/ai-search/status', ai_search.get_status, methods=['GET'])
+    # Keep disabled endpoints out of the SPA fallback (which serves HTML).
+    for path in ('/api/ai-search', '/api/ai-search/{path:path}',
+                 '/api/admin/ai-search/jobs', '/api/admin/ai-search/jobs/{path:path}'):
+        app.add_api_route(path, ai_search.disabled_response, methods=['GET', 'POST'])
 
 # ── v12.2 ASR state: Semaphore(3) per user + SSE event buses per item ──
 app.state.user_asr_sems = {}  # type: ignore[assignment]

@@ -19,9 +19,7 @@ function resetStores() {
 }
 
 function stubBrowserApis() {
-  Object.defineProperty(window, 'matchMedia', {
-    writable: true,
-    value: vi.fn().mockImplementation((query: string) => ({
+  vi.stubGlobal('matchMedia', vi.fn().mockImplementation((query: string) => ({
       matches: false,
       media: query,
       onchange: null,
@@ -30,8 +28,7 @@ function stubBrowserApis() {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
       dispatchEvent: vi.fn(),
-    })),
-  })
+    })))
   vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
 }
 
@@ -46,6 +43,7 @@ describe('TopBar v19 Image2 constraints', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   it('G1: 切 tab 记忆并恢复滚动位置;同 tab 再点回顶部', () => {
@@ -53,22 +51,21 @@ describe('TopBar v19 Image2 constraints', () => {
       cb(0)
       return 0
     })
-    let scrollY = 0
-    Object.defineProperty(window, 'scrollY', { configurable: true, get: () => scrollY })
+    vi.stubGlobal('scrollY', 0)
     const scrollToSpy = window.scrollTo as unknown as ReturnType<typeof vi.fn>
 
     render(<TopBar />)
 
     // 在精选 tab 滚到 500,切到信息 → 存精选=500
-    scrollY = 500
+    vi.stubGlobal('scrollY', 500)
     fireEvent.click(screen.getByTestId('topbar-tab-info'))
     // 切回精选 → 必恢复 500(往返一致,不受模块级 Map 历史影响)
-    scrollY = 123
+    vi.stubGlobal('scrollY', 123)
     fireEvent.click(screen.getByTestId('topbar-tab-highlights'))
     expect(scrollToSpy).toHaveBeenLastCalledWith({ top: 500 })
 
     // 同 tab 再点 → 回顶部 0
-    scrollY = 777
+    vi.stubGlobal('scrollY', 777)
     fireEvent.click(screen.getByTestId('topbar-tab-highlights'))
     expect(scrollToSpy).toHaveBeenLastCalledWith({ top: 0 })
   })
@@ -112,13 +109,13 @@ describe('TopBar v19 Image2 constraints', () => {
     const search = screen.getByTestId('topbar-search')
     expect(search).toBeInTheDocument()
     expect(search.className).toContain('hidden')
-    expect(search.className).toContain('sm:flex')
+    expect(search.className).toContain('lg:flex')
     expect(search.className).toContain('w-9')
     expect(screen.queryByRole('textbox', { name: '搜索信息' })).not.toBeInTheDocument()
     expect(within(search).getByRole('button', { name: '搜索' })).toBeInTheDocument()
-    // v24.0 §21.6: <sm 搜索入口补缺 — 移动端 icon 按钮(sm:hidden)与桌面入口并存
+    // Below 1024px search expands below the bar, leaving room for the changelog entry.
     const mobileTrigger = screen.getByTestId('topbar-search-mobile-trigger')
-    expect(mobileTrigger.className).toContain('sm:hidden')
+    expect(mobileTrigger.className).toContain('lg:hidden')
     expect(screen.queryByTestId('topbar-search-mobile')).not.toBeInTheDocument()
     expect(screen.getByLabelText('提交链接')).toBeInTheDocument()
     expect(screen.getByLabelText('切换主题')).toBeInTheDocument()
@@ -163,7 +160,7 @@ describe('TopBar v19 Image2 constraints', () => {
     fireEvent.click(screen.getByTestId('topbar-search-mobile-trigger'))
 
     const mobileRow = screen.getByTestId('topbar-search-mobile')
-    expect(mobileRow.className).toContain('sm:hidden')
+    expect(mobileRow.className).toContain('lg:hidden')
     const input = screen.getByTestId('topbar-search-mobile-input')
     expect(input).toHaveAttribute('aria-label', '搜索信息')
     expect(input.className).toContain('bg-transparent')

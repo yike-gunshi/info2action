@@ -123,6 +123,14 @@ describe('App public event aggregation entry', () => {
     resetStores()
   })
 
+  it('renders AI search anonymously while the auth probe is still pending', () => {
+    window.history.replaceState(null, '', '/#ai-search?q=Claude')
+    vi.mocked(authMe).mockReturnValue(new Promise(() => {}))
+    render(<App />)
+    expect(screen.getByRole('textbox', { name: 'AI 搜索' })).toHaveValue('Claude')
+    expect(window.location.hash).toBe('#ai-search?q=Claude')
+  })
+
   it('renders LatestEvents on the anonymous default (highlights) dashboard', async () => {
     // v17.0: 默认 tab = 'highlights'（HighlightsView 内嵌 LatestEvents）
     render(<App />)

@@ -1,0 +1,40 @@
+/* Skeleton .acts / .act: keep the result actions in the state-button family. */
+.ai-summary-actions {
+  margin-top: var(--ai-copy-mt);
+  display: flex;
+  gap: var(--ai-act-gap);
+}
+
+.ai-summary-action {
+  width: var(--ai-act-size);
+  height: var(--ai-act-size);
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: var(--ai-state-btn-bw) solid var(--ai-state-btn-border);
+  border-radius: var(--ai-state-btn-radius);
+  color: var(--ai-state-btn-fg);
+  background: var(--ai-state-btn-bg);
+  transition: color .15s, border-color .15s; /* fixed: matches skeleton .act */
+  cursor: pointer;
+}
+
+.ai-summary-action:hover:not(:disabled) {
+  color: var(--ai-state-btn-hover);
+  border-color: var(--ai-state-btn-hover-border);
+}
+
+.ai-summary-action:focus-visible {
+  outline: var(--ai-highlight-w) solid var(--brand);
+  outline-offset: var(--ai-state-btn-bw);
+}
+
+.ai-summary-action:disabled {
+  cursor: default;
+}
+
+.ai-summary-action svg {
+  width: var(--ai-act-icon);
+  height: var(--ai-act-icon);
+  display: block;
+}

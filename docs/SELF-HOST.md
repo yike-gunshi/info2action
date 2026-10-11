@@ -89,6 +89,12 @@ Info2Action 的「行动建议」可以派发到你私有 Discord 服务器的 F
 
 不需要代理就留空。
 
+### 3.5 AI 搜索（可选）
+
+AI 搜索使用 Supabase/PostgreSQL 的站内词法与向量检索，再通过 GLM Coding Plan 异步生成带引用的总结。SQLite Lite 模式不包含这项能力。需要配置自己的远程数据库、PGroonga、pgvector 和 embedding provider，并先完成下方的数据库迁移。
+
+在 `.env` 填入 `GLM_CODING_API_KEY`；承担总结任务的实例设置 `AI_SEARCH_WORKER_ENABLED=1`，连接同一数据库的其他开发实例保持 `0`。空密钥会关闭 AI 搜索入口；启用后，用户需登录，每人默认每天 2 次，全站默认每天 5 次，管理员不受这两项额度限制。模型、检索窗口和预算参数见 [配置指南 §4.10](配置指南.md)。
+
 ## 4. 部署到服务器
 
 一台常规 Linux（Ubuntu 22.04 实测）+ Python 3.11 + Node 20 即可。完整路径：
@@ -122,6 +128,16 @@ your.domain.com {
   reverse_proxy 127.0.0.1:8080
 }
 ```
+
+### 4.1 从旧版升级远程数据库实例
+
+升级前备份自己的数据库，并在已有 schema 和扩展上按顺序应用以下迁移：
+
+1. [202609191900_ai_search.sql](../supabase/migrations/202609191900_ai_search.sql)：1536 维向量召回索引与 AI 搜索任务表。
+2. [2026092100_ai_search_user_id.sql](../supabase/migrations/2026092100_ai_search_user_id.sql)：个人搜索历史归属字段与索引。
+3. [202610100930_source_live_order_indexes.sql](../supabase/migrations/202610100930_source_live_order_indexes.sql)：来源页首屏与续页排序索引。
+
+这些文件使用 `CREATE INDEX CONCURRENTLY`，请通过自己的 5432 直连或会话连接运行 `psql -v ON_ERROR_STOP=1 -f <迁移文件>`；不要使用 6543 事务池或 `--single-transaction`。默认 schema 为 `remote_poc`，使用其他 schema 时先核对并调整 SQL。向量索引的固定截止日期须与 `AI_SEARCH_VECTOR_INDEX_CUTOFF` 一致；索引构建失败后，按文件注释处理无效索引再重试。迁移后构建前端并重启应用。
 
 ## 5. 常见问题
 

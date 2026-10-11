@@ -11,6 +11,7 @@ import { fetchClassification } from './lib/api'
 import { authMe } from './lib/api'
 import type { L1View } from './lib/types'
 
+import { AiSearchPage } from './components/ai-search/AiSearchPage'
 import { TopBar } from './components/layout/TopBar'
 import { L2Pills } from './components/layout/L2Pills'
 import { HighlightsView } from './components/highlights/HighlightsView'
@@ -33,11 +34,12 @@ import { ResetPasswordPage } from './pages/ResetPasswordPage'
 import { PrivacyPage } from './pages/PrivacyPage'
 import { TermsPage } from './pages/TermsPage'
 import { ClusterFullPage } from './pages/ClusterFullPage'
+import { ChangelogPage } from './pages/ChangelogPage'
 import { BrandWordmark } from './components/shared/BrandWordmark'
 
 type AuthView = 'login' | 'register' | 'verify-email' | 'forgot-password' | 'reset-password'
 // v18.0 nav-merge: starred / history 从 L1 tab 升级为全屏路由（Spec-3 D5）
-type AppView = 'settings' | 'admin' | 'privacy' | 'terms' | 'starred' | 'history' | 'info-image2-lab' | 'info-legacy-lab'
+type AppView = 'ai-search' | 'settings' | 'admin' | 'privacy' | 'terms' | 'changelog' | 'starred' | 'history' | 'info-image2-lab' | 'info-legacy-lab'
 
 // v18.0 nav-merge: collectInitialDetailPrefetchIds + scheduleInitialDetailPrefetch
 // 已废弃 — 仅旧推荐 tab loadRecommendSections 使用，3 tab 模式后无 caller。
@@ -97,11 +99,13 @@ function getAppView(): AppView | null {
   const params = new URLSearchParams(hash)
   if (params.get('v') === 'info-image2-lab') return 'info-image2-lab'
   if (params.get('v') === 'info-legacy-lab') return 'info-legacy-lab'
+  if (hash === 'ai-search' || hash.startsWith('ai-search?')) return 'ai-search'
   if (hash === 'settings') return 'settings'
   // v23.0 admin-console: #admin 及子路由 #admin/overview|runs|subscriptions|access
   if (hash === 'admin' || hash.startsWith('admin/')) return 'admin'
   if (hash === 'privacy') return 'privacy'
   if (hash === 'terms') return 'terms'
+  if (hash === 'changelog') return 'changelog'
   // v18.0 nav-merge §Spec-3 D5: 全屏路由
   if (hash === 'starred') return 'starred'
   if (hash === 'history') return 'history'
@@ -211,6 +215,10 @@ export default function App() {
     )
   }
 
+  if (appView === 'ai-search') {
+    return <AppFrame><AiSearchPage /></AppFrame>
+  }
+
   // App-level pages (require login)
   if (appView === 'settings') {
     if (!user) {
@@ -240,6 +248,9 @@ export default function App() {
         <PrivacyPage />
       </AppFrame>
     )
+  }
+  if (appView === 'changelog') {
+    return <AppFrame><ChangelogPage /></AppFrame>
   }
   if (appView === 'terms') {
     return (

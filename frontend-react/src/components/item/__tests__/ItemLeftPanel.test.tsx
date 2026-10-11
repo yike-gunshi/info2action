@@ -40,6 +40,13 @@ describe('ItemLeftPanel', () => {
     expect(heading).toHaveTextContent('Hello World 这是一个测试标题')
   })
 
+  it('头部时间使用绝对日期时间', () => {
+    const fetchedAt = new Date(2026, 3, 19, 18, 5).toISOString()
+    render(<ItemLeftPanel item={makeItem({ fetched_at: fetchedAt })} />)
+
+    expect(screen.getByText('2026-04-19 18:05')).toBeInTheDocument()
+  })
+
   it('showHeader=false 时不重复渲染标题和作者头部,只保留正文阅读区', () => {
     render(
       <ItemLeftPanel

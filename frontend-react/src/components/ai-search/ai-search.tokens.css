@@ -1,0 +1,160 @@
+/* 由 docs/assets/visuals/ai-search/ai-search.tokens.json 生成（工作台「保存」或 build_tokens.py），勿手改。
+ * AI 搜索页 · 设计工作台 v32.1 v32.1 页面级与组件级 token。站点基础 token 只引用 var(--…)，值在站点全局样式。
+ * 工作台与前端组件读的是同一个文件。 */
+:root{
+  --ai-topbar-h: 52px; /* TopBar 高 */
+  --ai-entry-order: -1; /* 「AI」入口在右侧图标组的位置 */
+  --ai-col-w: 300px; /* 引用列宽 */
+  --ai-col-gap: 48px; /* 正文与引用列间距 */
+  --ai-shell-pad: 32px; /* 整组左右最小边距 */
+  --ai-doc-max: 700px; /* 正文宽（搜索框同宽） */
+  --ai-search-h: 48px; /* 搜索框高 */
+  --ai-idle-w: 800px; /* 空态搜索框宽 */
+  --ai-sb-hide-ms: 1000ms; /* 滚动条隐藏延迟 */
+  --ai-sb-thumb: color-mix(in srgb, var(--muted-foreground) 44%, var(--background)); /* 滚动条滑块色 */
+  --ai-sb-w: 8px; /* Safari 滚动条宽度 */
+  --ai-sb-gutter: 16px; /* 滚动条让位宽 */
+  --ai-body-size: 16px; /* 正文字号 */
+  --ai-body-lh: 1.72; /* 正文行高 */
+  --ai-para-gap: 12px; /* 段距 */
+  --ai-heading-size: 18px; /* 小标题字号 */
+  --ai-heading-weight: 700; /* 小标题字重 */
+  --ai-heading-mt: 16px; /* 小标题上距 */
+  --ai-heading-mb: 12px; /* 小标题下距 */
+  --ai-meta-size: 13px; /* meta 行字号 */
+  --ai-chip-size: 10px; /* 角标字号 */
+  --ai-chip-weight: 400; /* 角标字重 */
+  --ai-card-title-size: 14px; /* 卡标题字号 */
+  --ai-card-title-lh: 1.4; /* 卡标题行高 */
+  --ai-card-title-weight: 400; /* 卡标题字重 */
+  --ai-card-title-lines: 2; /* 卡标题行数 */
+  --ai-card-src-size: 11px; /* 来源行字号 */
+  --ai-search-size: 16px; /* 搜索框字号 */
+  --ai-search-lh: 1.5; /* 输入框行高 */
+  --ai-hint-size: 14px; /* 提示行字号 */
+  --ai-entry-size: 15px; /* 「AI」入口字号 */
+  --ai-entry-weight: 600; /* 「AI」入口字重 */
+  --ai-chip-color: var(--brand); /* 角标色 */
+  --ai-card-num-color: var(--brand); /* 卡内角标色 */
+  --ai-meta-color: var(--muted-foreground); /* meta 行色 */
+  --ai-card-src-color: var(--muted-foreground); /* 来源行色 */
+  --ai-card-bg: var(--card); /* 卡片底 */
+  --ai-card-border: transparent; /* 卡片边 */
+  --ai-card-hover-border: var(--brand-border); /* 卡片 hover 边 */
+  --ai-highlight: var(--brand-border); /* 高亮描边 */
+  --ai-highlight-pulse-bg: var(--brand-soft); /* 单次高亮脉冲背景 */
+  --ai-highlight-pulse-color: var(--brand); /* 单次高亮脉冲描边 */
+  --ai-skeleton: var(--border); /* 骨架条色 */
+  --ai-entry-color: var(--brand); /* 「AI」入口色 */
+  --ai-card-pad: 12px; /* 卡内边距 */
+  --ai-card-gap: 12px; /* 卡间距 */
+  --ai-card-thumb-auto: calc(var(--ai-card-src-size) * 1.5 + 4px + var(--ai-card-title-size) * var(--ai-card-title-lh) * var(--ai-card-title-lines)); /* 缩略图边长（随文字高时的算式） */
+  --ai-card-thumb: 56px; /* 缩略图边长（固定模式用） */
+  --ai-card-thumb-gap: 12px; /* 图文间距 */
+  --ai-card-radius: 8px; /* 卡圆角 */
+  --ai-card-border-w: 1px; /* 卡边框 */
+  --ai-chip-pad: 2px; /* 角标组左右内距 */
+  --ai-search-radius: 8px; /* 搜索框圆角 */
+  --ai-search-pad: 16px; /* 输入文字左内距 */
+  --ai-left-pt: 32px; /* 左区上留白（搜索框距 TopBar） */
+  --ai-col-pt: 32px; /* 引用列顶部留白 */
+  --ai-col-pb: 48px; /* 引用列底部留白 */
+  --ai-pane-pb: 64px; /* 正文底部留白 */
+  --ai-highlight-ms: 2250ms; /* 高亮持续 */
+  --ai-outline-ms: 300ms; /* 描边过渡 */
+  --ai-glow-sweep-ms: 5000ms; /* 空态一圈 */
+  --ai-glow-fade-ms: 400ms; /* 熄灯淡出 */
+  --ai-search-move-ms: 200ms; /* 空态→结果态位移 */
+  --ai-state-title: 15px; /* 状态文案字号 */
+  --ai-topbar-h-mob: 84px; /* 手机 TopBar 高（两行） */
+  --ai-idle-pad: 16px; /* 空态左右内距 */
+  --ai-search-gap: 8px; /* 输入区与箭头间距 */
+  --ai-placeholder-size: 14px; /* placeholder 字号 */
+  --ai-hint-mt: 8px; /* 提示行上距 */
+  --ai-hint-h: 20px; /* 提示行预留高 */
+  --ai-vec-size: 12px; /* 向量失败提示字号 */
+  --ai-vec-mt: 2px; /* 向量提示上距 */
+  --ai-article-mt: 20px; /* 正文距 meta 行（骨架屏同值） */
+  --ai-list-indent: 20px; /* 列表缩进 */
+  --ai-list-gap: 4px; /* 列表项间距 */
+  --ai-sk-bar-h: 18px; /* 骨架条高 */
+  --ai-sk-head-h: 20px; /* 骨架加粗位高 */
+  --ai-sk-head-w: 160px; /* 骨架加粗位宽 */
+  --ai-sk-bar-gap: 12px; /* 骨架条间距 */
+  --ai-sk-bar-radius: 2px; /* 骨架条圆角 */
+  --ai-card-thumb-radius: 4px; /* 缩略图圆角 */
+  --ai-card-src-gap: 8px; /* 来源行左右间距 */
+  --ai-card-num-gap: 6px; /* 角标与来源间距 */
+  --ai-card-title-mt: 4px; /* 卡标题上距 */
+  --ai-highlight-w: 2px; /* 点角标高亮描边宽 */
+  --ai-mob-pad-x: 16px; /* 手机左右内距 */
+  --ai-mob-pad-t: 24px; /* 手机上内距 */
+  --ai-mob-col-pb: 32px; /* 手机引用列底部留白 */
+  --ai-mob-idle-pt: 120px; /* 手机空态上留白 */
+  --ai-idle-pt: 160px; /* 空态搜索框上距（TopBar 下） */
+  --ai-hist-mt: 32px; /* 记录区距搜索框 */
+  --ai-hist-label: 11px; /* 区块标签字号 */
+  --ai-hist-label-mb: 8px; /* 标签到第一行 */
+  --ai-hist-q: 14px; /* 查询词字号 */
+  --ai-hist-date: 12px; /* 日期字号 */
+  --ai-hist-row-py: 10px; /* 记录行上下内距 */
+  --ai-hist-max: 10; /* 展示条数 */
+  --ai-hist-q-color: var(--muted-foreground); /* 查询词色 */
+  --ai-hist-date-color: var(--muted-foreground); /* 日期与标签色 */
+  --ai-hist-divider: var(--border); /* 行分隔线 */
+  --ai-hist-gap: 12px; /* 查询词与日期间距 */
+  --ai-pane-fade: 32px; /* 正文顶部渐隐高度 */
+  --ai-state-btn-radius: 4px; /* 操作按钮圆角 */
+  --ai-state-btn-bw: 1px; /* 操作按钮边框宽 */
+  --ai-state-btn-border: var(--border); /* 操作按钮边框色 */
+  --ai-state-btn-fg: var(--muted-foreground); /* 操作按钮图标色 */
+  --ai-state-btn-bg: var(--card); /* 操作按钮底色 */
+  --ai-state-btn-hover: var(--foreground); /* 悬停图标色 */
+  --ai-toc-w: 200px; /* 目录宽 */
+  --ai-toc-gap: 24px; /* 目录距正文 */
+  --ai-toc-bp: 1500px; /* 显示目录的最小视口宽 */
+  --ai-toc-size: 13px; /* 目录项字号 */
+  --ai-toc-lh: 1.5; /* 目录项行高 */
+  --ai-toc-item-py: 6px; /* 目录项上下内距 */
+  --ai-toc-indent: 12px; /* 目录项左内距 */
+  --ai-toc-rule-w: 2px; /* 目录左侧竖线宽 */
+  --ai-copy-mt: 24px; /* 操作按钮距正文 */
+  --ai-toc-fg: var(--ink-2); /* 目录项文字色 */
+  --ai-toc-active: var(--brand); /* 当前章节色 */
+  --ai-toc-rule: var(--border); /* 目录左侧竖线色 */
+  --ai-act-size: 32px; /* 操作按钮边长 */
+  --ai-act-icon: 16px; /* 图标尺寸 */
+  --ai-act-gap: 8px; /* 两个按钮间距 */
+  --ai-col-fade-t: 32px; /* 引用列顶部渐隐 */
+  --ai-col-fade-b: 32px; /* 引用列底部渐隐 */
+  --ai-entry-ls: 0.02; /* 「AI」入口字距（em） */
+  --ai-hist-empty-pt: 24px; /* 空记录提示上留白 */
+  --ai-search-pad-r: 8px; /* 箭头右内距 */
+  --ai-search-bw: 1px; /* 边框宽（光环粗） */
+  --ai-search-btn: 32px; /* 箭头按钮边长 */
+  --ai-search-btn-icon: 16px; /* 箭头图标尺寸 */
+  --ai-search-btn-bg: var(--brand); /* 箭头底色 */
+  --ai-search-btn-fg: var(--background); /* 箭头色 */
+  --ai-glow-color: var(--brand); /* 光球色 */
+  --ai-glow-size: 96px; /* 光球直径 */
+  --ai-glow-core: 40; /* 实心半径占比 */
+  --ai-glow-edge: 60; /* 透明处占比 */
+  --ai-glow-opacity: 0.8; /* 光球不透明度 */
+  --ai-glow-loading-ms: 6000ms; /* 加载态一圈 */
+  --ai-ph-interval: 3000ms; /* 轮播间隔 */
+  --ai-ph-dur: 300ms; /* 单次进出时长 */
+  --ai-ph-in-y: 5px; /* 入场位移 */
+  --ai-ph-out-y: 15px; /* 出场位移 */
+  --ai-state-btn-hover-border: var(--brand-border); /* 悬停边框色 */
+  --ai-state-line: var(--muted-foreground); /* 状态文案色 */
+  --ai-search-outer-gap: 8px; /* 输入框与按钮间距 */
+  --ai-search-btn-pad: 20px; /* 外置按钮左右内距 */
+  --ai-search-btn-size: 15px; /* 外置按钮字号 */
+  --ai-search-btn-weight: 500; /* 外置按钮字重 */
+  --ai-search-btn-text: var(--background); /* 外置按钮文字色 */
+  --ai-qtitle-size: 24px; /* 结果标题字号 */
+  --ai-qtitle-weight: 600; /* 结果标题字重 */
+  --ai-qtitle-lh: 1.5; /* 结果标题行高 */
+  --ai-qtitle-color: var(--foreground); /* 结果标题色 */
+  --ai-qtitle-mb: 12px; /* 标题到 meta 行 */
+}

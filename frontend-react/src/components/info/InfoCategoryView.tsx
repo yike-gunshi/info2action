@@ -57,6 +57,8 @@ export function InfoCategoryView({ onLoadingChange, embedded = false }: InfoCate
   const setSections = useFeedStore((s) => s.setSections)
   const isSearching = useFeedStore((s) => s.searchResults !== null)
   const searchDegraded = useFeedStore((s) => s.searchDegraded)
+  const searchError = useFeedStore((s) => s.searchError)
+  const countsAvailable = useFeedStore((s) => s.searchCountsAvailable)
   // rev3: 搜索请求进行中(含输入防抖),用于加载状态条与旧内容压暗
   const searchLoading = useFeedStore((s) => s.isSearching)
   const searchQuery = useUIStore((s) => s.searchQuery)
@@ -116,12 +118,13 @@ export function InfoCategoryView({ onLoadingChange, embedded = false }: InfoCate
   }
 
   // BF-0704-6: 搜索降级(后端超时等)必须显式提示;保留当前可见内容
-  const degradedBanner = searchDegraded && searchQuery ? (
+  const degradedBanner = searchQuery && (searchDegraded || !countsAvailable) ? (
     <div
       data-testid="info-search-degraded-hint"
       className="mb-4 rounded-md border border-border bg-muted px-4 py-2 text-[13px] text-muted-foreground"
     >
-      搜索暂时不可用，请稍后重试
+      {searchDegraded ? searchError || '搜索暂时不可用，请重试' : '总数暂不可用，已显示查到的内容'}
+      <button type="button" disabled={searchLoading} className="ml-3 text-primary hover:underline disabled:opacity-50" onClick={() => useFeedStore.getState().serverSearch(searchQuery)}>重试</button>
     </div>
   ) : null
 
@@ -133,11 +136,11 @@ export function InfoCategoryView({ onLoadingChange, embedded = false }: InfoCate
         className={cn(embedded ? 'py-12' : 'max-w-[1168px] mx-auto px-4 py-12', 'text-center')}
         data-testid="info-category-search-empty"
       >
-        {degradedBanner ?? (
+        {degradedBanner ?? (searchLoading ? <p data-testid="info-search-loading" className="text-muted-foreground">正在搜索 “{searchQuery}”…</p> : (
           <p className="text-muted-foreground">
             {searchQuery ? <>未找到与「{searchQuery}」相关的内容</> : '未找到相关内容'}
           </p>
-        )}
+        ))}
       </div>
     )
   }

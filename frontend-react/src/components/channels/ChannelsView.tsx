@@ -1,13 +1,14 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
 import { cn, platformName } from '../../lib/utils'
 import { usePlatformSections, useFeedStore } from '../../store/feedStore'
+import { useAuthStore } from '../../store/authStore'
 import { useUIStore } from '../../store/uiStore'
 import { SectionFront } from '../feed/SectionFront'
 import { L1PillBar } from './L1PillBar'
 import { InfoSectionPillBar, scrollInfoSectionToTop } from '../shared/InfoSectionPillBar'
 import { fetchFeedPlatformMore, fetchLingowhaleGroups } from '../../lib/api'
 import { PLATFORM_ORDER } from '../../lib/platforms'
-import type { FeedItem, FeedSection as FeedSectionType, InfoReadModelCursor } from '../../lib/types'
+import type { FeedItem, FeedSection as FeedSectionType, InfoReadModelCursor, InfoFeedCursor } from '../../lib/types'
 
 // v18.2: 来源 section 仍按 platform 分组；section 内 pill 统一使用 L1 内容分类。
 const L1_PILL_PLATFORMS = new Set(PLATFORM_ORDER)
@@ -16,7 +17,16 @@ const BATCH = 50
 const PLATFORM_PREFETCH_IDLE_DELAY_MS = 1200
 const EMPTY_COUNT_MAP: Record<string, number> = {}
 type PlatformPage = Awaited<ReturnType<typeof fetchFeedPlatformMore>>
-type CachedPlatformPage = { items: FeedItem[]; total: number; nextCursor?: InfoReadModelCursor | null }
+type CachedPlatformPage = { items: FeedItem[]; total: number | null; nextCursor?: InfoFeedCursor | null; hasMore: boolean }
+function pageHasMore(page: PlatformPage): boolean {
+  return page.has_more ?? (page.next_cursor != null || (page.total != null
+    ? (page.offset ?? 0) + page.items.length < page.total
+    : page.items.length === BATCH))
+}
+function requireUsablePage(page: PlatformPage): PlatformPage {
+  if (page.degraded) throw new Error(page.degraded_reason || page.fallback_reason || '来源数据暂时不可用')
+  return page
+}
 
 function mergeUniqueItems(existing: FeedItem[], incoming: FeedItem[]): { items: FeedItem[]; added: number } {
   const existingIds = new Set(existing.map((item) => item.id))
@@ -153,76 +163,48 @@ function ChannelsEmptyState({ embedded = false, message }: { embedded?: boolean;
 
 export function ChannelsView({ embedded = false }: { embedded?: boolean } = {}) {
   const sections = usePlatformSections()
-  const platformSectionsLoaded = useFeedStore((s) => s.platformSectionsLoaded)
-  const loadError = useFeedStore((s) => s.loadError)
-  const setLoadError = useFeedStore((s) => s.setLoadError)
-  const ensurePlatformSections = useFeedStore((s) => s.ensurePlatformSections)
+  const loaded = useFeedStore((s) => s.platformSectionsLoaded)
+  const ordinaryError = useFeedStore((s) => s.platformLoadError)
+  const searchError = useFeedStore((s) => s.searchPlatformError)
+  const searchCountsAvailable = useFeedStore((s) => s.searchPlatformCountsAvailable)
+  const stale = useFeedStore((s) => s.platformOverviewStale)
+  const generatedAt = useFeedStore((s) => s.platformOverviewGeneratedAt)
+  const ensure = useFeedStore((s) => s.ensurePlatformSections)
   const isSearching = useFeedStore((s) => s.isSearching)
-  const searchPlatformLoading = useFeedStore((s) => s.searchPlatformLoading)
+  const searchLoading = useFeedStore((s) => s.searchPlatformLoading)
   const searchResults = useFeedStore((s) => s.searchResults)
-  const loadAttemptedRef = useRef(false)
-  const emptyLoadedRetryRef = useRef(false)
-
-  const sorted = [...sections]
-    .filter((s) => PLATFORM_ORDER.includes(s.key))
+  const identity = useAuthStore((s) => `${s.user?.id ?? 'public'}:${s.user?.role ?? ''}`)
+  const [retrying, setRetrying] = useState(false)
+  const sorted = [...sections].filter((s) => PLATFORM_ORDER.includes(s.key))
     .sort((a, b) => PLATFORM_ORDER.indexOf(a.key) - PLATFORM_ORDER.indexOf(b.key))
+  const searching = searchResults !== null || isSearching || searchLoading
+  const error = searching ? searchError : ordinaryError
 
   useEffect(() => {
-    if (searchResults !== null || isSearching || searchPlatformLoading) return
-    if (platformSectionsLoaded && sorted.length > 0) return
-    if (platformSectionsLoaded && sorted.length === 0 && emptyLoadedRetryRef.current) return
-    if (loadAttemptedRef.current) return
-    loadAttemptedRef.current = true
-    if (platformSectionsLoaded && sorted.length === 0) {
-      emptyLoadedRetryRef.current = true
+    if (!searching && !loaded) void ensure().catch(() => {})
+  }, [searching, loaded, ensure, identity])
+
+  const retry = () => {
+    if (searching) {
+      useFeedStore.getState().serverSearch(useUIStore.getState().searchQuery)
+      return
     }
-    setLoadError(null)
-    ensurePlatformSections()
-      .catch((err) => {
-        console.error('Failed to load platform data:', err)
-        setLoadError('频道数据加载失败，请重试')
-      })
-    return () => {
-      if (!platformSectionsLoaded) {
-        loadAttemptedRef.current = false
-      }
-    }
-  }, [
-    isSearching,
-    platformSectionsLoaded,
-    sorted.length,
-    searchPlatformLoading,
-    searchResults,
-    setLoadError,
-    ensurePlatformSections,
-  ])
-
-  const isSearchActive = searchResults !== null || isSearching || searchPlatformLoading
-  const loading = sorted.length === 0 && (isSearchActive
-    ? (isSearching || searchPlatformLoading)
-    : (!platformSectionsLoaded && !loadError))
-
-  if (loading) {
-    return <ChannelsSkeleton embedded={embedded} />
+    setRetrying(true)
+    void ensure(true).catch(() => {}).finally(() => setRetrying(false))
   }
-
-  if (loadError && sorted.length === 0) {
-    return <ChannelsEmptyState embedded={embedded} message={loadError} />
-  }
-
-  if (sorted.length === 0) {
-    return <ChannelsEmptyState embedded={embedded} message="暂无频道内容" />
-  }
-
+  const retryButton = <button type="button" className="ml-3 text-sm text-primary hover:underline disabled:opacity-50" disabled={retrying} onClick={retry}>{retrying ? '加载中…' : '重试'}</button>
+  const loading = sorted.length === 0 && (searching ? isSearching || searchLoading : !loaded && !error)
+  if (loading) return <ChannelsSkeleton embedded={embedded} />
+  if (error && sorted.length === 0) return <div className="py-12 text-center text-sm text-muted-foreground" role="status">{error}{retryButton}</div>
+  if (sorted.length === 0) return <ChannelsEmptyState embedded={embedded} message="暂无频道内容" />
+  const updateLabel = generatedAt ? new Date(generatedAt).toLocaleString('zh-CN') : '未知'
   return (
     <div className={cn(embedded ? 'py-0' : 'max-w-[1168px] mx-auto px-4 py-4')}>
-      {sorted.map((section) => (
-        <PlatformSection
-          key={section.key}
-          section={section}
-          showHeader
-        />
-      ))}
+      {(error || (!searching && stale)) && <div className="mb-4 text-sm text-muted-foreground" role="status">
+        {error ? searching ? error : `${error} · 更新时间：${updateLabel}` : `正在显示缓存内容 · 更新时间：${updateLabel}`}{retryButton}
+      </div>}
+      {searching && !searchCountsAvailable && <div className="mb-4 text-sm text-muted-foreground" role="status">总数暂不可用，已显示查到的内容{retryButton}</div>}
+      {sorted.map((section) => <PlatformSection key={`${identity}:${generatedAt ?? ''}:${section.key}`} section={section} showHeader />)}
     </div>
   )
 }
@@ -230,7 +212,8 @@ export function ChannelsView({ embedded = false }: { embedded?: boolean } = {}) 
 function PlatformSection({ section, showHeader = true }: { section: FeedSectionType; showHeader?: boolean }) {
   const platform = section.key
   const items = section.items
-  const serverTotal = section.count
+  const countsAvailable = useFeedStore((s) => s.searchResults !== null ? s.searchPlatformCountsAvailable : s.platformCountsGeneratedAt !== null)
+  const serverTotal = countsAvailable ? section.count : null
   const searchQuery = useUIStore((s) => s.searchQuery)
   const isSearchActive = useFeedStore((s) => s.searchResults !== null)
   const activeSearch = isSearchActive ? searchQuery.trim() : ''
@@ -239,6 +222,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   ) ?? EMPTY_COUNT_MAP)
   const platformReadModelVersionId = useFeedStore((s) => s.platformReadModelVersionId)
   const initialPlatformCursor = useFeedStore((s) => s.platformNextCursors[platform] ?? null)
+  const initialCursorKnown = useFeedStore((s) => Object.prototype.hasOwnProperty.call(s.platformNextCursors, platform))
   const expandedKey = useUIStore((s) => s.expandedKey)
   const setExpandedKey = useUIStore((s) => s.setExpandedKey)
   const [sourceFilter, setSourceFilter] = useState<string | null>(null)
@@ -248,7 +232,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   // 避免"某 source 数据被 fetched_at 更新的其他 source 挤出前 50 条客户端 filter 找不到"
   const [sourceItems, setSourceItems] = useState<FeedItem[] | null>(null)
   const [sourceTotal, setSourceTotal] = useState<number | null>(null)
-  const [sourceCursor, setSourceCursor] = useState<InfoReadModelCursor | null>(null)
+  const [sourceCursor, setSourceCursor] = useState<InfoFeedCursor | null>(null)
   const [sourceLoading, setSourceLoading] = useState(false)
   // BF-0419-10: 公众号订阅分组过滤(detail_json.group)
   const [groupFilter, setGroupFilter] = useState<string | null>(null)
@@ -256,7 +240,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   const [, setLwUngrouped] = useState<number>(0)  // BF-0512-3 第二轮: 仅 setter 用于追踪 API 返回的总数,UI 不再独立显示「未分组」
   const [groupItems, setGroupItems] = useState<FeedItem[] | null>(null)
   const [groupTotal, setGroupTotal] = useState<number | null>(null)
-  const [groupCursor, setGroupCursor] = useState<InfoReadModelCursor | null>(null)
+  const [groupCursor, setGroupCursor] = useState<InfoFeedCursor | null>(null)
   const [groupLoading, setGroupLoading] = useState(false)
 
   // v18.2: 所有可见来源 section 都使用 L1 维度 pill。
@@ -269,9 +253,19 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   const classification = useFeedStore((s) => s.classification)
   const [categoryItems, setCategoryItems] = useState<FeedItem[] | null>(null)
   const [categoryTotal, setCategoryTotal] = useState<number | null>(null)
-  const [categoryCursor, setCategoryCursor] = useState<InfoReadModelCursor | null>(null)
-  const [, setCategoryLoading] = useState(false)
+  const [categoryCursor, setCategoryCursor] = useState<InfoFeedCursor | null>(null)
+  const [categoryLoading, setCategoryLoading] = useState(false)
   const filterPageCacheRef = useRef<Map<string, CachedPlatformPage>>(new Map())
+  const [filterRetry, setFilterRetry] = useState(0)
+  const [pageError, setPageError] = useState<'filter' | 'more' | null>(null)
+  const [pageMetadata, setPageMetadata] = useState<Record<string, { total: number | null; hasMore: boolean }>>({})
+  const loadMoreScopeKey = useMemo(() => platformFilterCacheKey(platform, sourceFilter, groupFilter,
+    isL1Dimension ? selectedCategory : null, activeSearch),
+    [platform, sourceFilter, groupFilter, isL1Dimension, selectedCategory, activeSearch])
+  const rememberPageMetadata = (key: string, page: { total: number | null; hasMore: boolean }) => {
+    setPageMetadata((previous) => ({ ...previous, [key]: { total: page.total, hasMore: page.hasMore } }))
+  }
+
 
   const readCachedFilterPage = (
     source: string | null | undefined,
@@ -285,10 +279,10 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     category: string | null | undefined,
     page: PlatformPage,
   ) => {
-    filterPageCacheRef.current.set(
-      platformFilterCacheKey(platform, source, group, category, activeSearch),
-      { items: page.items, total: page.total ?? page.items.length, nextCursor: page.next_cursor ?? null },
-    )
+    const key = platformFilterCacheKey(platform, source, group, category, activeSearch)
+    const cached = { items: page.items, total: page.total ?? null, nextCursor: page.next_cursor ?? null, hasMore: pageHasMore(page) }
+    filterPageCacheRef.current.set(key, cached)
+    rememberPageMetadata(key, cached)
   }
 
   // L1 id → 显示名 map (来自 classification.categories 已加载到 store)
@@ -338,6 +332,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       setGroupItems(cached.items)
       setGroupTotal(cached.total)
       setGroupCursor(cached.nextCursor ?? null)
+      rememberPageMetadata(loadMoreScopeKey, cached)
       setGroupLoading(false)
       return
     }
@@ -347,23 +342,21 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     fetchFeedPlatformMore(platform, 0, BATCH, sourceFilter ?? undefined, groupFilter, undefined, activeSearch || undefined)
       .then((r) => {
         if (!cancelled) {
-          if (r.degraded) return
+          requireUsablePage(r)
           writeCachedFilterPage(sourceFilter, groupFilter, undefined, r)
           setGroupItems(r.items)
-          setGroupTotal(r.total ?? r.items.length)
+          setGroupTotal(r.total ?? null)
           setGroupCursor(r.next_cursor ?? null)
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setGroupItems(null)
-          setGroupTotal(null)
-          setGroupCursor(null)
+          setPageError('filter')
         }
       })
       .finally(() => { if (!cancelled) setGroupLoading(false) })
     return () => { cancelled = true }
-  }, [groupFilter, sourceFilter, platform, activeSearch])
+  }, [groupFilter, sourceFilter, platform, activeSearch, filterRetry])
 
   const sectionKey = `ch-${platform}`
   const isExpanded = expandedKey === sectionKey
@@ -407,6 +400,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       setSourceItems(cached.items)
       setSourceTotal(cached.total)
       setSourceCursor(cached.nextCursor ?? null)
+      rememberPageMetadata(loadMoreScopeKey, cached)
       setSourceLoading(false)
       return
     }
@@ -415,23 +409,21 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     fetchFeedPlatformMore(platform, 0, BATCH, sourceFilter, undefined, undefined, activeSearch || undefined)
       .then((r) => {
         if (!cancelled) {
-          if (r.degraded) return
+          requireUsablePage(r)
           writeCachedFilterPage(sourceFilter, undefined, undefined, r)
           setSourceItems(r.items)
-          setSourceTotal(r.total ?? r.items.length)
+          setSourceTotal(r.total ?? null)
           setSourceCursor(r.next_cursor ?? null)
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setSourceItems(null)
-          setSourceTotal(null)
-          setSourceCursor(null)
+          setPageError('filter')
         }
       })
       .finally(() => { if (!cancelled) setSourceLoading(false) })
     return () => { cancelled = true }
-  }, [sourceFilter, platform, activeSearch])
+  }, [sourceFilter, platform, activeSearch, filterRetry])
 
   // v16.0 W4.T11: L1 pill 切换 → 服务端拉该 category 的数据 (带取消竞态防护)
   // 切回「全部」(selectedCategory === null) 清空 categoryItems, 走默认 section.items
@@ -452,6 +444,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       setCategoryItems(cached.items)
       setCategoryTotal(cached.total)
       setCategoryCursor(cached.nextCursor ?? null)
+      rememberPageMetadata(loadMoreScopeKey, cached)
       setCategoryLoading(false)
       requestAnimationFrame(() => requestAnimationFrame(() => {
         const afterTop = sectionTop()
@@ -468,10 +461,10 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     fetchFeedPlatformMore(platform, 0, BATCH, undefined, undefined, selectedCategory, activeSearch || undefined)
       .then((r) => {
         if (cancelled) return
-        if (r.degraded) return
+        requireUsablePage(r)
         writeCachedFilterPage(undefined, undefined, selectedCategory, r)
         setCategoryItems(r.items)
-        setCategoryTotal(r.total ?? r.items.length)
+        setCategoryTotal(r.total ?? null)
         setCategoryCursor(r.next_cursor ?? null)
         // 双 rAF 等 React render + SectionFront 版面完成后修正 scroll
         requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -485,14 +478,12 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       })
       .catch(() => {
         if (!cancelled) {
-          setCategoryItems(null)
-          setCategoryTotal(null)
-          setCategoryCursor(null)
+          setPageError('filter')
         }
       })
       .finally(() => { if (!cancelled) setCategoryLoading(false) })
     return () => { cancelled = true }
-  }, [selectedCategory, platform, isL1Dimension, activeSearch])
+  }, [selectedCategory, platform, isL1Dimension, activeSearch, filterRetry])
 
   // Filter items by source / group / category
   const filteredItems = useMemo(() => {
@@ -524,35 +515,21 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     () => filteredItems.slice(0, limit),
     [filteredItems, limit],
   )
-  // total：pill 激活时用服务端 source_counts/category_counts/分页 total 全库数字（而非仅取回的 50 条数量）
-  // v16.0 W4.T11: L1 pill 激活 → 用 platformCategoryCounts[selectedCategory] 作为 total
-  const effectiveTotal = (isL1Dimension && selectedCategory)
-    ? (platformCategoryCounts[selectedCategory] ?? categoryTotal ?? filteredItems.length)
-    : groupFilter
-      ? (groupTotal ?? filteredItems.length)
-      : sourceFilter
-        ? (serverSourceCounts[sourceFilter] ?? sourceTotal ?? filteredItems.length)
-        : serverTotal
-  // hasMore: 任意筛选口径都以服务端 total 为准；未过滤时 effectiveTotal=section 全量。
-  const hasMore = filteredItems.length > limit || effectiveTotal > filteredItems.length
-  const remaining = Math.max(effectiveTotal - visibleItems.length, 0)
-  const isFilterLoading = (sourceFilter && sourceLoading) || (groupFilter && groupLoading)
+  const currentPage = pageMetadata[loadMoreScopeKey]
+  const effectiveTotal = currentPage ? currentPage.total : !countsAvailable ? null : (isL1Dimension && selectedCategory)
+    ? (platformCategoryCounts[selectedCategory] ?? categoryTotal)
+    : groupFilter ? groupTotal : sourceFilter ? (serverSourceCounts[sourceFilter] ?? sourceTotal) : serverTotal
+  const remoteHasMore = currentPage ? currentPage.hasMore : (!activeSearch && !sourceFilter && !groupFilter && !selectedCategory && initialCursorKnown)
+    ? initialPlatformCursor !== null : (effectiveTotal !== null ? effectiveTotal > filteredItems.length : filteredItems.length >= BATCH)
+  const hasMore = filteredItems.length > limit || remoteHasMore
+  const remaining = effectiveTotal === null ? 0 : Math.max(effectiveTotal - visibleItems.length, 0)
+  const isFilterLoading = categoryLoading || (sourceFilter && sourceLoading) || (groupFilter && groupLoading)
 
   const loadingMoreRef = useRef(false)
   const loadMoreRequestSeqRef = useRef(0)
   const prefetchedRef = useRef<{ scopeKey: string; offset: number; page: PlatformPage } | null>(null)
   const prefetchRef = useRef<{ scopeKey: string; offset: number; promise: Promise<PlatformPage> } | null>(null)
-  const [platformCursor, setPlatformCursor] = useState<InfoReadModelCursor | null>(null)
-  const loadMoreScopeKey = useMemo(
-    () => [
-      platform,
-      sourceFilter ?? '',
-      groupFilter ?? '',
-      isL1Dimension ? (selectedCategory ?? '') : '',
-      activeSearch,
-    ].join('|'),
-    [platform, sourceFilter, groupFilter, isL1Dimension, selectedCategory, activeSearch],
-  )
+  const [platformCursor, setPlatformCursor] = useState<InfoFeedCursor | null | undefined>(undefined)
   const loadMoreScopeRef = useRef(loadMoreScopeKey)
 
   useEffect(() => {
@@ -561,18 +538,24 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     loadMoreRequestSeqRef.current += 1
     prefetchedRef.current = null
     prefetchRef.current = null
-    setPlatformCursor(null)
+    setPlatformCursor(undefined)
+    setPageError(null)
+    return () => {
+      loadMoreScopeRef.current = ''
+      loadMoreRequestSeqRef.current += 1
+    }
   }, [loadMoreScopeKey])
 
   useEffect(() => {
     if (!hasEnteredViewport) return
     if (sourceFilter || groupFilter || (isL1Dimension && selectedCategory)) return
     const offset = items.length
-    if (offset >= serverTotal) return
+    if (!remoteHasMore) return
     const scopeKey = loadMoreScopeKey
     let cancelled = false
     const timer = window.setTimeout(() => {
       if (cancelled) return
+      if (activeSearch) return
       const existing = prefetchedRef.current
       if (existing && existing.scopeKey === scopeKey && existing.offset === offset) return
       const inFlight = prefetchRef.current
@@ -580,9 +563,9 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       const excludeIds = items.map((item) => item.id)
       const cursor = activeSearch
         ? null
-        : platformCursor ?? initialPlatformCursor ?? makePlatformCursor(platformReadModelVersionId, platform, offset)
+        : platformCursor !== undefined ? platformCursor : initialPlatformCursor ?? makePlatformCursor(platformReadModelVersionId, platform, offset)
 
-      const promise = cursor
+      const request = cursor
         ? fetchFeedPlatformMore(
           platform,
           offset,
@@ -604,6 +587,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
           activeSearch || undefined,
           excludeIds,
         )
+      const promise = request.then(requireUsablePage)
       const token = { scopeKey, offset, promise }
       prefetchRef.current = token
       promise
@@ -611,12 +595,13 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
           if (cancelled) return
           if (prefetchRef.current !== token) return
           if (loadMoreScopeRef.current !== scopeKey) return
-          if (page.degraded) return
-          if (page.items.length > 0) {
+          if (page.items.length > 0 || !pageHasMore(page)) {
             prefetchedRef.current = { scopeKey, offset, page }
           }
         })
-        .catch(() => {})
+        .catch(() => {
+          if (!cancelled && loadMoreScopeRef.current === scopeKey) setPageError('more')
+        })
         .finally(() => {
           if (prefetchRef.current === token) {
             prefetchRef.current = null
@@ -636,6 +621,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     selectedCategory,
     items.length,
     serverTotal,
+    remoteHasMore,
     loadMoreScopeKey,
     platform,
     activeSearch,
@@ -652,9 +638,14 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     if (groupFilter && groupItems === null) return
     if (!groupFilter && sourceFilter && sourceItems === null) return
     if (isL1Dimension && selectedCategory && categoryItems === null) return
+    if (filteredItems.length > limit) {
+      setShowCount((previous) => previous + BATCH)
+      return
+    }
 
     const offset = filteredItems.length
-    if (offset >= effectiveTotal) return
+    if (!remoteHasMore && filteredItems.length <= limit) return
+    setPageError(null)
     const excludeIds = filteredItems.map((item) => item.id)
     const cursor = activeSearch
       ? null
@@ -664,8 +655,15 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
           ? categoryCursor
             : sourceFilter
               ? sourceCursor
-              : platformCursor ?? initialPlatformCursor ?? makePlatformCursor(platformReadModelVersionId, platform, offset)
+              : platformCursor !== undefined ? platformCursor : initialPlatformCursor ?? makePlatformCursor(platformReadModelVersionId, platform, offset)
     const scopeKey = loadMoreScopeKey
+    const requestUser = useAuthStore.getState().user
+    const requestUserId = requestUser?.id
+    const requestRole = requestUser?.role
+    const identityIsCurrent = () => {
+      const current = useAuthStore.getState().user
+      return current?.id === requestUserId && current?.role === requestRole
+    }
     const requestSeq = ++loadMoreRequestSeqRef.current
     loadingMoreRef.current = true
     const prefetched = prefetchedRef.current
@@ -705,8 +703,9 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     }
 
     pagePromise.then((res) => {
-      if (loadMoreScopeRef.current !== scopeKey || loadMoreRequestSeqRef.current !== requestSeq) return
-      if (res.degraded) return
+      if (!identityIsCurrent() || loadMoreScopeRef.current !== scopeKey || loadMoreRequestSeqRef.current !== requestSeq) return
+      requireUsablePage(res)
+      rememberPageMetadata(scopeKey, { total: res.total ?? null, hasMore: pageHasMore(res) })
       const total = res.total ?? null
       let added = 0
       if (groupFilter) {
@@ -730,17 +729,17 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
       } else {
         const merged = mergeUniqueItems(items, res.items)
         added = merged.added
-        if (added > 0) {
-          useFeedStore.getState().appendPlatformItems(platform, res.items)
-        }
+        useFeedStore.getState().appendPlatformItems(platform, res.items, res.next_cursor)
         setPlatformCursor(res.next_cursor ?? null)
       }
       if (added > 0) {
         setShowCount((prev) => prev + added)
       }
-    }).catch(() => {})
+    }).catch(() => {
+      if (identityIsCurrent() && loadMoreScopeRef.current === scopeKey && loadMoreRequestSeqRef.current === requestSeq) setPageError('more')
+    })
       .finally(() => {
-        if (loadMoreScopeRef.current === scopeKey && loadMoreRequestSeqRef.current === requestSeq) {
+        if (identityIsCurrent() && loadMoreScopeRef.current === scopeKey && loadMoreRequestSeqRef.current === requestSeq) {
           loadingMoreRef.current = false
         }
       })
@@ -827,6 +826,7 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
     /* v18.2: L1 维度 pill (所有可见来源 section)，「全部」首位由 L1PillBar 内部实现 */
     <L1PillBar
       platform={platform}
+      countsAvailable={countsAvailable}
       categoryCounts={platformCategoryCounts}
       categoryLabels={categoryLabels}
       categoryOrder={categoryOrder}
@@ -853,11 +853,19 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
   ) : undefined
 
   return (
+    <>
+    {pageError && <div className="mb-3 text-sm text-muted-foreground" role="status">
+      {pageError === 'filter' ? '分类内容加载失败，已保留现有内容。' : '更多内容加载失败，已保留现有内容。'}
+      <button type="button" className="ml-3 text-primary hover:underline" onClick={() => {
+        if (pageError === 'more') handleLoadMore()
+        else { setPageError(null); setFilterRetry((value) => value + 1) }
+      }}>{pageError === 'filter' ? '重试筛选' : '重试加载'}</button>
+    </div>}
     <SectionFront
       sectionKey={platform}
       label={showHeader ? platformName(platform) : undefined}
       /* BF-0512-7: 切 pill 后数字联动（用 effectiveTotal），跟「按类型」FeedSection 一致 */
-      count={showHeader ? effectiveTotal : undefined}
+      count={showHeader ? effectiveTotal ?? undefined : undefined}
       items={visibleItems}
       hasMore={hasMore}
       remaining={remaining}
@@ -872,8 +880,9 @@ function PlatformSection({ section, showHeader = true }: { section: FeedSectionT
         setShowCount(BATCH)
       }}
       onBecameVisible={() => setHasEnteredViewport(true)}
-      pillBar={pillBar}
+      pillBar={effectiveTotal !== null ? pillBar : <div className="flex flex-wrap items-center gap-3"><span className="shrink-0 text-sm text-muted-foreground">总数暂不可用</span>{pillBar}</div>}
       filterLoading={Boolean(isFilterLoading)}
     />
+    </>
   )
 }

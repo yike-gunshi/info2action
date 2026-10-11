@@ -183,6 +183,18 @@
       <td>item 级 LLM verdict（featured / borderline / drop）+ cluster 级聚合，直出「应该立即看到的高价值内容」时间线</td>
     </tr>
     <tr>
+      <td width="150"><b>AI 搜索</b></td>
+      <td>站内词法与向量检索结合，异步生成带引用的总结；支持目录、来源卡片、个人搜索历史和每日额度。需另配 Supabase 与 GLM Coding Plan，见 <a href="docs/SELF-HOST.md#35-ai-搜索可选">自部署说明</a></td>
+    </tr>
+    <tr>
+      <td width="150"><b>统一阅读</b></td>
+      <td>信息、事件与行动共用阅读弹窗，支持全页阅读、目录导航与滚动状态反馈</td>
+    </tr>
+    <tr>
+      <td width="150"><b>更新日志</b></td>
+      <td>公开更新日志页与未读提示，随时查看产品变化</td>
+    </tr>
+    <tr>
       <td width="150"><b>个性化排序</b></td>
       <td>注册 onboarding 画像（角色 / 关注方向 / 常用工具），<code>quality × engagement × freshness × match</code> 纯计算排序，不额外烧 LLM</td>
     </tr>
@@ -200,7 +212,7 @@
     </tr>
     <tr>
       <td width="150"><b>双存储模式</b></td>
-      <td>本地 SQLite 单机全功能；Supabase Postgres + Storage 承载多用户生产（远程 read model + pgvector 召回）</td>
+      <td>本地 SQLite 单机基础能力；Supabase Postgres + Storage 承载多用户生产（远程 read model + pgvector 召回）</td>
     </tr>
   </tbody>
 </table>

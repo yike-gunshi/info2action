@@ -1,8 +1,10 @@
+import { setActiveSearchSignal } from '../lib/api/_search'
 import { useMemo } from 'react'
 import { create } from 'zustand'
 import { toast } from 'sonner'
-import type { FeedItem, ClassificationConfig, FeedSection, InfoReadModelCursor } from '../lib/types'
+import type { FeedItem, ClassificationConfig, FeedSection, InfoReadModelCursor, InfoFeedCursor } from '../lib/types'
 import { triggerFetchAll, fetchFetchStatus, fetchFeedSections, fetchFeedPlatforms, type FetchProgress, type FetchProgressStage } from '../lib/api'
+import { useAuthStore } from './authStore'
 // Search is now server-side — no need for useUIStore
 
 interface FeedState {
@@ -14,7 +16,11 @@ interface FeedState {
   sectionNextCursors: Record<string, InfoReadModelCursor | null>
   // Server-side search results (replaces sectionItems when active)
   searchResults: Map<string, FeedItem[]> | null
-  searchTotal: number
+  searchTotal: number | null
+  searchCountsAvailable: boolean
+  searchPlatformCountsAvailable: boolean
+  searchError: string | null
+  searchPlatformError: string | null
   searchCatCounts: Record<string, number>
   searchPlatformSectionItems: Map<string, FeedItem[]> | null
   searchPlatformCounts: Record<string, number>
@@ -37,7 +43,11 @@ interface FeedState {
   platformCategoryCounts: Record<string, Record<string, number>>
   platformSectionsLoaded: boolean
   platformReadModelVersionId: string | null
-  platformNextCursors: Record<string, InfoReadModelCursor | null>
+  platformNextCursors: Record<string, InfoFeedCursor | null>
+  platformOverviewStale: boolean
+  platformOverviewGeneratedAt: string | null
+  platformCountsGeneratedAt: string | null | undefined
+  platformLoadError: string | null
   // v16.0 W4.T9: 每 platform 当前选中的 L1 pill (null = 「全部」),用于 ChannelsView 状态持久化(切走再回保留选择)
   selectedCategory: Record<string, string | null>
   clickedAtById: Record<string, string>
@@ -58,7 +68,8 @@ interface FeedState {
     sourceCounts?: Record<string, Record<string, number>>,
     categoryCounts?: Record<string, Record<string, number>>,
     readModelVersionId?: string | null,
-    platformNextCursors?: Record<string, InfoReadModelCursor | null>,
+    platformNextCursors?: Record<string, InfoFeedCursor | null>,
+    metadata?: { stale?: boolean; overview_generated_at?: string; counts_generated_at?: string | null },
   ) => void
   /** v16.0 W4.T9: 设置某 platform 当前选中的 L1 pill (null = 「全部」) */
   setSelectedCategory: (platform: string, category: string | null) => void
@@ -70,8 +81,8 @@ interface FeedState {
   // v12.2: Twitter 视频 ASR 完成后回写 ai_summary, 列表卡片摘要同步刷新
   updateItemSummary: (itemId: string, newSummary: string) => void
   appendCategoryItems: (category: string, items: FeedItem[]) => void
-  appendPlatformItems: (platform: string, items: FeedItem[]) => void
-  ensurePlatformSections: () => Promise<void>
+  appendPlatformItems: (platform: string, items: FeedItem[], cursor?: InfoFeedCursor | null) => void
+  ensurePlatformSections: (force?: boolean) => Promise<void>
   serverSearch: (query: string) => void
   clearSearch: () => void
   startFetch: () => void
@@ -307,25 +318,15 @@ function pollUntilDone(set: (partial: Partial<FeedState>) => void, get: () => Fe
         try {
           const requests = [
             fetchFeedSections(),
-            get().platformSectionsLoaded ? fetchFeedPlatforms() : Promise.resolve(null),
+            get().platformSectionsLoaded ? get().ensurePlatformSections(true) : Promise.resolve(null),
           ] as const
-          const [feedRes, platRes] = await Promise.allSettled(requests)
+          const [feedRes] = await Promise.allSettled(requests)
           if (feedRes.status === 'fulfilled') {
             get().setSections(
               feedRes.value.sections,
               feedRes.value.cat_counts,
               feedRes.value.read_model_version_id ?? null,
               feedRes.value.section_next_cursors,
-            )
-          }
-          if (platRes.status === 'fulfilled' && platRes.value) {
-            get().setPlatformSections(
-              platRes.value.sections,
-              platRes.value.platform_counts,
-              platRes.value.source_counts,
-              platRes.value.category_counts,
-              platRes.value.read_model_version_id ?? null,
-              platRes.value.platform_next_cursors,
             )
           }
         } catch { /* ignore */ }
@@ -337,8 +338,11 @@ function pollUntilDone(set: (partial: Partial<FeedState>) => void, get: () => Fe
 }
 
 let _searchTimer: ReturnType<typeof setTimeout> | null = null
+let _searchController: AbortController | null = null
+let _lastSearchQuery = ''
 let _searchSeq = 0
 let _platformSectionsPromise: Promise<void> | null = null
+let _platformRequestEpoch = 0
 
 export const useFeedStore = create<FeedState>((set, get) => ({
   sectionItems: new Map(),
@@ -352,10 +356,18 @@ export const useFeedStore = create<FeedState>((set, get) => ({
   platformSectionsLoaded: false,
   platformReadModelVersionId: null,
   platformNextCursors: {},
+  platformOverviewStale: false,
+  platformOverviewGeneratedAt: null,
+  platformCountsGeneratedAt: undefined,
+  platformLoadError: null,
   selectedCategory: {},
   clickedAtById: {},
   searchResults: null,
   searchTotal: 0,
+  searchCountsAvailable: true,
+  searchPlatformCountsAvailable: true,
+  searchError: null,
+  searchPlatformError: null,
   searchCatCounts: {},
   searchPlatformSectionItems: null,
   searchPlatformCounts: {},
@@ -384,7 +396,7 @@ export const useFeedStore = create<FeedState>((set, get) => ({
     })
   },
 
-  setPlatformSections: (sections, platformCounts, sourceCounts, categoryCounts, readModelVersionId, platformNextCursors) => {
+  setPlatformSections: (sections, platformCounts, sourceCounts, categoryCounts, readModelVersionId, platformNextCursors, metadata) => {
     const map = new Map<string, FeedItem[]>()
     for (const [key, items] of Object.entries(sections)) {
       map.set(key, [...items])
@@ -397,6 +409,10 @@ export const useFeedStore = create<FeedState>((set, get) => ({
       platformSectionsLoaded: true,
       platformReadModelVersionId: readModelVersionId ?? null,
       platformNextCursors: platformNextCursors ?? {},
+      platformOverviewStale: metadata?.stale ?? false,
+      platformOverviewGeneratedAt: metadata?.overview_generated_at ?? null,
+      platformCountsGeneratedAt: metadata?.counts_generated_at,
+      platformLoadError: null,
     })
   },
 
@@ -455,77 +471,85 @@ export const useFeedStore = create<FeedState>((set, get) => ({
     return state.searchResults ? { searchResults: map } : { sectionItems: map }
   }),
 
-  appendPlatformItems: (platform, newItems) => set((state) => {
+  appendPlatformItems: (platform, newItems, cursor) => set((state) => {
     const map = new Map(state.searchPlatformSectionItems ?? state.platformSectionItems)
     const existing = map.get(platform) || []
     const existingIds = new Set(existing.map((it) => it.id))
     const deduped = newItems.filter((it) => !existingIds.has(it.id))
     map.set(platform, [...existing, ...deduped])
-    return state.searchPlatformSectionItems ? { searchPlatformSectionItems: map } : { platformSectionItems: map }
+    return state.searchPlatformSectionItems ? { searchPlatformSectionItems: map } : {
+      platformSectionItems: map,
+      ...(cursor !== undefined ? { platformNextCursors: { ...state.platformNextCursors, [platform]: cursor } } : {}),
+    }
   }),
 
-  ensurePlatformSections: () => {
-    const current = get()
-    if (current.platformSectionsLoaded && current.platformSectionItems.size > 0) {
-      return Promise.resolve()
-    }
-    if (_platformSectionsPromise) return _platformSectionsPromise
-
-    _platformSectionsPromise = fetchFeedPlatforms()
+  ensurePlatformSections: (force = false) => {
+    if (!force && get().platformSectionsLoaded) return Promise.resolve()
+    if (!force && _platformSectionsPromise) return _platformSectionsPromise
+    const epoch = ++_platformRequestEpoch
+    set({ platformLoadError: null })
+    const request = (force ? fetchFeedPlatforms({ force: true }) : fetchFeedPlatforms())
       .then((platRes) => {
-        if (platRes.degraded) {
-          throw new Error(platRes.degraded_reason || platRes.fallback_reason || 'platform sections degraded')
+        if (epoch !== _platformRequestEpoch) return
+        const usableStale = platRes.stale === true && Object.values(platRes.sections).some((items) => items.length > 0)
+        if (platRes.degraded && !usableStale) {
+          throw new Error(platRes.degraded_reason || platRes.fallback_reason || '来源数据加载失败，请重试')
         }
         get().setPlatformSections(
-          platRes.sections,
-          platRes.platform_counts,
-          platRes.source_counts,
-          platRes.category_counts,
-          platRes.read_model_version_id ?? null,
-          platRes.platform_next_cursors,
+          platRes.sections, platRes.platform_counts, platRes.source_counts, platRes.category_counts,
+          platRes.read_model_version_id ?? null, platRes.platform_next_cursors, platRes,
         )
-        set({ loadError: null })
+      })
+      .catch((err: unknown) => {
+        if (epoch !== _platformRequestEpoch) return
+        set({ platformLoadError: '来源数据加载失败，请重试' })
+        throw err
       })
       .finally(() => {
-        _platformSectionsPromise = null
+        if (_platformSectionsPromise === request) _platformSectionsPromise = null
       })
-    return _platformSectionsPromise
+    _platformSectionsPromise = request
+    return request
   },
 
   serverSearch: (query) => {
     if (_searchTimer) clearTimeout(_searchTimer)
+    _searchController?.abort()
+    setActiveSearchSignal()
     const q = query.trim()
+    const sameQuery = q === _lastSearchQuery
+    _lastSearchQuery = q
     const seq = ++_searchSeq
     if (!q) {
-      set({
-        searchResults: null,
-        searchTotal: 0,
-        searchCatCounts: {},
-        searchPlatformSectionItems: null,
-        searchPlatformCounts: {},
-        searchSourceCounts: {},
-        searchPlatformCategoryCounts: {},
-        searchPlatformLoading: false,
-        isSearching: false,
-        searchDegraded: false,
-      })
+      get().clearSearch()
       return
     }
     set({
+      searchResults: sameQuery ? get().searchResults ?? new Map() : new Map(),
+      searchDegraded: false,
+      searchError: null,
+      searchPlatformError: null,
+      searchTotal: sameQuery ? get().searchTotal : null,
+      searchCatCounts: sameQuery ? get().searchCatCounts : {},
+      searchCountsAvailable: sameQuery ? get().searchCountsAvailable : true,
+      searchPlatformCountsAvailable: sameQuery ? get().searchPlatformCountsAvailable : true,
       isSearching: true,
-      searchPlatformSectionItems: null,
-      searchPlatformCounts: {},
-      searchSourceCounts: {},
-      searchPlatformCategoryCounts: {},
+      searchPlatformSectionItems: sameQuery ? get().searchPlatformSectionItems : null,
+      searchPlatformCounts: sameQuery ? get().searchPlatformCounts : {},
+      searchSourceCounts: sameQuery ? get().searchSourceCounts : {},
+      searchPlatformCategoryCounts: sameQuery ? get().searchPlatformCategoryCounts : {},
       searchPlatformLoading: true,
     })
     _searchTimer = setTimeout(async () => {
       try {
-        const res = await fetchFeedSections({ search: q })
+        _searchController = new AbortController()
+        setActiveSearchSignal(_searchController.signal)
+        const request = { signal: _searchController.signal, deadline: Date.now() + 120_000 }
+        const res = await fetchFeedSections({ search: q, request })
         if (seq !== _searchSeq) return
         if (res.degraded) {
           // BF-0704-6: 保留旧结果的同时显式暴露降级,UI 提示"搜索暂时不可用"
-          set({ isSearching: false, searchPlatformLoading: false, searchDegraded: true })
+          set({ isSearching: false, searchPlatformLoading: false, searchDegraded: true, searchError: '搜索暂时不可用，请重试', searchPlatformError: '搜索暂时不可用，请重试' })
           return
         }
         const map = new Map<string, FeedItem[]>()
@@ -535,15 +559,16 @@ export const useFeedStore = create<FeedState>((set, get) => ({
         set({
           searchResults: map,
           searchTotal: res.total,
+          searchCountsAvailable: res.counts_available !== false,
           searchCatCounts: res.cat_counts ?? {},
           isSearching: false,
           searchDegraded: false,
         })
-        fetchFeedPlatforms({ search: q })
+        fetchFeedPlatforms({ search: q, request })
           .then((platRes) => {
             if (seq !== _searchSeq) return
             if (platRes.degraded) {
-              set({ searchPlatformSectionItems: null, searchPlatformLoading: false })
+              set({ searchPlatformLoading: false, searchPlatformError: '来源搜索暂时不可用，请重试' })
               return
             }
             const platformMap = new Map<string, FeedItem[]>()
@@ -553,22 +578,27 @@ export const useFeedStore = create<FeedState>((set, get) => ({
             set({
               searchPlatformSectionItems: platformMap,
               searchPlatformCounts: platRes.platform_counts ?? {},
+              searchPlatformCountsAvailable: platRes.counts_available !== false,
               searchSourceCounts: platRes.source_counts ?? {},
               searchPlatformCategoryCounts: platRes.category_counts ?? {},
               searchPlatformLoading: false,
             })
           })
-          .catch(() => {
-            if (seq === _searchSeq) set({ searchPlatformSectionItems: null, searchPlatformLoading: false })
+          .catch((error: unknown) => {
+            if (seq === _searchSeq) set({ searchPlatformLoading: false, searchPlatformError: error instanceof Error ? error.message : '来源搜索暂时不可用，请重试' })
           })
-      } catch {
+      } catch (error) {
         if (seq !== _searchSeq) return
-        set({ isSearching: false, searchPlatformLoading: false, searchDegraded: true })
+        const message = error instanceof Error ? error.message : '搜索暂时不可用，请重试'
+        set({ isSearching: false, searchPlatformLoading: false, searchDegraded: true, searchError: message, searchPlatformError: message })
       }
     }, 300)
   },
 
   clearSearch: () => {
+    _searchController?.abort()
+    setActiveSearchSignal()
+    _lastSearchQuery = ''
     _searchSeq += 1
     if (_searchTimer) clearTimeout(_searchTimer)
     set({
@@ -582,6 +612,10 @@ export const useFeedStore = create<FeedState>((set, get) => ({
       searchPlatformLoading: false,
       isSearching: false,
       searchDegraded: false,
+      searchError: null,
+      searchPlatformError: null,
+      searchCountsAvailable: true,
+      searchPlatformCountsAvailable: true,
     })
   },
 
@@ -629,6 +663,22 @@ export const useFeedStore = create<FeedState>((set, get) => ({
 }))
 
 // --- Client-side keyword classification fallback ---
+// Responses and in-memory private pages belong to one authenticated identity.
+useAuthStore.subscribe((state, previous) => {
+  if (state.user?.id === previous.user?.id && state.user?.role === previous.user?.role) return
+  _platformRequestEpoch += 1
+  _platformSectionsPromise = null
+  useFeedStore.getState().clearSearch()
+  useFeedStore.setState({
+    platformSectionItems: new Map(), platformCounts: {}, sourceCounts: {}, platformCategoryCounts: {},
+    platformSectionsLoaded: false, platformNextCursors: {}, platformReadModelVersionId: null,
+    platformOverviewStale: false, platformOverviewGeneratedAt: null, platformCountsGeneratedAt: undefined,
+    platformLoadError: null, selectedCategory: {}, searchPlatformSectionItems: null,
+    searchPlatformCounts: {}, searchSourceCounts: {}, searchPlatformCategoryCounts: {},
+    searchResults: null, isSearching: false, searchPlatformLoading: false,
+  })
+})
+
 export function classifyByKeywords(item: FeedItem, categories: ClassificationConfig['categories']): string | null {
   const titleText = (item.title || '').toLowerCase()
   const bodyText = ((item.content || '') + (item.description || '') + (item.ai_summary || '')).toLowerCase()
@@ -695,6 +745,7 @@ export const useSectionItems = (): FeedSection[] => {
   const catCounts = useFeedStore((s) => s.catCounts)
   const searchCatCounts = useFeedStore((s) => s.searchCatCounts)
   const classification = useFeedStore((s) => s.classification)
+  const countsAvailable = useFeedStore((s) => s.searchCountsAvailable)
   const isSearching = useFeedStore((s) => s.searchResults !== null)
 
   return useMemo(() => {
@@ -703,7 +754,7 @@ export const useSectionItems = (): FeedSection[] => {
       for (const [key, items] of activeItems) {
         if (items.length > 0) {
           const serverTotal = isSearching ? (searchCatCounts[key] ?? items.length) : (catCounts[key] ?? items.length)
-          sections.push({ key, label: key, items, count: serverTotal })
+          sections.push({ key, label: key, items, count: serverTotal, countKnown: !isSearching || countsAvailable })
         }
       }
       return sections
@@ -715,12 +766,12 @@ export const useSectionItems = (): FeedSection[] => {
       .map((cat) => {
         const items = activeItems.get(cat.id) ?? []
         const serverTotal = isSearching ? (searchCatCounts[cat.id] ?? items.length) : (catCounts[cat.id] ?? items.length)
-        return { key: cat.id, label: cat.name, items, count: serverTotal }
+        return { key: cat.id, label: cat.name, items, count: serverTotal, countKnown: !isSearching || countsAvailable }
       })
       .filter((s) => s.items.length > 0 && !HIDDEN_CATEGORIES.has(s.key))
 
     return sections
-  }, [activeItems, catCounts, searchCatCounts, classification, isSearching])
+  }, [activeItems, catCounts, searchCatCounts, classification, isSearching, countsAvailable])
 }
 
 /** Returns items grouped by platform (flattened from active items) */
@@ -753,13 +804,15 @@ export const usePlatformSections = (): FeedSection[] => {
   const searchResults = useFeedStore((s) => s.searchResults)
   const searchPlatformItems = useFeedStore((s) => s.searchPlatformSectionItems)
   const searchPlatformCounts = useFeedStore((s) => s.searchPlatformCounts)
+  const countsAvailable = useFeedStore((s) => s.searchPlatformCountsAvailable)
 
   return useMemo(() => {
-    if (searchResults && searchPlatformItems) {
+    if (searchResults) {
+      if (!searchPlatformItems) return []
       const sections: FeedSection[] = []
       for (const [key, items] of searchPlatformItems) {
         if (items.length > 0) {
-          sections.push({ key, label: key, items, count: searchPlatformCounts[key] ?? items.length })
+          sections.push({ key, label: key, items, count: searchPlatformCounts[key] ?? items.length, countKnown: countsAvailable })
         }
       }
       return sections
@@ -772,7 +825,7 @@ export const usePlatformSections = (): FeedSection[] => {
       }
     }
     return sections
-  }, [platformItems, platformCounts, searchResults, searchPlatformItems, searchPlatformCounts])
+  }, [platformItems, platformCounts, searchResults, searchPlatformItems, searchPlatformCounts, countsAvailable])
 }
 
 /** v16.0 W4.T9: 返回某 platform 非空 L1 分类的列表(按数量降序)。

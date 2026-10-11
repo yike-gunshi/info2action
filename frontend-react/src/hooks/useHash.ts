@@ -145,7 +145,8 @@ export function useHash() {
     s?: string | null
     d?: string | null
   }) => {
-    const current = new URLSearchParams(window.location.hash.slice(1))
+    const hash = window.location.hash.slice(1)
+    const current = new URLSearchParams(hash === 'changelog' ? '' : hash)
     if (params.v !== undefined) {
       current.set('v', params.v)
       current.delete('a')

@@ -18,6 +18,7 @@ import db
 import feedback_store
 import ranking
 import remote_db
+from feed_search import SearchRoute
 from authz import can_access_all, require_admin
 from deps import BASE
 from routes.public_response_cache import (
@@ -27,7 +28,7 @@ from routes.public_response_cache import (
 )
 from time_utils import to_utc_iso
 
-router = APIRouter()
+router = APIRouter(route_class=SearchRoute)
 
 
 def _get_user_id(request: Request):
@@ -228,6 +229,23 @@ def _optional_read_model_cursor(value):
     if exclude_ids:
         cursor['exclude_ids'] = exclude_ids
     return cursor
+
+
+def _optional_source_cursor(value):
+    raw = _optional_query_str(value)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError('Invalid source cursor JSON')
+    if isinstance(data, dict) and 'kind' in data:
+        if data.get('kind') != 'live' or data.get('v') != 1 or not _optional_query_str(data.get('scope_key')):
+            raise ValueError('Invalid source live cursor')
+        if not isinstance(data.get('after'), dict):
+            raise ValueError('Invalid source live cursor position')
+        return data
+    return _optional_read_model_cursor(value)
 
 
 @router.get("/api/admin/info-read-model/freshness")
@@ -857,7 +875,7 @@ def _get_category_counts_for_all_platforms(conn, *, user_id, public_only,
 
 
 @router.get("/api/feed/platforms")
-def get_feed_platforms(request: Request, search: str = Query(None)):
+def get_feed_platforms(request: Request, search: str = Query(None), refresh: bool = Query(False)):
     """Get items grouped by platform (first-paint sample per platform) + platform_counts.
 
     v16.0 W3.T7: 同时返回 category_counts (每平台近 7 天 L1 分布) 给所有平台,
@@ -873,7 +891,8 @@ def get_feed_platforms(request: Request, search: str = Query(None)):
     per_platform = 50 if search else first_paint_per_group
     feed_remote = remote_db.feed_read_from_remote()
     cache_key = None
-    if feed_remote and search is None and is_public_get_request(request, public_only=public_only):
+    force_refresh = refresh is True or getattr(request, 'headers', {}).get('cache-control', '').lower() == 'no-cache'
+    if feed_remote and search is None and not force_refresh and is_public_get_request(request, public_only=public_only):
         cache_key = ("feed_platforms", _public_cache_scope(), min_github_stars, first_paint_per_group)
         cached = get_public_json_response(cache_key)
         if cached is not None:
@@ -887,8 +906,11 @@ def get_feed_platforms(request: Request, search: str = Query(None)):
                 public_only=public_only,
                 manual_owner_user_id=manual_owner_user_id,
                 min_github_stars=min_github_stars,
+                force_refresh=force_refresh,
             )
             result = _prune_disabled_platforms(result)
+            if result.get('degraded') or result.get('stale'):
+                return JSONResponse(result, headers={'Cache-Control': 'no-store'})
             if cache_key is not None:
                 return set_public_json_response(cache_key, result)
             return result
@@ -973,7 +995,10 @@ def get_feed_platforms_more(
     group = _optional_query_str(group)
     category = _optional_query_str(category)
     search = _optional_query_str(search)
-    read_model_cursor = _optional_read_model_cursor(cursor)
+    try:
+        read_model_cursor = _optional_source_cursor(cursor)
+    except ValueError as exc:
+        return JSONResponse({'error': 'Invalid source cursor', 'detail': str(exc)}, status_code=400)
     excluded_item_ids = [
         item_id.strip()
         for item_id in (exclude_ids or "").split(",")
@@ -998,6 +1023,8 @@ def get_feed_platforms_more(
                 manual_owner_user_id=manual_owner_user_id,
                 min_github_stars=_github_display_min_stars(),
             )
+        except ValueError as exc:
+            return JSONResponse({'error': 'Invalid source cursor', 'detail': str(exc)}, status_code=400)
         except remote_db.RemoteDBError as exc:
             return _remote_error_response(exc)
 

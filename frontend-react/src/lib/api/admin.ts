@@ -6,6 +6,84 @@ import type {
 } from '../types'
 import { apiFetch } from './_client'
 
+import type { AiSearchJobStatus } from './aiSearch'
+export type { AiSearchJobStatus } from './aiSearch'
+
+export interface AiSearchJobUsage {
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  completion_tokens_details?: { reasoning_tokens?: number | null } | null
+  reasoning_tokens?: number | null
+}
+
+export interface AiSearchJobRow {
+  id: string
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  status: AiSearchJobStatus
+  query: string
+  lexical_hits: number
+  vector_hits: number
+  vector_ok: boolean
+  candidate_count: number
+  elapsed_ms: number | null
+  usage: AiSearchJobUsage | null
+  points_estimate: number | null
+  error: string | null
+}
+
+export interface AiSearchJobsResponse {
+  jobs: AiSearchJobRow[]
+  total: number
+  limit: number
+  offset: number
+  quota: { cap_day: number | null; used_day: number; used_month: number; user_day: number | null; concurrency: number }
+  params: {
+    model: string
+    max_tokens: number
+    reasoning_effort: string
+    sim_min: number
+    quality_min: number | null
+    window_days: number
+  }
+}
+
+export interface AiSearchJobDetail extends AiSearchJobRow {
+  query_lexical: string
+  input_text: string | null
+  result: unknown
+  content_md_final: string | null
+  cited_ids: string[]
+  candidate_meta: Array<{
+    id: string
+    sim: number | null
+    hs10: number | null
+    tier: string | null
+    legs?: string[]
+  }>
+  request_params: Record<string, unknown> | null
+  model: string | null
+  prompt_version: string | null
+}
+
+export async function getAiSearchJobs(params: {
+  limit?: number
+  offset?: number
+  status?: AiSearchJobStatus | ''
+} = {}): Promise<AiSearchJobsResponse> {
+  const qs = new URLSearchParams({
+    limit: String(params.limit ?? 50),
+    offset: String(params.offset ?? 0),
+    status: params.status ?? '',
+  })
+  return apiFetch(`/api/admin/ai-search/jobs?${qs}`)
+}
+
+export async function getAiSearchJob(id: string): Promise<AiSearchJobDetail> {
+  return apiFetch(`/api/admin/ai-search/jobs/${encodeURIComponent(id)}`)
+}
+
 // ── Admin ──
 
 export interface InviteCode {

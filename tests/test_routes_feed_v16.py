@@ -47,6 +47,9 @@ def app_with_tmp_db(monkeypatch):
     # Reset the v16.0 cache between tests (5min TTL would otherwise cross-pollinate)
     import routes.feed as feed_route
     feed_route._CATEGORY_COUNTS_CACHE.clear()
+    # These are SQLite fixture tests even when the workspace .env uses remote
+    # production reads. Do not let app import's dotenv loading change the backend.
+    monkeypatch.setattr(feed_route.remote_db, "feed_read_from_remote", lambda: False)
 
     # 跳过 anonymous public_only gate（避免 manual 平台数据被隐藏 + manual 测试外干扰）；
     # 测试聚焦 v16.0 数据形态而非鉴权回归（鉴权另由 test_owner_isolation.py 覆盖）。

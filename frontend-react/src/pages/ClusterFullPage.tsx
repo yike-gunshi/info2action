@@ -7,16 +7,37 @@
  *
  * merged_into redirect: store.modalState='redirecting' 时 history.replaceState 到新 id。
  */
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
+import type { ReactNode } from 'react'
 import { ArrowLeft, ExternalLink } from 'lucide-react'
 import { useClusterDetailStore } from '../store/clusterDetailStore'
 import { ClusterLeftPanel } from '../components/cluster/ClusterLeftPanel'
 import { ClusterRightPanel } from '../components/cluster/ClusterRightPanel'
 import { BrandWordmark } from '../components/shared/BrandWordmark'
+import { formatReadingDateTime } from '../components/reading/readingUtils'
+import { useScrollbarReveal } from '../hooks/useScrollbarReveal'
 import { eventCategoryLabel } from '../lib/eventCategories'
 
 interface ClusterFullPageProps {
   clusterId: number
+}
+
+function ClusterScrollSection({
+  children,
+  className,
+  testId,
+}: {
+  children: ReactNode
+  className: string
+  testId: string
+}) {
+  const ref = useRef<HTMLElement>(null)
+  useScrollbarReveal(ref)
+  return (
+    <section ref={ref} className={className} data-testid={testId}>
+      {children}
+    </section>
+  )
 }
 
 function goBackOrClose() {
@@ -50,14 +71,7 @@ export function ClusterFullPage({ clusterId }: ClusterFullPageProps) {
   const categoryLabel = eventCategoryLabel(cluster?.category)
   const sourceCount = cluster?.unique_source_count ?? sources.length
   const kickerTimeRaw = cluster?.last_doc_at || cluster?.first_doc_at
-  const kickerTime = kickerTimeRaw
-    ? new Date(kickerTimeRaw).toLocaleString('zh-CN', {
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-      })
-    : null
+  const kickerTime = formatReadingDateTime(kickerTimeRaw)
   const sortedSources = useMemo(() => {
     return [...sources].sort((a, b) => {
       const aTime = a.published_at ? new Date(a.published_at).getTime() : 0
@@ -200,9 +214,9 @@ export function ClusterFullPage({ clusterId }: ClusterFullPageProps) {
               className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1.18fr)_minmax(0,0.82fr)] lg:h-[calc(100dvh-104px)] lg:min-h-[420px] lg:items-stretch lg:overflow-hidden"
               data-testid="cluster-full-grid"
             >
-              <section
-                className="event-detail-scrollbar min-w-0 lg:min-h-0 lg:overflow-y-auto lg:pr-6"
-                data-testid="cluster-source-scroll"
+              <ClusterScrollSection
+                className="reading-page-scroll reading-page-scroll-left min-w-0 lg:min-h-0 lg:overflow-y-auto"
+                testId="cluster-source-scroll"
               >
                 {/* v24.0 §21.5 内页标题区: kicker(mono 12px) + 28px/1.3 衬线标题 + Scotch rule
                     (复用批次① event-scotch-rule 同款双线),随左栏滚动 */}
@@ -230,10 +244,10 @@ export function ClusterFullPage({ clusterId }: ClusterFullPageProps) {
                   />
                 </header>
                 <ClusterLeftPanel sources={sortedSources} />
-              </section>
-              <section
-                className="event-detail-scrollbar min-w-0 lg:min-h-0 lg:overflow-y-auto lg:border-l lg:border-dashed lg:border-border lg:pl-6"
-                data-testid="cluster-summary-scroll"
+              </ClusterScrollSection>
+              <ClusterScrollSection
+                className="reading-page-scroll reading-page-scroll-right min-w-0 lg:min-h-0 lg:overflow-y-auto lg:border-l lg:border-dashed lg:border-border lg:pl-6"
+                testId="cluster-summary-scroll"
               >
                 <ClusterRightPanel
                   cluster={cluster}
@@ -242,7 +256,7 @@ export function ClusterFullPage({ clusterId }: ClusterFullPageProps) {
                   showActions
                   className="h-full"
                 />
-              </section>
+              </ClusterScrollSection>
             </div>
           </>
         )}

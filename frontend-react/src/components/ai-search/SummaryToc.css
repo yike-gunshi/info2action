@@ -1,0 +1,78 @@
+/* Keep the toc absolute, centered together with the document and citation column. */
+.ai-search-toc {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: calc(50% + (var(--ai-doc-max) + var(--ai-col-gap) + var(--ai-col-w)) / 2 + var(--ai-toc-gap) - (var(--ai-toc-w) + var(--ai-toc-gap)) / 2);
+  width: var(--ai-toc-w);
+  padding-top: var(--ai-left-pt);
+}
+
+.ai-search-toc-inner {
+  position: sticky;
+  top: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;   /* 滚到头不把滚动链传给正文 */
+  scrollbar-width: none;
+}
+.ai-search-toc-inner::-webkit-scrollbar { display: none; }
+
+.ai-search-toc-list {
+  position: relative;
+}
+.ai-search-toc-list::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--ai-toc-rule-w);
+  background: var(--ai-toc-rule);
+  pointer-events: none;
+}
+
+.ai-search-toc-skeleton-row {
+  padding: var(--ai-toc-item-py) 0 var(--ai-toc-item-py) var(--ai-toc-indent);
+  height: calc(var(--ai-toc-size) * var(--ai-toc-lh) + var(--ai-toc-item-py) * 2);
+  display: flex; /* fixed: 灰条在目录行中垂直居中 */
+  align-items: center; /* fixed: 与真实目录的文字基线位置对应 */
+}
+.ai-search-toc-skeleton-bar {
+  display: block; /* fixed: 目录加载占位 */
+  width: 75%; /* fixed: 灰条模拟短标题 */
+  height: var(--ai-toc-size);
+  border-radius: var(--ai-sk-bar-radius);
+  background: var(--ai-skeleton);
+}
+.ai-search-toc-skeleton-row:nth-child(even) > span { width: 55%; /* fixed: 交错的目录标题长度 */ }
+
+.ai-search-toc button {
+  position: relative;
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: var(--serif);
+  font-size: var(--ai-toc-size);
+  line-height: var(--ai-toc-lh);
+  color: var(--ai-toc-fg);
+  padding: var(--ai-toc-item-py) 0 var(--ai-toc-item-py) var(--ai-toc-indent);
+  cursor: pointer;
+}
+.ai-search-toc button[aria-current='location']::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: var(--ai-toc-item-py);
+  bottom: var(--ai-toc-item-py);
+  width: var(--ai-toc-rule-w);
+  background: var(--ai-toc-active);
+}
+.ai-search-toc button:hover { color: var(--brand); }
+.ai-search-toc button[aria-current='location'] {
+  color: var(--ai-toc-active);
+}
+.ai-search-toc button:focus-visible {
+  outline: var(--ai-toc-rule-w) solid var(--brand-border);
+  outline-offset: calc(-1 * var(--ai-toc-rule-w));
+}

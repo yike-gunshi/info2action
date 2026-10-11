@@ -210,7 +210,7 @@ def prewarm_platforms(
     t1 = time.time()
     try:
         # 对齐 Wave2 首屏每组条数,使 prewarm 预热的缓存条目正是路由首屏请求命中的那个。
-        query_feed_sections(
+        sections_result = query_feed_sections(
             per_category=_feed_first_paint_per_group(),
             search=None,
             user_id=None,
@@ -219,7 +219,9 @@ def prewarm_platforms(
             min_github_stars=50,
         )
         timings['sections_query_ms'] = int((time.time() - t1) * 1000)
-        timings['sections_query_ok'] = True
+        timings['sections_query_ok'] = not bool(sections_result.get('degraded') or sections_result.get('stale'))
+        if not timings['sections_query_ok']:
+            timings['sections_query_error'] = sections_result.get('degraded_reason') or 'degraded_or_stale'
     except Exception as exc:
         timings['sections_query_ms'] = int((time.time() - t1) * 1000)
         timings['sections_query_ok'] = False
@@ -227,16 +229,19 @@ def prewarm_platforms(
 
     t1 = time.time()
     try:
-        query_feed_platforms(
+        platforms_result = query_feed_platforms(
             per_platform=_feed_first_paint_per_group(),
             search=None,
             user_id=None,
             public_only=True,
             manual_owner_user_id=None,
-            min_github_stars=50,
+            min_github_stars=_source_display_min_stars(),
+            force_refresh=True,
         )
         timings['query_ms'] = int((time.time() - t1) * 1000)
-        timings['query_ok'] = True
+        timings['query_ok'] = not bool(platforms_result.get('degraded') or platforms_result.get('stale'))
+        if not timings['query_ok']:
+            timings['query_error'] = platforms_result.get('degraded_reason') or 'degraded_or_stale'
     except Exception as exc:
         timings['query_ms'] = int((time.time() - t1) * 1000)
         timings['query_ok'] = False

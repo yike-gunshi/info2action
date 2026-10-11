@@ -74,7 +74,9 @@ export function SubmitPanel() {
   // Persist records under the current user's namespace.
   useEffect(() => {
     if (loadedStorageKey !== storageKey) return
-    localStorage.setItem(storageKey, JSON.stringify(records.slice(0, 20)))
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(records.slice(0, 20)))
+    } catch { /* Browser storage may be disabled; the topbar must remain usable. */ }
   }, [loadedStorageKey, records, storageKey])
 
   // Close on outside click

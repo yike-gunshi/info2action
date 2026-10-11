@@ -70,4 +70,20 @@ describe('v19 dark tokens', () => {
     expect(token('--modal-current-bg')).toBe('#3A2A21')
     expect(token('--modal-danger-surface')).toBe('#2D201B')
   })
+
+  it('keeps contextual reading scrollbars hidden at rest with progressive scroll fades', () => {
+    expect(globalsCss).toContain('--scrollbar-hide-ms: 1000ms;')
+    expect(globalsCss).toContain('--scrollbar-w: 8px;')
+    expect(globalsCss).toContain('--scroll-fade: 32px;')
+    expect(globalsCss).toMatch(/\.reveal-scroll\[data-scrollbar='on'\][\s\S]*scrollbar-color:\s*var\(--scrollbar-thumb-current\) transparent;/)
+    expect(globalsCss).toMatch(/@supports \(animation-timeline: scroll\(\)\)\s*\{[\s\S]*animation-timeline:\s*scroll\(self\), scroll\(self\);/)
+    expect(globalsCss).toMatch(/@property --scroll-fade-bottom\s*\{[\s\S]*?initial-value:\s*0px;/)
+    expect(globalsCss).toMatch(/\.reading-page-scroll-right\s*\{\s*padding-right:\s*max\(0px, calc\(var\(--scrollbar-gutter\) - var\(--scrollbar-actual, 0px\)\)\);\s*\}/)
+    expect(globalsCss).not.toContain('.event-detail-scrollbar')
+  })
+
+
+  it('justifies reading copy only from the 640px breakpoint', () => {
+    expect(globalsCss).toMatch(/@media \(min-width: 640px\)\s*\{\s*\.reading-body,\s*\.reading-bullet\s*\{\s*text-align:\s*justify;/)
+  })
 })

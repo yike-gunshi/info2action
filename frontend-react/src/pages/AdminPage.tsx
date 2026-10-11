@@ -7,6 +7,7 @@ import { cn } from '../lib/utils'
 import { buildInfoItemHash } from '../lib/itemDeepLink'
 import { HighlightsFilteredTab } from '../components/admin/HighlightsFilteredTab'
 import { OverviewTab } from '../components/admin/OverviewTab'
+import { AiSearchLogsTab } from '../components/admin/AiSearchLogsTab'
 import {
   createInviteCodes,
   deleteInviteCode,
@@ -47,13 +48,14 @@ import type {
   AdminXRunSummary,
 } from '../lib/api'
 
-type AdminTab = 'overview' | 'runs' | 'subscriptions' | 'access' | 'filtered'
+type AdminTab = 'overview' | 'runs' | 'subscriptions' | 'access' | 'filtered' | 'ai-search'
 const ADMIN_TABS: { key: AdminTab; label: string }[] = [
   { key: 'overview', label: '总览' },
   { key: 'runs', label: '抓取运行' },
   { key: 'subscriptions', label: '订阅配置' },
   { key: 'access', label: '用户与权限' },
   { key: 'filtered', label: '精选漏斗' },
+  { key: 'ai-search', label: 'AI 搜索' },
 ]
 
 type SourceWizardStep = 1 | 2 | 3
@@ -91,7 +93,7 @@ const ALGO_PARAM_SPECS: Array<{
 function readAdminTab(): AdminTab {
   const hash = window.location.hash.slice(1) // e.g. "admin/runs"
   const sub = hash.split('?')[0].split('/')[1] as AdminTab | undefined
-  if (sub === 'runs' || sub === 'subscriptions' || sub === 'access' || sub === 'filtered') return sub
+  if (sub === 'runs' || sub === 'subscriptions' || sub === 'access' || sub === 'filtered' || sub === 'ai-search') return sub
   return 'overview'
 }
 
@@ -459,7 +461,7 @@ export function AdminPage() {
         </div>
       </header>
 
-      <main className={cn('mx-auto px-4 py-8', activeTab === 'filtered' ? 'w-full max-w-none' : 'max-w-[1280px]')}>
+      <main className={cn('mx-auto px-4 py-8', activeTab === 'filtered' || activeTab === 'ai-search' ? 'w-full max-w-none' : 'max-w-[1280px]')}>
         {activeTab === 'overview' && (
           <OverviewTab reloadSignal={reloadSignal} onOpenRuns={() => navTab('runs')} />
         )}
@@ -467,6 +469,8 @@ export function AdminPage() {
         {activeTab === 'subscriptions' && <SubscriptionConfigTab />}
 
         {activeTab === 'filtered' && <HighlightsFilteredTab reloadSignal={reloadSignal} />}
+
+        {activeTab === 'ai-search' && <AiSearchLogsTab reloadSignal={reloadSignal} />}
 
         {activeTab === 'runs' &&
           (loading ? (

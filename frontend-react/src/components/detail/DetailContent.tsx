@@ -2,16 +2,16 @@ import { useState } from 'react'
 import { ChevronDown, ImageOff, TriangleAlert } from 'lucide-react'
 import { useDetailStore } from '../../store/detailStore'
 import { cn } from '../../lib/utils'
-import { renderMarkdownInline } from '../../lib/markdown-lite'
 import { proxiedImageUrl } from '../../lib/media'
 import type { FeedItem } from '../../lib/types'
+import { ReadingSummary } from '../reading/ReadingSummary'
+import type { ReadingKeyPoint } from '../reading/readingUtils'
 import { ActionZone } from './ActionZone'
 import { VideoPlayer } from './VideoPlayer'
 import { YoutubePlayer } from './YoutubePlayer'
 import { TranscriptPanel } from './TranscriptPanel'
 import { SummaryUpdatedBadge } from './SummaryUpdatedBadge'
-import { collectImages, extractVideoMp4Url, normalizeSummaryText, paragraphLines } from './detailContentUtils'
-import type { KeyPointItem } from './detailContentUtils'
+import { collectImages, extractVideoMp4Url, normalizeSummaryText } from './detailContentUtils'
 import { mediaCapStyle } from './detailShared'
 
 export interface DetailContentProps {
@@ -155,75 +155,19 @@ function ItemSummaryBlock({
   keyPoints,
 }: {
   summary?: string | null
-  keyPoints?: KeyPointItem[] | null
+  keyPoints?: ReadingKeyPoint[] | null
 }) {
   const normalizedSummary = normalizeSummaryText(summary)
-  const hasPoints = !!keyPoints?.length
-  if (!normalizedSummary && !hasPoints) return null
-
   return (
-    <section
-      data-testid="detail-ai-summary"
-      className="mb-5 text-[var(--modal-text-soft)]"
-    >
-      {normalizedSummary && (
-        <div
-          data-testid="detail-summary-lead"
-          className={cn(
-            'reading-body pb-5',
-            hasPoints && 'border-b border-[var(--modal-divider)]',
-          )}
-        >
-          {paragraphLines(normalizedSummary).map((line, index) => (
-            <p key={index} className={index > 0 ? 'mt-2.5' : undefined}>
-              {index === 0 && (
-                <strong className="mr-1.5 !text-[var(--brand)]">精华速览：</strong>
-              )}
-              {renderMarkdownInline(line)}
-            </p>
-          ))}
-        </div>
-      )}
-
-      {hasPoints && (
-        <ul data-testid="detail-key-points" className={cn(
-          'reading-bullet space-y-1 py-4 pl-6 sm:pl-[38px]',
-        )}>
-          {(keyPoints ?? []).map((point, index) => {
-            if (typeof point === 'string') {
-              return (
-                <li key={index} className="relative">
-                  <span className="absolute -left-3.5 top-[0.78em] h-1 w-1 rounded-full bg-[var(--modal-text)] sm:-left-4" aria-hidden="true" />
-                  {renderMarkdownInline(point)}
-                </li>
-              )
-            }
-            return (
-              <li key={index} className="relative -ml-6 pb-3.5 last:pb-0 sm:-ml-[38px]">
-                <div className="mb-2 flex items-baseline gap-2.5">
-                  <span className="reading-section leading-none text-[var(--brand)]">
-                    {String(index + 1).padStart(2, '0')}
-                  </span>
-                  <div className="reading-section min-w-0">
-                    {renderMarkdownInline(point.title)}
-                  </div>
-                </div>
-                {point.points?.length > 0 && (
-                  <ul className="reading-bullet space-y-1 pl-6 sm:pl-[38px]">
-                    {point.points.map((subPoint, subIndex) => (
-                      <li key={subIndex} className="relative">
-                        <span className="absolute -left-3.5 top-[0.78em] h-1 w-1 rounded-full bg-[var(--modal-text)] sm:-left-4" aria-hidden="true" />
-                        {renderMarkdownInline(subPoint)}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </li>
-            )
-          })}
-        </ul>
-      )}
-    </section>
+    <ReadingSummary
+      lead={normalizedSummary}
+      keyPoints={keyPoints}
+      testIds={{
+        container: 'detail-ai-summary',
+        lead: 'detail-summary-lead',
+        keyPoints: 'detail-key-points',
+      }}
+    />
   )
 }
 

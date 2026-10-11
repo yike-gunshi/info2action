@@ -66,12 +66,13 @@ describe('FeedSection', () => {
       category: 'products',
       total: 137,
     })
-    useUIStore.setState({ expandedKey: null })
+    useUIStore.setState({ expandedKey: null, searchQuery: '' })
     useFeedStore.setState({
       sectionItems: new Map(),
       catCounts: {},
       searchResults: null,
       searchCatCounts: {},
+      searchCountsAvailable: true,
       sectionReadModelVersionId: null,
       sectionNextCursors: {},
       classification: {
@@ -94,6 +95,55 @@ describe('FeedSection', () => {
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+  })
+
+  it('global search with unknown counts fetches more and honors has_more=false', async () => {
+    const first = makeItems('search-first', 50)
+    useUIStore.setState({ searchQuery: '设计' })
+    useFeedStore.setState({ searchResults: new Map([['products', first]]), searchCountsAvailable: false })
+    mockFetchSectionMore.mockResolvedValue({ items: [makeItem('search-last')], total: null, has_more: false })
+    render(<FeedSectionHarness />)
+    await userEvent.setup().click(screen.getByRole('button', { name: /展开更多/ }))
+    await waitFor(() => expect(screen.getByText('Item search-last')).toBeInTheDocument())
+    expect(mockFetchSectionMore).toHaveBeenCalledWith('products', 50, 50, undefined, undefined, '设计')
+    expect(screen.queryByRole('button', { name: /展开更多/ })).not.toBeInTheDocument()
+    expect(screen.queryByText('50 条')).not.toBeInTheDocument()
+  })
+
+  it('global L2 with unknown counts retries more and clears its error on success', async () => {
+    useUIStore.setState({ searchQuery: '设计' })
+    useFeedStore.setState({ searchResults: new Map() })
+    mockFetchSectionMore.mockResolvedValueOnce({ items: makeItems('filtered', 50), total: null, has_more: true })
+      .mockRejectedValueOnce(new Error('搜索繁忙，请重试'))
+      .mockResolvedValueOnce({ items: [makeItem('filtered-last')], total: null, has_more: false })
+    render(<FeedSection section={makeSection()} />)
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'AI 视频' }))
+    await waitFor(() => expect(screen.getByText('Item filtered-1')).toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: /展开更多/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument())
+    expect(screen.getByText('Item filtered-1')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(screen.getByText('Item filtered-last')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /展开更多/ })).not.toBeInTheDocument()
+  })
+
+  it('global L2 initial failure is explicit and retryable, without unfiltered cards', async () => {
+    useUIStore.setState({ searchQuery: '设计' })
+    useFeedStore.setState({ searchResults: new Map() })
+    mockFetchSectionMore.mockRejectedValueOnce(new Error('搜索繁忙，请重试'))
+      .mockResolvedValueOnce({ items: [makeItem('filtered-retry')], total: 1, has_more: false })
+    render(<FeedSection section={makeSection()} />)
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'AI 视频' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument())
+    expect(screen.queryByText('Item a')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(screen.getByText('Item filtered-retry')).toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: '全部' }))
+    await waitFor(() => expect(screen.getByText('Item a')).toBeInTheDocument())
+    expect(useUIStore.getState().searchQuery).toBe('设计')
   })
 
   it('section header 不再渲染单 section 刷新按钮', () => {

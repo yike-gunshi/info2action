@@ -2,7 +2,7 @@
  * v24.1 §21.3 修订: SectionFront = 板块壳 —— v24 板块眉（保留件）+ 回滚的瀑布流白卡身体。
  *
  * 眉（v24 保留，不随卡片回滚）：
- *   2px×26px brand 短标线压通栏 hairline + 22px/700 衬线板块名 + mono 12px 计数
+ *   22px/700 衬线板块名 + mono 12px 计数
  *   + 同行右侧 L2 underline-tab；桌面滚进 section 后 sticky（top-[92px]），移动端不 sticky。
  *
  * 身体（v24.1 回滚，用户实物验收定案）：
@@ -47,11 +47,13 @@ export interface SectionFrontProps {
   /** 同行右侧 L2（underline-tab 筛选条），由容器注入。 */
   pillBar?: ReactNode
   /** 筛选请求进行中 → 轻微降透明度 + aria-busy。 */
+  pageError?: string | null
   filterLoading?: boolean
 }
 
 export function SectionFront({
   sectionKey,
+  pageError,
   label,
   count,
   items,
@@ -149,11 +151,6 @@ export function SectionFront({
           className="z-10 bg-background sm:sticky sm:top-[92px]"
           data-testid="section-front-head"
         >
-          {/* 双线 motif：2px×26px brand 短标线压通栏 hairline */}
-          <div className="relative h-[2px]" data-testid="section-front-rule" aria-hidden="true">
-            <span className="absolute inset-x-0 top-0 h-px bg-border" />
-            <span className="absolute left-0 top-0 h-[2px] w-[26px] bg-[var(--brand)]" />
-          </div>
           <div className="flex flex-wrap items-center gap-x-3 pb-1.5 pt-2 sm:h-[42px] sm:flex-nowrap sm:py-0">
             <h2 className="shrink-0 font-event-title text-[22px] font-bold leading-none text-foreground">
               {label}
@@ -201,6 +198,7 @@ export function SectionFront({
             )}
           </div>
 
+          {pageError && <div className="mt-4 text-center text-sm text-muted-foreground" role="status">{pageError}<button type="button" className="ml-3 text-primary hover:underline" onClick={onLoadMore}>重试</button></div>}
           {/* 展开按钮：hairline 边框、无阴影（v24 §21.6 保留件，替换旧阴影胶囊） */}
           {hasMore && (
             <div className="mt-6 flex justify-center">

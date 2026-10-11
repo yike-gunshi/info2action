@@ -21,8 +21,10 @@ export function useTheme() {
   const [mode, setMode] = useState<ThemeMode>(() => {
     const override = getUrlThemeOverride()
     if (override) return override
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (stored === 'light' || stored === 'dark') return stored
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY)
+      if (stored === 'light' || stored === 'dark') return stored
+    } catch { /* Storage is optional; public pages still use the system theme. */ }
     // Migrate 'auto' or missing → resolve to system preference
     return getSystemTheme()
   })
@@ -30,7 +32,9 @@ export function useTheme() {
   useEffect(() => {
     applyTheme(mode)
     if (getUrlThemeOverride()) return
-    localStorage.setItem(STORAGE_KEY, mode)
+    try {
+      localStorage.setItem(STORAGE_KEY, mode)
+    } catch { /* Keep the selected theme for this page session. */ }
   }, [mode])
 
   const toggle = useCallback(() => {
