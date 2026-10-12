@@ -9,10 +9,13 @@ export function CardsPane() {
   const items = useAiSearchStore((state) => state.items)
   const cardOrder = useAiSearchStore((state) => state.cardOrder)
   const highlightItemId = useAiSearchStore((state) => state.highlightItemId)
+  const status = useAiSearchStore((state) => state.summary.status)
   const containerRef = useRef<HTMLDivElement>(null)
   useScrollbarReveal(containerRef)
   const anchorRef = useRef<{ id: string; top: number } | null>(null)
   const itemById = useMemo(() => new Map(items.map((item, index) => [item.id, { item, n: index + 1 }])), [items])
+  const showSkeleton = status === 'retrieving' || !items.length
+  const visibleOrder = status === 'insufficient' ? items.slice(0, 5).map(item => item.id) : cardOrder
 
   useLayoutEffect(() => useAiSearchStore.subscribe((state, previous) => {
     if (!isDesktopAiSearch()) return
@@ -62,7 +65,7 @@ export function CardsPane() {
       className="ai-search-cards"
       onFocusCapture={keepFocusVisible}
     >
-      {!items.length ? (
+      {showSkeleton ? (
         <div aria-hidden="true">
           {Array.from({ length: 8 }, (_, index) => (
             <div key={index} className="ai-citation-card ai-citation-card-skeleton">
@@ -79,13 +82,13 @@ export function CardsPane() {
           ))}
         </div>
       ) : null}
-      {cardOrder.map((id) => {
+      {!showSkeleton ? visibleOrder.map((id) => {
         const entry = itemById.get(id)
         if (!entry) return null
         return (
           <CitationCard key={id} item={entry.item} number={entry.n} highlighted={highlightItemId === id} />
         )
-      })}
+      }) : null}
     </div>
   )
 }

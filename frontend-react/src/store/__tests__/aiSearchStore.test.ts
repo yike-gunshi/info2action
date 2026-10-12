@@ -35,6 +35,210 @@ describe('aiSearchStore', () => {
   })
   afterEach(() => { useAiSearchStore.getState().reset(); vi.useRealTimers() })
 
+  const retrievingPost = (): AiSearchPostResponse => ({ job_id: 'job-1', query: 'test', summary: { status: 'retrieving' } })
+
+  it('enters the v2 result layout and fetches immediately before the first interval', async () => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    let resolve!: (response: AiSearchJobResponse) => void
+    vi.mocked(getAiSearchJob).mockReturnValueOnce(new Promise(done => { resolve = done }))
+    await useAiSearchStore.getState().submit('test')
+    expect(getAiSearchJob).toHaveBeenCalledOnce()
+    expect(useAiSearchStore.getState()).toMatchObject({ phase: 'results', jobId: 'job-1', query: 'test', items: [], emptyResult: false, summary: { status: 'retrieving' } })
+    expect(window.location.hash).toBe('#ai-search?job=job-1&q=test')
+    resolve(job({ status: 'retrieving', items: [], stage: 'searching', keywords: ['Muse', 'Cue'] }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useAiSearchStore.getState().summary).toMatchObject({ status: 'retrieving', stage: 'searching', keywords: ['Muse', 'Cue'] })
+  })
+
+  it('polls retrieval every 2 seconds then switches to 10 seconds for writing', async () => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    vi.mocked(getAiSearchJob)
+      .mockResolvedValueOnce(job({ status: 'retrieving', stage: 'understanding', items: [] }))
+      .mockResolvedValueOnce(job({ status: 'retrieving', stage: 'searching', keywords: ['Muse'], items: [] }))
+      .mockResolvedValueOnce(job({ status: 'queued', position: 1 }))
+      .mockResolvedValueOnce(job({ status: 'running' }))
+      .mockResolvedValue(job({ status: 'done' }))
+    await useAiSearchStore.getState().submit('test')
+    await vi.advanceTimersByTimeAsync(1999)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useAiSearchStore.getState()).toMatchObject({ items, summary: { status: 'queued', position: 1 } })
+    expect(getAiSearchStatus).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(9999)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(4)
+    await vi.advanceTimersByTimeAsync(9999)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(4)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(useAiSearchStore.getState().summary.status).toBe('done')
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(5)
+    expect(getAiSearchStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['queued', 'running', 'insufficient', 'failed', 'unavailable', 'done'] as const)('refreshes quota once when retrieving becomes %s', async status => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    vi.mocked(getAiSearchJob)
+      .mockResolvedValueOnce(job({ status: 'retrieving', items: [] }))
+      .mockResolvedValueOnce(job({ status: 'retrieving', items: [] }))
+      .mockResolvedValue(job({ status }))
+    await useAiSearchStore.getState().submit('test')
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(getAiSearchStatus).toHaveBeenCalledOnce()
+    vi.mocked(getAiSearchStatus).mockResolvedValue({ enabled: true, logged_in: true, can_search: false, reason: 'quota_exhausted', user_day_limit: 2 })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useAiSearchStore.getState().summary.status).toBe(status)
+    expect(getAiSearchStatus).toHaveBeenCalledTimes(2)
+    expect(useAiSearchStore.getState().searchStatus).toMatchObject({ can_search: false, reason: 'quota_exhausted' })
+    await vi.advanceTimersByTimeAsync(30_000)
+    visibility('hidden'); visibility('visible')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(getAiSearchStatus).toHaveBeenCalledTimes(2)
+    useAiSearchStore.getState().reset()
+    expect(useAiSearchStore.getState().searchStatus?.can_search).toBe(false)
+  })
+
+  it('refreshes quota once for each restored retrieval job', async () => {
+    for (const id of ['job-1', 'job-2']) {
+      vi.mocked(getAiSearchJob)
+        .mockResolvedValueOnce(job({ job_id: id, status: 'retrieving', items: [] }))
+        .mockResolvedValueOnce(job({ job_id: id, status: 'queued' }))
+        .mockResolvedValue(job({ job_id: id, status: 'running' }))
+      await useAiSearchStore.getState().loadJob(id)
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(getAiSearchStatus).toHaveBeenCalledTimes(id === 'job-1' ? 1 : 2)
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(getAiSearchStatus).toHaveBeenCalledTimes(id === 'job-1' ? 1 : 2)
+    }
+  })
+
+  it.each(['insufficient', 'failed', 'unavailable', 'done'] as const)('stops retrieving polls on terminal %s', async status => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    vi.mocked(getAiSearchJob).mockResolvedValueOnce(job({ status: 'retrieving', items: [] })).mockResolvedValue(job({ status }))
+    await useAiSearchStore.getState().submit('test')
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useAiSearchStore.getState().summary.status).toBe(status)
+    await vi.advanceTimersByTimeAsync(20_000)
+    visibility('hidden'); visibility('visible')
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(2)
+  })
+
+  it('pauses retrieving polls while hidden and refreshes immediately on return', async () => {
+    vi.mocked(getAiSearchJob).mockResolvedValue(job({ status: 'retrieving', items: [] }))
+    await useAiSearchStore.getState().loadJob('job-1')
+    await vi.advanceTimersByTimeAsync(1999)
+    expect(getAiSearchJob).toHaveBeenCalledOnce()
+    visibility('hidden')
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(getAiSearchJob).toHaveBeenCalledOnce()
+    visibility('visible')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1999)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(3)
+  })
+
+  it('retries an immediate retrieval GET failure after 2 seconds without losing the layout', async () => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    vi.mocked(getAiSearchJob).mockRejectedValueOnce(new Error('offline')).mockResolvedValue(job({ status: 'insufficient', items: [] }))
+    await useAiSearchStore.getState().submit('test')
+    expect(useAiSearchStore.getState()).toMatchObject({ phase: 'results', requestError: null, summary: { status: 'retrieving' } })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(2)
+    expect(useAiSearchStore.getState().summary.status).toBe('insufficient')
+  })
+
+  it('preserves input and stays idle on 409 without polling or revoking quota', async () => {
+    const searchStatus = { enabled: true, logged_in: true, can_search: true, reason: null, user_day_limit: 2 } as const
+    useAiSearchStore.setState({ searchStatus })
+    vi.mocked(postAiSearch).mockRejectedValue(new AiSearchAccessError('retrieval_in_progress'))
+    await useAiSearchStore.getState().submit(' 保留问题 ')
+    expect(useAiSearchStore.getState()).toMatchObject({ phase: 'idle', query: '保留问题', jobId: null, items: [], requestError: null,
+      requestNotice: '上一个问题还在找资料，请稍等', searchStatus })
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(getAiSearchJob).not.toHaveBeenCalled()
+    expect(getAiSearchStatus).not.toHaveBeenCalled()
+    expect(window.location.hash).toBe('#ai-search')
+  })
+
+  it('clears the 409 notice when editing the query without submitting or changing quota', async () => {
+    vi.mocked(postAiSearch).mockRejectedValueOnce(new AiSearchAccessError('retrieval_in_progress'))
+    await useAiSearchStore.getState().submit('test')
+    expect(useAiSearchStore.getState().requestNotice).toBe('上一个问题还在找资料，请稍等')
+    const searchStatus = useAiSearchStore.getState().searchStatus
+    useAiSearchStore.getState().setQuery('换一个问题')
+    expect(useAiSearchStore.getState()).toMatchObject({ query: '换一个问题', phase: 'idle', requestNotice: null, searchStatus })
+    expect(postAiSearch).toHaveBeenCalledOnce()
+    expect(getAiSearchStatus).not.toHaveBeenCalled()
+  })
+
+  it('reads vector degradation from GET after v2 submission and after reloading the job', async () => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    vi.mocked(getAiSearchJob).mockResolvedValue(job({ status: 'retrieving', items: [], vector_ok: false }))
+    await useAiSearchStore.getState().submit('test')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useAiSearchStore.getState().vectorOk).toBe(false)
+    useAiSearchStore.getState().reset()
+    await useAiSearchStore.getState().loadJob('job-1')
+    expect(useAiSearchStore.getState().vectorOk).toBe(false)
+    vi.mocked(getAiSearchJob).mockResolvedValue(job({ status: 'queued', vector_ok: true }))
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useAiSearchStore.getState().vectorOk).toBe(true)
+  })
+
+  it('lets GET vector_ok override a legacy POST fallback and retains it if later GET omits the field', async () => {
+    vi.mocked(getAiSearchJob).mockResolvedValueOnce(job({ vector_ok: false })).mockResolvedValue(job())
+    await useAiSearchStore.getState().submit('test')
+    expect(useAiSearchStore.getState().vectorOk).toBe(true)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(useAiSearchStore.getState().vectorOk).toBe(false)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(useAiSearchStore.getState().vectorOk).toBe(false)
+  })
+
+  it('does not overlap immediate retrieval requests when visibility changes or timers advance', async () => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    let resolve!: (response: AiSearchJobResponse) => void
+    vi.mocked(getAiSearchJob).mockReturnValueOnce(new Promise(done => { resolve = done })).mockResolvedValue(job({ status: 'retrieving', items: [] }))
+    await useAiSearchStore.getState().submit('test')
+    visibility('hidden'); visibility('visible')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(getAiSearchJob).toHaveBeenCalledOnce()
+    resolve(job({ status: 'retrieving', items: [] }))
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(getAiSearchJob).toHaveBeenCalledTimes(2)
+  })
+
+  it('ignores a late immediate retrieval GET after a newer search', async () => {
+    vi.mocked(postAiSearch).mockResolvedValue(retrievingPost())
+    let resolve!: (response: AiSearchJobResponse) => void
+    vi.mocked(getAiSearchJob).mockReturnValueOnce(new Promise(done => { resolve = done })).mockResolvedValue(job({ job_id: 'new-job', status: 'retrieving', items: [] }))
+    await useAiSearchStore.getState().submit('old')
+    vi.mocked(postAiSearch).mockResolvedValue({ job_id: 'new-job', query: 'new', summary: { status: 'retrieving' } })
+    await useAiSearchStore.getState().submit('new')
+    resolve(job({ status: 'insufficient', query: 'old' }))
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useAiSearchStore.getState()).toMatchObject({ query: 'new', jobId: 'new-job', summary: { status: 'retrieving' } })
+    expect(getAiSearchJob).toHaveBeenCalledTimes(3)
+    expect(getAiSearchJob).toHaveBeenLastCalledWith('new-job')
+    expect(getAiSearchStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the previous 409 notice when a subsequent search succeeds', async () => {
+    vi.mocked(postAiSearch).mockRejectedValueOnce(new AiSearchAccessError('retrieval_in_progress')).mockResolvedValue(post())
+    await useAiSearchStore.getState().submit('test')
+    expect(useAiSearchStore.getState().requestNotice).toBe('上一个问题还在找资料，请稍等')
+    await useAiSearchStore.getState().submit('next')
+    expect(useAiSearchStore.getState()).toMatchObject({ phase: 'results', requestNotice: null })
+  })
+
   it.each([
     Object.assign(new Error('internal'), { status: 500 }),
     Object.assign(new Error('bad gateway'), { status: 502 }),

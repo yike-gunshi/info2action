@@ -56,6 +56,19 @@ afterEach(() => {
 })
 
 describe('AiSearchInput', () => {
+  it('shows the 409 notice in the existing neutral hint while preserving an editable question', () => {
+    useAiSearchStore.setState({ query: '保留的问题', requestNotice: '上一个问题还在找资料，请稍等' })
+    render(<AiSearchInput />)
+    const hint = screen.getByRole('status')
+    expect(hint).toHaveTextContent('上一个问题还在找资料，请稍等')
+    expect(hint).toHaveClass('ai-search-hint')
+    expect(hint).not.toHaveClass('text-[var(--destructive)]')
+    expect(getComputedStyle(hint).color).toBe('var(--muted-foreground)')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox')).toHaveValue('保留的问题')
+    expect(screen.getByRole('textbox')).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'AI 搜索' })).toBeEnabled()
+  })
   it('submits Enter through a bubbling, cancelable submit event on Safari without requestSubmit and advertises a search key', () => {
     vi.spyOn(HTMLFormElement.prototype, 'requestSubmit')
     Object.defineProperty(HTMLFormElement.prototype, 'requestSubmit', { configurable: true, value: undefined })
@@ -296,7 +309,7 @@ describe('AiSearchInput', () => {
     expect(glow).toHaveStyle('opacity: 1')   // 失焦且为空，邀请回来
   })
 
-  it.each(['queued', 'running'] as const)('keeps the glow lit throughout a long %s summary with a filled query', status => {
+  it.each(['retrieving', 'queued', 'running'] as const)('keeps the glow lit throughout a long %s summary with a filled query', status => {
     useAiSearchStore.setState({ phase: 'results', query: 'Seedance 2.5', summary: { ...useAiSearchStore.getState().summary, status } })
     render(<AiSearchInput />)
     const glow = screen.getByTestId('ai-search-glow')
@@ -309,7 +322,7 @@ describe('AiSearchInput', () => {
     expect(glow).toHaveStyle('opacity: 0')
   })
 
-  it.each(['done', 'failed', 'unavailable', 'none'] as const)('keeps a terminal %s result unlit, even with an empty field', status => {
+  it.each(['insufficient', 'done', 'failed', 'unavailable', 'none'] as const)('keeps a terminal %s result unlit, even with an empty field', status => {
     useAiSearchStore.setState({ phase: 'results', summary: { ...useAiSearchStore.getState().summary, status } })
     render(<AiSearchInput />)
     expect(screen.getByTestId('ai-search-glow')).toHaveStyle('opacity: 0')

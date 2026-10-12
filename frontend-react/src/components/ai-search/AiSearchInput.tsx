@@ -79,11 +79,12 @@ export function AiSearchInput({ feedback = '', inputRef }: { feedback?: string; 
   const setQuery = useAiSearchStore((s) => s.setQuery)
   const submit = useAiSearchStore((s) => s.submit)
   const phase = useAiSearchStore((s) => s.phase)
-  const pendingSummary = useAiSearchStore((s) => !s.emptyResult && (s.summary.status === 'queued' || s.summary.status === 'running'))
+  const pendingSummary = useAiSearchStore((s) => !s.emptyResult && (s.summary.status === 'retrieving' || s.summary.status === 'queued' || s.summary.status === 'running'))
   const searchStatus = useAiSearchStore((s) => s.searchStatus)
   const authReady = useAuthStore((s) => s.isChecked && !s.isLoading)
   const user = useAuthStore((s) => s.user)
   const requestError = useAiSearchStore((s) => s.requestError)
+  const requestNotice = useAiSearchStore((s) => s.requestNotice)
   const loginRequired = authReady && user?.role !== 'admin'
     && (searchStatus ? !searchStatus.logged_in || searchStatus.reason === 'login_required' : !user)
   const capped = user?.role !== 'admin' && searchStatus?.reason === 'quota_exhausted'
@@ -99,10 +100,10 @@ export function AiSearchInput({ feedback = '', inputRef }: { feedback?: string; 
   const hasText = query.length > 0
   // The glow invites you to type. Once the box has focus you are already typing,
   // so it stops competing with the caret and the selection (user feedback 2026-09-22).
-  const glow = loading || (phase === 'idle' && !hasText && !focused && !capped && !requestError)
+  const glow = loading || (phase === 'idle' && !hasText && !focused && !capped && !requestError && !requestNotice)
   const loginText = searchStatus?.user_day_limit === null ? 'AI 搜索需要登录'
     : `AI 搜索需要登录，每人每天可用 ${searchStatus?.user_day_limit ?? 2} 次`
-  const hintText = loginRequired ? loginText : capped ? QUOTA_EXHAUSTED_MESSAGE : invalid ? QUERY_VALIDATION_MESSAGE : feedback
+  const hintText = loginRequired ? loginText : capped ? QUOTA_EXHAUSTED_MESSAGE : invalid ? QUERY_VALIDATION_MESSAGE : requestNotice || feedback
 
   useLayoutEffect(() => {
     if (fieldRef.current) resizeTextarea(fieldRef.current)

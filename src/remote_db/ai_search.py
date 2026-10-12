@@ -30,7 +30,9 @@ _TRAILING_INTENT = re.compile(rf"(?:{_INTENT_PATTERN})$")
 _MODEL = re.compile(r"^([A-Za-z]+)[- ]?(\d+(?:\.\d+)?)$")
 VECTOR_INDEX_NAME = "remote_poc_items_embedding_halfvec_hnsw_idx"
 _vector_index_cache: dict[str, tuple[float, bool]] = {}
+_schema_ready_cache: dict[str, tuple[float, bool]] = {}
 _INDEX_CACHE_SECONDS = 600
+_SCHEMA_NOT_READY_CACHE_SECONDS = 30
 
 # Preserve the PGroonga expression's left-associative concatenation tree.
 _LEXICAL_EXPRESSION = (
@@ -104,6 +106,38 @@ def vector_index_available(conn: Any) -> bool:
     _vector_index_cache[schema] = (now, available)
     if not available:
         print("[warn] ai_search vector leg failed: HNSW index missing or invalid")
+    return available
+
+
+def schema_ready() -> bool:
+    """Cache readiness for 600s, absence for 30s; query errors propagate."""
+    schema = _core.remote_schema()
+    now = time.monotonic()
+    cached = _schema_ready_cache.get(schema)
+    if cached is not None:
+        ttl = _INDEX_CACHE_SECONDS if cached[1] else _SCHEMA_NOT_READY_CACHE_SECONDS
+        if now - cached[0] < ttl:
+            return cached[1]
+    with _core.connect() as conn:
+        _set_short_statement_timeout(conn, 6000)
+        row = conn.execute(
+            """SELECT EXISTS (
+                   SELECT 1 FROM pg_class t
+                   JOIN pg_namespace n ON n.oid = t.relnamespace
+                   JOIN pg_attribute a ON a.attrelid = t.oid
+                   WHERE n.nspname = %s AND t.relname = 'ai_search_jobs'
+                     AND a.attname = 'write_queued_at' AND NOT a.attisdropped
+                     AND EXISTS (
+                         SELECT 1 FROM pg_constraint c
+                         JOIN pg_attribute s ON s.attrelid = c.conrelid
+                         WHERE c.conrelid = t.oid AND c.contype = 'c' AND c.convalidated
+                           AND s.attname = 'status' AND s.attnum = ANY(c.conkey)
+                           AND position('''retrieving''' in pg_get_constraintdef(c.oid)) > 0
+                     )
+               ) AS available""", (schema,),
+        ).fetchone()
+    available = bool(row and row["available"])
+    _schema_ready_cache[schema] = (now, available)
     return available
 
 
@@ -282,6 +316,10 @@ class QuotaExceeded(Exception):
     """A daily account or site quota was reached before inserting a job."""
 
 
+class RetrievalInProgress(Exception):
+    """The account already has a job finding sources."""
+
+
 def create_job(
     *, query: str, query_lexical: str, ip_hash: str, user_id: str | None = None,
     candidate_ids: list, candidate_meta: list, input_text: str | None = None,
@@ -308,15 +346,54 @@ def create_job(
                 f"""INSERT INTO {_core.remote_schema()}.ai_search_jobs
                     (query, query_lexical, ip_hash, user_id, candidate_ids, candidate_meta, input_text,
                      window_days, lexical_hits, vector_hits, vector_ok, model, prompt_version,
-                     request_params, status, error)
+                     request_params, status, error, write_queued_at)
                     VALUES (%(query)s, %(query_lexical)s, %(ip_hash)s, %(user_id)s, %(candidate_ids)s::jsonb,
                      %(candidate_meta)s::jsonb, %(input_text)s, %(window_days)s, %(lexical_hits)s,
                      %(vector_hits)s, %(vector_ok)s, %(model)s, %(prompt_version)s,
-                     %(request_params)s::jsonb, %(status)s, %(error)s) RETURNING id""", params,
+                     %(request_params)s::jsonb, %(status)s, %(error)s, now()) RETURNING id""", params,
             ).fetchone()
     except _core.RemoteDBError as exc:
         # connect() wraps application exceptions after rolling back the transaction.
         if isinstance(exc.__cause__, QuotaExceeded):
+            raise exc.__cause__ from None
+        raise
+    return str(row["id"])
+
+
+def create_retrieval_job(
+    *, query: str, ip_hash: str, scope: dict, user_id: str | None = None,
+    user_day: int | None = None, cap_day: int | None = None,
+    retrieval_user_day: int = 10, quota_exempt: bool = False,
+) -> str:
+    """Atomically check writing/attempt limits, then one active retrieval per user.
+
+    Callers supply writing limits as in create_job. Admin/legacy callers must
+    pass quota_exempt here and again to finish_retrieval.
+    """
+    schema = _core.remote_schema()
+    try:
+        with _core.connect() as conn:
+            _lock_claims(conn)
+            if not quota_exempt:
+                if (_quota_exhausted_on(conn, user_id, user_day, cap_day)
+                        or _count_retrieval_day_on(conn, user_id) >= retrieval_user_day):
+                    raise QuotaExceeded()
+                active = conn.execute(
+                    f"SELECT 1 FROM {schema}.ai_search_jobs WHERE user_id = %s AND status='retrieving' LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if active:
+                    raise RetrievalInProgress()
+            row = conn.execute(
+                f"""INSERT INTO {schema}.ai_search_jobs
+                    (query, ip_hash, user_id, status, candidate_ids, retrieval)
+                    VALUES (%(query)s, %(ip_hash)s, %(user_id)s, 'retrieving', '[]'::jsonb,
+                            %(retrieval)s::jsonb) RETURNING id""",
+                dict(query=_without_nuls(query), ip_hash=ip_hash, user_id=user_id,
+                     retrieval=_json({"scope": scope, "stage": "queued"})),
+            ).fetchone()
+    except _core.RemoteDBError as exc:
+        if isinstance(exc.__cause__, (QuotaExceeded, RetrievalInProgress)):
             raise exc.__cause__ from None
         raise
     return str(row["id"])
@@ -355,6 +432,83 @@ def claim_next_queued(concurrency: int) -> str | None:
                 RETURNING id""", (int(concurrency),),
         ).fetchone()
     return str(row["id"]) if row else None
+
+
+def claim_next_retrieving(concurrency: int) -> dict | None:
+    """Claim FIFO retrieval work; queued retrievals do not consume concurrency."""
+    schema = _core.remote_schema()
+    with _core.connect() as conn:
+        _lock_claims(conn)
+        row = conn.execute(
+            f"""UPDATE {schema}.ai_search_jobs
+                SET retrieval=COALESCE(retrieval, '{{}}'::jsonb)
+                              || jsonb_build_object('started_at', now(), 'stage', 'understanding')
+                WHERE id=(SELECT id FROM {schema}.ai_search_jobs
+                          WHERE status='retrieving' AND NOT (COALESCE(retrieval, '{{}}'::jsonb) ? 'started_at')
+                          ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
+                  AND status='retrieving'
+                  AND (SELECT count(*) FROM {schema}.ai_search_jobs
+                       WHERE status='retrieving' AND retrieval ? 'started_at') < %s
+                RETURNING id, query, user_id, retrieval""", (int(concurrency),),
+        ).fetchone()
+    return {**dict(row), "id": str(row["id"])} if row else None
+
+
+def update_retrieval_progress(job_id: str, patch: dict) -> None:
+    """Merge progress without changing jobs that have left retrieval."""
+    with _core.connect() as conn:
+        _set_short_statement_timeout(conn, 6000)
+        conn.execute(
+            f"""UPDATE {_core.remote_schema()}.ai_search_jobs
+                SET retrieval=COALESCE(retrieval, '{{}}'::jsonb) || %s::jsonb
+                WHERE id=%s AND status='retrieving'""", (_json(patch), job_id),
+        )
+
+
+def finish_retrieval(
+    job_id: str, outcome: str, *, candidate_ids: list, candidate_meta: list,
+    retrieval: dict, lexical_hits: int = 0, vector_hits: int = 0,
+    vector_ok: bool = False, window_days: int = 90, query_lexical: str | None = None,
+    user_day: int | None = None, cap_day: int | None = None, quota_exempt: bool = False,
+) -> str | None:
+    """Persist sources and atomically charge writing only when it can be queued.
+
+    An insufficient result supplies at most five display candidates. Repeated
+    completion returns the current status without overwriting fields; absent
+    jobs return None.
+    """
+    if outcome not in {"ok", "insufficient"}:
+        raise ValueError("retrieval outcome must be ok or insufficient")
+    schema = _core.remote_schema()
+    with _core.connect() as conn:
+        _lock_claims(conn)
+        job = conn.execute(
+            f"SELECT status, user_id FROM {schema}.ai_search_jobs WHERE id=%s FOR UPDATE", (job_id,),
+        ).fetchone()
+        if not job or job["status"] != "retrieving":
+            return job["status"] if job else None
+        status, error = "insufficient", None
+        if outcome == "ok":
+            if not quota_exempt and _quota_exhausted_on(conn, job["user_id"], user_day, cap_day):
+                status, error = "failed", "quota_exhausted"
+            else:
+                status = "queued"
+        conn.execute(
+            f"""UPDATE {schema}.ai_search_jobs
+                SET status=%(status)s, error=%(error)s,
+                    write_queued_at=CASE WHEN %(status)s='queued' THEN now() ELSE NULL END,
+                    finished_at=CASE WHEN %(status)s='queued' THEN NULL ELSE now() END,
+                    candidate_ids=%(candidate_ids)s::jsonb, candidate_meta=%(candidate_meta)s::jsonb,
+                    retrieval=COALESCE(retrieval, '{{}}'::jsonb) || %(retrieval)s::jsonb,
+                    lexical_hits=%(lexical_hits)s, vector_hits=%(vector_hits)s, vector_ok=%(vector_ok)s,
+                    window_days=%(window_days)s, query_lexical=%(query_lexical)s
+                WHERE id=%(job_id)s AND status='retrieving'""",
+            dict(job_id=job_id, status=status, error=error, candidate_ids=_json(candidate_ids),
+                 candidate_meta=_json(candidate_meta), retrieval=_json(retrieval),
+                 lexical_hits=lexical_hits, vector_hits=vector_hits, vector_ok=vector_ok,
+                 window_days=window_days, query_lexical=_without_nuls(query_lexical)),
+        )
+    return status
 
 
 def finish_job(
@@ -414,20 +568,27 @@ def fail_job(job_id: str, error: str, status: str = "failed", raw: str | None = 
         conn.execute(
             f"""UPDATE {_core.remote_schema()}.ai_search_jobs SET status=%(status)s,
                 error=%(error)s, result=COALESCE(%(result)s::jsonb, result), finished_at=now()
-                WHERE id=%(job_id)s AND status IN ('queued', 'running')""",
+                WHERE id=%(job_id)s AND (status IN ('queued', 'running')
+                    OR (status='retrieving' AND %(status)s='failed'))""",
             dict(job_id=job_id, status=status, error=_without_nuls(error), result=_json(result)),
         )
 
 
-def get_job(job_id: str) -> dict | None:
+def get_job(job_id: str, *, include_input: bool = True) -> dict | None:
     try:
         job_id = str(UUID(str(job_id)))
     except (ValueError, TypeError, AttributeError):
         return None
+    columns = "*" if include_input else (
+        "id, created_at, started_at, finished_at, status, query, query_lexical, ip_hash, user_id, "
+        "window_days, lexical_hits, vector_hits, vector_ok, candidate_ids, candidate_meta, "
+        "model, prompt_version, request_params, usage, elapsed_ms, points_estimate, "
+        "result, content_md_final, cited_ids, error, write_queued_at, retrieval"
+    )
     with _core.connect() as conn:
         _set_short_statement_timeout(conn, 6000)
         row = conn.execute(
-            f"SELECT * FROM {_core.remote_schema()}.ai_search_jobs WHERE id=%s", (job_id,),
+            f"SELECT {columns} FROM {_core.remote_schema()}.ai_search_jobs WHERE id=%s", (job_id,),
         ).fetchone()
     return dict(row) if row else None
 
@@ -463,7 +624,7 @@ def _count_day_on(conn: Any, user_id: str | None = None) -> int:
     # from later-started transactions that acquired the advisory lock first.
     row = conn.execute(
         f"""SELECT count(*) AS n FROM {_core.remote_schema()}.ai_search_jobs
-            WHERE created_at >= {_BEIJING_DAY_START}"""
+            WHERE write_queued_at >= {_BEIJING_DAY_START}"""
         + (" AND user_id = %s" if user_id is not None else
            f" AND user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM {_core.remote_schema()}.users WHERE role = 'admin')"),
         (user_id,) if user_id is not None else (),
@@ -482,8 +643,23 @@ def count_user_day(user_id: str) -> int:
 
 
 def count_all_day() -> int:
-    """Count every ordinary account's task since Beijing midnight, in any state."""
+    """Count ordinary accounts' writing entries since Beijing midnight."""
     return _count_day()
+
+
+def _count_retrieval_day_on(conn: Any, user_id: str | None) -> int:
+    row = conn.execute(
+        f"""SELECT count(*) AS n FROM {_core.remote_schema()}.ai_search_jobs
+            WHERE created_at >= {_BEIJING_DAY_START} AND user_id = %s""", (user_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
+def count_user_retrieval_day(user_id: str) -> int:
+    """Count the user's submissions today, including v1 and every job state."""
+    with _core.connect() as conn:
+        _set_short_statement_timeout(conn, 6000)
+        return _count_retrieval_day_on(conn, user_id)
 
 
 def _quota_exhausted_on(conn: Any, user_id: str | None, user_day: int | None, cap_day: int | None) -> bool:
@@ -501,12 +677,12 @@ def quota_exhausted(user_id: str, user_day: int | None, cap_day: int | None) -> 
 
 
 def count_all_month() -> int:
-    """Count all jobs since Beijing's calendar month began, including admins."""
+    """Count writing entries this Beijing calendar month, including admins."""
     with _core.connect() as conn:
         _set_short_statement_timeout(conn, 6000)
         row = conn.execute(
             f"""SELECT count(*) AS n FROM {_core.remote_schema()}.ai_search_jobs
-                WHERE created_at >= date_trunc('month', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'""",
+                WHERE write_queued_at >= date_trunc('month', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'""",
         ).fetchone()
     return int(row["n"])
 
@@ -539,6 +715,17 @@ def recover_stale(hard_timeout_minutes: int = 45, *, requeue_before: datetime | 
             conn.execute(
                 f"""UPDATE {schema}.ai_search_jobs SET status='queued', started_at=NULL, finished_at=NULL
                     WHERE status='running' AND started_at < %s""", (requeue_before,),
+            )
+        conn.execute(
+            f"""UPDATE {schema}.ai_search_jobs SET status='failed', error='retrieval_timeout', finished_at=now()
+                WHERE status='retrieving' AND created_at < now() - interval '5 minutes'""",
+        )
+        if requeue_before is not None:
+            conn.execute(
+                f"""UPDATE {schema}.ai_search_jobs
+                    SET retrieval=(retrieval - 'started_at') || '{{"stage": "queued"}}'::jsonb
+                    WHERE status='retrieving' AND (retrieval->>'started_at')::timestamptz < %s""",
+                (requeue_before,),
             )
 
 

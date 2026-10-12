@@ -106,6 +106,45 @@ def test_budget_downgrades_tail_first_across_rounds(monkeypatch):
     assert out['est_tokens'] > 1
 
 
+def test_v2_disables_total_budget_degradation_but_keeps_per_item_fallbacks(monkeypatch):
+    monkeypatch.setenv('AI_SEARCH_INPUT_BUDGET_TOKENS', '1')
+    monkeypatch.setenv('AI_SEARCH_ITEM_CHARS', '5')
+    candidates = [dict(id='body', content='123456', ai_key_points='k', ai_summary='s'),
+                  dict(id='points', ai_key_points='p', ai_summary='s'), dict(id='summary', ai_summary='s')]
+    out = digest.build_input('q', 'today', candidates, degrade=False)
+    assert out['tiers'] == {'body': 'content', 'points': 'key_points', 'summary': 'summary'}
+    assert '12345…（已截）' in out['user_message'] and out['est_tokens'] > 1
+    assert digest.build_input('q', 'today', candidates)['tiers'] == {
+        'body': 'summary', 'points': 'summary', 'summary': 'summary'}
+
+
+def test_writer_budget_counts_rendered_system_prompt_and_removes_whole_tail(monkeypatch):
+    import ai_search_retrieval as retrieval
+    config = digest.settings()
+    monkeypatch.setattr(digest, 'load_prompt', lambda _: ('test', '{query}|{today}|{item_count}|{items}|系统'))
+    candidates = [dict(id=str(i), content='正文' * 100, ai_summary='短摘要') for i in range(3)]
+    message = digest.build_input('question', '2026-10-11', candidates[:2], settings=config, degrade=False)['user_message']
+    system = 'question|2026-10-11|2||系统'
+    exact = len(message) + len(system)
+    monkeypatch.setattr(retrieval, 'settings', lambda: {
+        'AI_SEARCH_CHARS_PER_TOKEN': 1., 'AI_SEARCH_INPUT_MAX_TOKENS': exact})
+    original = copy.deepcopy(candidates)
+    kept, dropped = digest.trim_input_candidates('question', '2026-10-11', candidates, config)
+    assert kept == candidates[:2] and dropped == ['2'] and candidates == original
+    out = digest.build_input('question', '2026-10-11', kept, settings=config, degrade=False)
+    assert set(out['tiers'].values()) == {'content'}
+    assert len(out['user_message']) + len(system) == exact
+
+
+def test_writer_budget_retains_at_least_one_candidate(monkeypatch):
+    import ai_search_retrieval as retrieval
+    monkeypatch.setattr(retrieval, 'settings', lambda: {
+        'AI_SEARCH_CHARS_PER_TOKEN': 1.7, 'AI_SEARCH_INPUT_MAX_TOKENS': 1})
+    candidates = [dict(id=str(i), content='长' * 4000) for i in range(3)]
+    kept, dropped = digest.trim_input_candidates('q', 'today', candidates, digest.settings())
+    assert kept == candidates[:1] and dropped == ['2', '1']
+
+
 def test_budget_skips_missing_tiers_and_terminates_when_tiers_grow(monkeypatch):
     monkeypatch.setenv('AI_SEARCH_INPUT_BUDGET_TOKENS', '1')
     out = digest.build_input('q', 'today', [dict(id='a', content='a', ai_summary='s' * 200),

@@ -268,12 +268,14 @@ describe('AI search layout and scroll lifecycle', () => {
     expect(declarations(parse(layoutCss), '.ai-search-results').padding).toBe('0 var(--ai-shell-pad)')
   })
 
-  it.each(['loadingJob', 'submitting', 'queued', 'running'] as const)('reserves citation and wide toc skeletons during %s', stage => {
+  it.each(['loadingJob', 'submitting', 'understanding', 'searching', 'queued', 'running'] as const)('reserves citation and wide toc skeletons during %s', stage => {
     render(<AiSearchPage />)
     act(() => useAiSearchStore.setState({
       phase: stage === 'submitting' ? 'submitting' : 'results',
       loadingJob: stage === 'loadingJob', items: [], cardOrder: [],
-      summary: { ...useAiSearchStore.getState().summary, status: stage === 'queued' || stage === 'running' ? stage : 'none' },
+      summary: { ...useAiSearchStore.getState().summary,
+        status: stage === 'queued' || stage === 'running' ? stage : stage === 'understanding' || stage === 'searching' ? 'retrieving' : 'none',
+        stage: stage === 'understanding' || stage === 'searching' ? stage : undefined },
     }))
     const cards = screen.getByLabelText('引用内容')
     const skeleton = cards.querySelector('[aria-hidden="true"]')!
@@ -290,7 +292,7 @@ describe('AI search layout and scroll lifecycle', () => {
     expect(screen.getByRole('navigation', { name: '目录' })).toBe(toc)
   })
 
-  it.each(['done', 'failed', 'unavailable'] as const)('keeps an empty wide toc placeholder for %s without headings', status => {
+  it.each(['insufficient', 'done', 'failed', 'unavailable'] as const)('keeps an empty wide toc placeholder for %s without headings', status => {
     render(<AiSearchPage />)
     results()
     act(() => useAiSearchStore.setState({ summary: { ...useAiSearchStore.getState().summary, status, contentMd: '只有正文' } }))
@@ -322,6 +324,17 @@ describe('AI search layout and scroll lifecycle', () => {
     expect(layoutCss).not.toMatch(/ai-search-(?:qhead|again)|--ai-(?:qhead-gap|again-size|again-color)/)
     expect(declarations(styles, '.ai-search-form')).toHaveProperty('width', '100%')
     expect(declarations(styles, '.ai-search-form')).not.toHaveProperty('margin-left')
+  })
+
+  it('keeps long retrieval keywords in one ellipsized meta line using the existing keyword color token', () => {
+    const styles = parse(summaryCss)
+    expect(declarations(styles, '.ai-summary-meta')).toEqual({
+      'font-family': 'var(--mono)', 'font-size': 'var(--ai-meta-size)', color: 'var(--ai-meta-color)',
+    })
+    expect(declarations(styles, '.ai-summary-meta-oneline')).toEqual({
+      'white-space': 'nowrap', overflow: 'hidden', 'text-overflow': 'ellipsis',
+    })
+    expect(declarations(styles, '.ai-summary-keywords')).toEqual({ color: 'var(--ai-meta-kw-color)' })
   })
 
   it.each(['', 'stable both-edges'])('restores the original gutter "%s" on narrow screens and route unmount', (value) => {

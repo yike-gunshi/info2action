@@ -107,6 +107,7 @@ function withCitations(node: ReactNode, key: string, items: AiSearchItem[], last
 }
 
 export function describeSummaryOutcome(summary: AiSearchSummary, emptyResult = false): string {
+  if (summary.status === 'insufficient') return describeSummaryError('insufficient') ?? ''
   if (emptyResult) return '站内近 90 天没有找到相关内容，换个说法试试。'
   if (summary.status === 'done') {
     const elapsed = summary.elapsedMs == null ? '—' : summary.elapsedMs < 60000 ? '不足 1 分钟' : `${Math.round(summary.elapsedMs / 60000)} 分`
@@ -126,14 +127,18 @@ export function SummaryMeta() {
   const itemCount = useAiSearchStore((state) => state.items.length)
   const emptyResult = useAiSearchStore((state) => state.emptyResult)
   const pending = !emptyResult && (summary.status === 'queued' || summary.status === 'running')
-  let text = ''
-  if (pending && !(loadingJob && itemCount === 0)) {
-    text = `正在整理 ${itemCount} 条内容 · 通常需要 8 到 15 分钟`
-      + ((summary.position ?? 0) > 0 ? ` · 排在第 ${summary.position} 位` : '')
+  let text: ReactNode = ''
+  if (summary.status === 'retrieving') {
+    text = summary.stage === 'searching'
+      ? <>正在查：<span className="ai-summary-keywords">{(summary.keywords ?? []).join(' · ')}</span></>
+      : '正在理解问题'
+  } else if (pending && !(loadingJob && itemCount === 0)) {
+    text = `正在整理 ${itemCount} 条内容 · 通常需要 10 到 20 分钟`
+      + (summary.status === 'queued' && (summary.position ?? 0) > 0 ? ` · 排在第 ${summary.position} 位` : '')
   } else if (!emptyResult && !loadingJob && summary.status === 'done') {
     text = describeSummaryOutcome(summary)
   }
-  return <p className="ai-summary-meta">{text}</p>
+  return <p className={`ai-summary-meta${summary.status === 'retrieving' ? ' ai-summary-meta-oneline' : ''}`}>{text}</p>
 }
 
 export function SummaryPane({ onFeedback }: { onFeedback?: (message: string) => void }) {
@@ -156,7 +161,7 @@ export function SummaryPane({ onFeedback }: { onFeedback?: (message: string) => 
 
   // 取既有任务时也走骨架：此时还不知道它是完成还是进行中，
   // 但页面已经确定要放一篇文章，空着会让人以为出错了。
-  if (loadingJob || summary.status === 'queued' || summary.status === 'running') {
+  if (loadingJob || summary.status === 'retrieving' || summary.status === 'queued' || summary.status === 'running') {
     return (
       <section aria-label="AI 总结" aria-busy="true" className="min-w-0">
         <div aria-hidden="true" className="ai-summary-skeleton">
@@ -179,7 +184,7 @@ export function SummaryPane({ onFeedback }: { onFeedback?: (message: string) => 
     )
   }
 
-  if (summary.status === 'failed' || summary.status === 'unavailable') {
+  if (summary.status === 'insufficient' || summary.status === 'failed' || summary.status === 'unavailable') {
     return (
       <section aria-label="AI 总结" className="ai-summary-state min-w-0">
         <p className="ai-summary-state-title">{describeSummaryOutcome(summary)}</p>

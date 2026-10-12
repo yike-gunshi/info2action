@@ -71,6 +71,29 @@ describe('CardsPane', () => {
     expect(window.scrollBy).not.toHaveBeenCalled()
   })
 
+  it.each(['understanding', 'searching'] as const)('shows card skeletons while retrieving during %s, even if candidates were retained', stage => {
+    useAiSearchStore.setState({ summary: { ...useAiSearchStore.getState().summary, status: 'retrieving', stage } })
+    const { container } = render(<CardsPane />)
+    expect(container.querySelectorAll('.ai-citation-card-skeleton')).toHaveLength(8)
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    act(() => useAiSearchStore.setState({ summary: { ...useAiSearchStore.getState().summary, status: 'queued' } }))
+    expect(container.querySelectorAll('.ai-citation-card-skeleton')).toHaveLength(0)
+    expect(screen.getAllByRole('button')).toHaveLength(3)
+  })
+
+  it('limits insufficient results to the first five candidates while keeping all other result states unchanged', () => {
+    const candidates = Array.from({ length: 7 }, (_, index) => ({ ...items[0], id: `candidate-${index}`, title: `资料 ${index + 1}` }))
+    useAiSearchStore.setState({ items: candidates, cardOrder: candidates.map(item => item.id).reverse(),
+      summary: { ...useAiSearchStore.getState().summary, status: 'insufficient' } })
+    render(<CardsPane />)
+    expect(screen.getAllByRole('button').map(button => button.getAttribute('aria-label'))).toEqual([
+      '[1] X 资料 1', '[2] X 资料 2', '[3] X 资料 3', '[4] X 资料 4', '[5] X 资料 5',
+    ])
+    act(() => useAiSearchStore.setState({ summary: { ...useAiSearchStore.getState().summary, status: 'failed', error: 'quota_exhausted' } }))
+    expect(screen.getAllByRole('button')).toHaveLength(7)
+    expect(screen.getAllByRole('button')[0]).toHaveAttribute('aria-label', '[7] X 资料 7')
+  })
+
   it('highlights only the selected card and removes its highlight after 1.5 seconds', () => {
     vi.useFakeTimers()
     render(<CardsPane />)

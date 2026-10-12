@@ -11,7 +11,9 @@ Runtime choice is driven by `.env EMBEDDING_PROVIDER` or
 `config.global.embedding_provider` (PRD §4.8).
 
 Credentials are STRICTLY ISOLATED from chat:
-  - OpenRouter embedding reads OPENROUTER_API_KEY + OPENROUTER_EMBEDDING_BASE only.
+  - OpenRouter embedding reads OPENROUTER_EMBEDDING_API_KEY (falling back to
+    OPENROUTER_API_KEY) + OPENROUTER_EMBEDDING_BASE, which may point to another
+    OpenAI-compatible gateway. Each variable reads process env before project .env.
   - Chat (generate_actions, cluster summary, etc.) reads MINIMAX_API_KEY +
     MINIMAX_API_BASE.
 There is NO fallback from embedding to chat credentials.
@@ -577,7 +579,10 @@ def resolve_runtime_provider(config: dict | None = None) -> tuple[str, str, str 
       - minimax: disabled; requesting it raises before any HTTP call.
       - doubao: DOUBAO_API_KEY (or DOUBAO_ASR_API_KEY shared Volcengine Ark
         account) + DOUBAO_BASE_URL.
-      - openrouter: OPENROUTER_API_KEY + OPENROUTER_EMBEDDING_BASE.
+      - openrouter: OPENROUTER_EMBEDDING_API_KEY (falling back to
+        OPENROUTER_API_KEY) + OPENROUTER_EMBEDDING_BASE (OpenAI-compatible gateway).
+        Each variable reads process env before project .env; the dedicated key
+        takes precedence over the legacy key regardless of source.
 
     Fake provider returns empty key (it ignores it).
     """
@@ -611,7 +616,9 @@ def resolve_runtime_provider(config: dict | None = None) -> tuple[str, str, str 
         return (name, api_key, api_base)
     if name_lower == 'openrouter':
         api_key = (
-            os.environ.get('OPENROUTER_API_KEY')
+            os.environ.get('OPENROUTER_EMBEDDING_API_KEY')
+            or project_env.get('OPENROUTER_EMBEDDING_API_KEY')
+            or os.environ.get('OPENROUTER_API_KEY')
             or project_env.get('OPENROUTER_API_KEY')
             or ''
         )

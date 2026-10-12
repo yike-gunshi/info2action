@@ -36,6 +36,26 @@ afterEach(() => {
 })
 
 describe('AiSearchHistory', () => {
+  it.each([
+    ['retrieving', '找资料中'],
+    ['insufficient', '资料不足'],
+  ] as const)('opens the existing %s job with its new label without creating a search', async (status, label) => {
+    const saved = item('v2/job', status)
+    useAuthStore.setState({ user })
+    vi.mocked(getAiSearchHistory).mockResolvedValue({ anonymous: false, items: [saved], total: 1 })
+    const loadJob = vi.spyOn(useAiSearchStore.getState(), 'loadJob').mockResolvedValue(undefined)
+    const submit = vi.spyOn(useAiSearchStore.getState(), 'submit').mockResolvedValue(undefined)
+    render(<AiSearchHistory />)
+    const link = await screen.findByRole('link', { name: `查询 v2/job ${label}` })
+    expect(link).toHaveAttribute('href', `#ai-search?job=v2%2Fjob&q=${encodeURIComponent(saved.query)}`)
+    expect(link).not.toHaveAttribute('aria-disabled')
+    fireEvent.click(link)
+    await waitFor(() => expect(window.location.hash).toBe(link.getAttribute('href')))
+    fireEvent.click(link)
+    expect(loadJob).toHaveBeenCalledOnce()
+    expect(loadJob).toHaveBeenCalledWith(saved.job_id, saved.query)
+    expect(submit).not.toHaveBeenCalled()
+  })
   it('directly reloads the matching history URL without relying on a hashchange', async () => {
     const saved = item('saved/job')
     vi.mocked(getAiSearchHistory).mockResolvedValue({ anonymous: false, items: [saved], total: 1 })

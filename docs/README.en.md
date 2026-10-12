@@ -4,7 +4,7 @@
 
 **Information should end in action.**
 
-Cross-platform aggregation · Cross-source event dedup · AI curation · Info→Action loop
+Cross-platform aggregation · Cross-source event dedup · AI curation · AI search · Info→Action loop
 
 [中文（完整文档）](../README.md) · **English**
 
@@ -32,15 +32,21 @@ Checking Twitter, WeChat, Reddit, Discord, RSS and YouTube every day means readi
 - **AI enrichment** — one LLM pass produces summary, key points, category, content type, quality score and keywords
 - **Cross-source event clustering** — embedding recall + LLM verdict on "same event"; event-level digests regenerated from original sources; fully auditable
 - **AI curation** — per-item LLM verdicts (featured / borderline / drop) aggregated per cluster into a "what you should see now" timeline
-- **AI search** — lexical and vector retrieval with asynchronous, cited summaries, source cards, personal history and daily quotas; requires Supabase and a GLM Coding Plan key ([setup](SELF-HOST.md#35-ai-搜索可选))
 - **Unified reading** — shared reading dialogs for items, events and actions, with full-page reading and table-of-contents navigation
 - **Product changelog** — a public changelog page with an unread indicator
 - **Personalized ranking** — onboarding profile (role / interests / tools), pure-computation `quality × engagement × freshness × match` scoring
+- **AI search** — ask one question; a background job splits it into entities, keywords and search sentences (MiniMax-M3), runs full-text and vector retrieval in parallel, reranks everything with Voyage rerank-3, and hands the top 200 full texts to GLM-5.3, which writes a long-form answer where every factual sentence links back to its sources. When the site has too little relevant material (fewer than 3 items scoring ≥ 0.65), it says so instead of writing — and the search is not counted. Requires Supabase, an embedding/rerank provider and a GLM Coding Plan key ([setup](SELF-HOST.md#35-ai-搜索可选))
 - **Info→Action loop** — signals worth acting on become executable action cards, dispatched to Discord Forum or opened in browser
 - **Video understanding** — subtitles first, Doubao ASR fallback, segment-level bilingual captions
 - **Multi-user** — open browsing without login; invite-based registration with email verification unlocks personalization, stars, history and actions
 - **Dual storage** — local SQLite for single-machine use; Supabase Postgres + Storage (pgvector recall, remote read models) for multi-user production
 - **Admin console** — curation-funnel panorama (per-cluster ledger of every item's score, veto reason and display verdict across the ingest→score→cluster→gate→display pipeline, with one-click manual override that feeds a golden replay set) plus per-run fetch reconciliation (ingest / AI-enrich / publish counts, stage timings, per-source drill-down)
+
+<div align="center">
+<img src="assets/readme/ai-search-result.png" alt="AI search — outline, cited long-form answer, and source cards" width="880">
+
+<sub>AI search: “What is jev and how do I use it?” — 200 relevant items found on the site, 199 of them cited in a ~19k-character answer</sub>
+</div>
 
 ## 🚀 Quick Start
 
