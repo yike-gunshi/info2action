@@ -4,6 +4,27 @@ import { useAuthStore } from '../../store/authStore'
 
 afterEach(() => { vi.unstubAllGlobals() })
 describe('aiSearch API client', () => {
+  it('preserves the retrieval-in-progress 409 as a distinct access reason', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: 'retrieval_in_progress' }), { status: 409 })))
+    const request = postAiSearch('query')
+    await expect(request).rejects.toMatchObject({ name: 'AiSearchAccessError', reason: 'retrieval_in_progress', status: 409 })
+    await expect(request).rejects.toBeInstanceOf(AiSearchAccessError)
+  })
+
+  it.each([
+    { job_id: 'v2-job', query: 'test', summary: { status: 'retrieving' } },
+    { job_id: 'v1-job', query: 'test', query_lexical: 'test', window_days: 90, lexical_hits: 1, vector_hits: 0, vector_ok: false,
+      items: [{ id: 'one', title: 'One', platform: 'rss', fetched_at: '' }], summary: { status: 'queued', position: 2 } },
+  ])('accepts both minimal v2 and legacy POST contracts: $job_id', async response => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(response))))
+    await expect(postAiSearch('test')).resolves.toEqual(response)
+  })
+
+  it('returns retrieval progress and vector_ok from GET', async () => {
+    const response = { job_id: 'v2-job', status: 'retrieving', stage: 'searching', keywords: ['Muse', 'Cue'], vector_ok: false, items: [] }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(response))))
+    await expect(getAiSearchJob('v2-job')).resolves.toEqual(response)
+  })
   it('preserves the login-required 401 reason without starting an anonymous search', async () => {
     useAuthStore.setState({ user: null })
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: 'login_required' }), { status: 401 })))

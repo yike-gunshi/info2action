@@ -20,18 +20,19 @@ function historyDate(createdAt: string): string {
 
 function HistoryRow({ item }: { item: AiSearchHistoryItem }) {
   const running = item.status === 'queued' || item.status === 'running'
+  const retrieving = item.status === 'retrieving'
   const contents = <>
     <span className="hq" title={item.query}>{item.query}</span>
     {item.status === 'done'
       ? <time className="hd" dateTime={item.created_at}>{historyDate(item.created_at)}</time>
-      : <span className="hd">{running ? '进行中' : '未完成'}</span>}
+      : <span className="hd">{retrieving ? '找资料中' : item.status === 'insufficient' ? '资料不足' : running ? '进行中' : '未完成'}</span>}
   </>
 
-  // 已完成与进行中的可点；失败的只显示「未完成」，不可点（用户定的规则）。
-  const available = item.status === 'done' || running
+  // 打开已保存的任务不新建搜索；失败行仍不可点。
+  const available = item.status === 'done' || item.status === 'insufficient' || retrieving || running
   const href = `#ai-search?job=${encodeURIComponent(item.job_id)}&q=${encodeURIComponent(item.query)}`
   return available
-    ? <a className={`hrow${running ? ' run' : ''}`} href={href} onClick={event => {
+    ? <a className={`hrow${running || retrieving ? ' run' : ''}`} href={href} onClick={event => {
       if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || window.location.hash !== href) return
       event.preventDefault()
       void useAiSearchStore.getState().loadJob(item.job_id, item.query)

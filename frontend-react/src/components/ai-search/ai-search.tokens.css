@@ -1,5 +1,5 @@
 /* 由 docs/assets/visuals/ai-search/ai-search.tokens.json 生成（工作台「保存」或 build_tokens.py），勿手改。
- * AI 搜索页 · 设计工作台 v32.1 v32.1 页面级与组件级 token。站点基础 token 只引用 var(--…)，值在站点全局样式。
+ * AI 搜索页 · 设计工作台 v34.0 页面级与组件级 token。站点基础 token 只引用 var(--…)，值在站点全局样式。
  * 工作台与前端组件读的是同一个文件。 */
 :root{
   --ai-topbar-h: 52px; /* TopBar 高 */
@@ -37,6 +37,7 @@
   --ai-chip-color: var(--brand); /* 角标色 */
   --ai-card-num-color: var(--brand); /* 卡内角标色 */
   --ai-meta-color: var(--muted-foreground); /* meta 行色 */
+  --ai-meta-kw-color: var(--ink-2); /* 「正在查」里关键词的颜色 */
   --ai-card-src-color: var(--muted-foreground); /* 来源行色 */
   --ai-card-bg: var(--card); /* 卡片底 */
   --ai-card-border: transparent; /* 卡片边 */

@@ -40,7 +40,8 @@ def quota_db(postgres, monkeypatch):
             candidate_ids jsonb, candidate_meta jsonb, input_text text,
             window_days integer, lexical_hits integer, vector_hits integer, vector_ok boolean,
             model text, prompt_version text, request_params jsonb, status text, error text,
-            created_at timestamptz DEFAULT '2026-10-10 15:59:59+00'::timestamptz)''')
+            created_at timestamptz DEFAULT '2026-10-10 15:59:59+00'::timestamptz,
+            write_queued_at timestamptz)''')
 
     clock = {'now': '2026-10-10 15:59:59+00'}  # Beijing 23:59:59.
     barrier = {'value': None}
@@ -67,8 +68,8 @@ def quota_db(postgres, monkeypatch):
 
     def seed(user_id, status='done', created_at=None):
         with psycopg.connect(postgres) as conn:
-            conn.execute(f'INSERT INTO {schema}.ai_search_jobs (user_id, status, created_at) VALUES (%s, %s, %s)',
-                         (user_id, status, created_at or clock['now']))
+            conn.execute(f'INSERT INTO {schema}.ai_search_jobs (user_id, status, created_at, write_queued_at) VALUES (%s, %s, %s, %s)',
+                         (user_id, status, created_at or clock['now'], created_at or clock['now']))
 
     def create(user_id, *, user_day=2, cap_day=5, exempt=False):
         return search.create_job(query='q', query_lexical='q', ip_hash='shared-ip', user_id=user_id,

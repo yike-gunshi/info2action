@@ -4,6 +4,16 @@
   color: var(--ai-meta-color);
 }
 
+.ai-summary-meta-oneline {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ai-summary-keywords {
+  color: var(--ai-meta-kw-color);
+}
+
 .ai-summary-article {
   margin-top: var(--ai-article-mt);
   font-family: var(--serif);

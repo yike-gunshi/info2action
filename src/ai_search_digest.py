@@ -5,10 +5,12 @@ QuotaExhausted to unavailable, and other failures to failed.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
 import re
+import socket
 import ssl
 import time
 import urllib.error
@@ -98,7 +100,7 @@ def _platform(item: dict) -> str:
     return _PLATFORMS.get(platform, platform)
 
 
-def _build_input(query, today, candidates, config: dict) -> dict:
+def _build_input(query, today, candidates, config: dict, *, degrade=True) -> dict:
     headers, bodies, levels = [], [], []
     item_chars = max(0, int(config['AI_SEARCH_ITEM_CHARS']))
     for number, item in enumerate(candidates, 1):
@@ -122,7 +124,7 @@ def _build_input(query, today, candidates, config: dict) -> dict:
     budget_chars = config['AI_SEARCH_INPUT_BUDGET_TOKENS'] * 1.4
     # Each round changes each item by at most one available tier, tail first.
     # Levels strictly increase, even if the fallback happens to be longer.
-    while char_count > budget_chars and any(level < 2 for level in levels):
+    while degrade and char_count > budget_chars and any(level < 2 for level in levels):
         for i in range(len(candidates) - 1, -1, -1):
             if levels[i] == 2:
                 continue
@@ -141,9 +143,32 @@ def _build_input(query, today, candidates, config: dict) -> dict:
     }
 
 
-def build_input(query, today, candidates) -> dict:
+def build_input(query, today, candidates, *, degrade=True, settings=None) -> dict:
     """Assemble ordered candidates with bounded content and tier degradation."""
-    return _build_input(query, today, candidates, settings())
+    config = settings if settings is not None else globals()['settings']()
+    return _build_input(query, today, candidates, config, degrade=degrade)
+
+
+def _render_prompt(template, query, today, item_count):
+    variables = {'query': query, 'today': today, 'item_count': str(item_count), 'items': ''}
+    # One pass preserves literal placeholders inside user-supplied text.
+    return re.sub(r'\{(query|today|item_count|items)\}', lambda m: variables[m.group(1)], template)
+
+
+def trim_input_candidates(query, today, candidates, config) -> tuple[list, list]:
+    """Recheck v2's current full-text budget, retaining at least one item."""
+    from ai_search_retrieval import settings as retrieval_settings
+    limits = retrieval_settings()
+    _, template = load_prompt(config['AI_SEARCH_PROMPT_PATH'])
+    retained, dropped = list(candidates), []
+    while len(retained) > 1:
+        message = _build_input(query, today, retained, config, degrade=False)['user_message']
+        system = _render_prompt(template, query, today, len(retained))
+        tokens = math.ceil((len(message) + len(system)) / limits['AI_SEARCH_CHARS_PER_TOKEN'])
+        if tokens <= limits['AI_SEARCH_INPUT_MAX_TOKENS']:
+            break
+        dropped.append(retained.pop()['id'])
+    return retained, dropped
 
 
 def _request_params(config: dict) -> dict:
@@ -151,13 +176,44 @@ def _request_params(config: dict) -> dict:
         'model': config['AI_SEARCH_MODEL'],
         'max_tokens': config['AI_SEARCH_MAX_TOKENS'],
         'reasoning_effort': config['AI_SEARCH_REASONING_EFFORT'],
+        'stream': True,
     }
+
+
+def _stream_idle_timeout(config: dict) -> int:
+    # Keep legacy settings snapshots stable; this transport setting is optional.
+    env = {**load_project_env(BASE_DIR), **os.environ}
+    value = config.get('AI_SEARCH_STREAM_IDLE_TIMEOUT_S', env.get('AI_SEARCH_STREAM_IDLE_TIMEOUT_S'))
+    try:
+        return max(30, int(value if value not in (None, '') else 300))
+    except (TypeError, ValueError):
+        return 300
 
 
 def call_glm(system_prompt, user_message, *, settings) -> tuple[str, dict, str]:
     """Call Coding Plan; settings['retry_delay_s'] can override the 30s delay."""
     if not settings['GLM_CODING_API_KEY']:
         raise DigestError('missing GLM_CODING_API_KEY')
+    secrets = [settings['GLM_CODING_API_KEY'], system_prompt, user_message]
+    query = re.match(r'^用户问题：(.*?)\n\n今天：', user_message, re.S)
+    if query:
+        secrets.append(query.group(1))
+
+    def error_summary(value):
+        detail = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        for secret in sorted(filter(None, secrets), key=len, reverse=True):
+            for encoded in (secret, json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1]):
+                detail = detail.replace(encoded, '[redacted]')
+        return detail[:300]
+
+    idle_timeout = _stream_idle_timeout(settings)
+    total_started = time.monotonic()
+
+    def check_total_timeout():
+        elapsed = time.monotonic() - total_started
+        if elapsed > settings['AI_SEARCH_JOB_TIMEOUT_S']:
+            raise DigestError(f'GLM job timeout after {elapsed:.0f} seconds')
+
     payload = {
         **_request_params(settings),
         'messages': [
@@ -175,33 +231,71 @@ def call_glm(system_prompt, user_message, *, settings) -> tuple[str, dict, str]:
         method='POST',
     )
     for attempt in range(2):
+        check_total_timeout()
         started = time.monotonic()
         try:
             with ai_provider_guard.guarded_urlopen(
                 req, provider='glm-coding', source='ai_search',
-                timeout=settings['AI_SEARCH_JOB_TIMEOUT_S'], context=_SSL_CTX,
+                timeout=idle_timeout, context=_SSL_CTX,
             ) as response:
-                result = json.loads(response.read().decode('utf-8'))
-            try:
-                text = result['choices'][0]['message']['content']
-                usage = result.get('usage') or {}
-                model = result.get('model') or settings['AI_SEARCH_MODEL']
-                if not isinstance(text, str) or not isinstance(usage, dict):
-                    raise ValueError('invalid content or usage')
-            except (KeyError, IndexError, TypeError, ValueError) as exc:
-                raise DigestError('invalid GLM response') from exc
-            return text, usage, model
+                parts, usage, model = [], {}, settings['AI_SEARCH_MODEL']
+                done, finished = False, False
+                while True:
+                    check_total_timeout()
+                    line = response.readline()
+                    check_total_timeout()
+                    if not line:
+                        break
+                    if not line.startswith(b'data:'):
+                        continue
+                    data = line[5:].strip()
+                    if data == b'[DONE]':
+                        done = True
+                        break
+                    try:
+                        result = json.loads(data)
+                        if not isinstance(result, dict):
+                            raise ValueError('invalid chunk')
+                        if 'error' in result:
+                            raise DigestError(f'GLM stream error: {error_summary(result["error"])}')
+                        model = result.get('model') or model
+                        if 'usage' in result:
+                            usage = result['usage'] or {}
+                            if not isinstance(usage, dict):
+                                raise ValueError('invalid usage')
+                        choices = result['choices']
+                        if not isinstance(choices, list):
+                            raise ValueError('invalid choices')
+                        for choice in choices:
+                            finished = finished or choice.get('finish_reason') is not None
+                            content = choice['delta'].get('content')
+                            if content is not None:
+                                if not isinstance(content, str):
+                                    raise ValueError('invalid content')
+                                parts.append(content)
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        raise DigestError('invalid GLM response') from None
+                if not done and not finished:
+                    raise DigestError('GLM stream ended early')
+            return ''.join(parts), usage, model
         except ai_provider_guard.ProviderCooldown as exc:
-            raise QuotaExhausted(str(exc)) from exc
+            raise QuotaExhausted(error_summary(str(exc))) from None
         except urllib.error.HTTPError as exc:
-            body = ai_provider_guard.read_http_error_body(exc)[:300]
+            body = error_summary(ai_provider_guard.read_http_error_body(exc))
             if exc.code == 429:
-                raise QuotaExhausted(f'HTTP 429: {body}') from exc
+                raise QuotaExhausted(f'HTTP 429: {body}') from None
             if not (500 <= exc.code < 600) or attempt == 1 or time.monotonic() - started >= 120:
-                raise DigestError(f'HTTP {exc.code}: {body}') from exc
-        except urllib.error.URLError:
-            if attempt == 1 or time.monotonic() - started >= 120:
-                raise
+                raise DigestError(f'HTTP {exc.code}: {body}') from None
+        except (urllib.error.URLError, http.client.RemoteDisconnected, ConnectionError,
+                socket.timeout, TimeoutError) as exc:
+            elapsed = time.monotonic() - started
+            if attempt == 1 or elapsed >= 120:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                kind = type(exc).__name__
+                if isinstance(reason, BaseException) and reason is not exc:
+                    kind += f'/{type(reason).__name__}'
+                failure = '读超时' if isinstance(reason, (socket.timeout, TimeoutError)) else '断开'
+                raise DigestError(f'GLM 连接在 {elapsed:.0f} 秒后{failure}（{kind}）') from None
         time.sleep(settings.get('retry_delay_s', 30))
     raise DigestError('GLM retry exhausted')  # Defensive: loop returns or raises.
 
@@ -331,12 +425,9 @@ def run_digest(job: dict, candidates: list, *, settings=None, call=None, now=Non
         current = datetime.now(ZoneInfo('Asia/Shanghai'))
     today = current.isoformat()[:10]
     query = job['query']
-    assembled = _build_input(query, today, candidates, config)
+    assembled = _build_input(query, today, candidates, config, degrade=job.get('retrieval') is None)
     version, template = load_prompt(config['AI_SEARCH_PROMPT_PATH'])
-    variables = {'query': query, 'today': today, 'item_count': str(len(candidates)), 'items': ''}
-    # Replace only declared variables, in one pass: JSON braces and user text
-    # containing a placeholder must survive literally.
-    system = re.sub(r'\{(query|today|item_count|items)\}', lambda m: variables[m.group(1)], template)
+    system = _render_prompt(template, query, today, len(candidates))
     raw, usage, model = (call or call_glm)(system, assembled['user_message'], settings=config)
     processed = postprocess(raw, candidates)
     return {

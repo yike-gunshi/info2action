@@ -17,11 +17,12 @@ export function AiSearchPage() {
   const query = useAiSearchStore((s) => s.query)
   const hasItems = useAiSearchStore((s) => s.items.length > 0)
   const loadingJob = useAiSearchStore((s) => s.loadingJob)
-  const pendingSummary = useAiSearchStore((s) => s.summary.status === 'queued' || s.summary.status === 'running')
+  const pendingSummary = useAiSearchStore((s) => s.summary.status === 'retrieving' || s.summary.status === 'queued' || s.summary.status === 'running')
   const unavailable = useAiSearchStore((s) => s.unavailable)
   const requestError = useAiSearchStore((s) => s.requestError)
   const emptyResult = useAiSearchStore((s) => s.emptyResult)
   const staleResult = useAiSearchStore((s) => (s.summary.error || s.summary.reason) === 'job_not_found')
+  const retrievalFailed = useAiSearchStore((s) => ['retrieval_failed', 'retrieval_timeout'].includes(s.summary.error || s.summary.reason || ''))
   const vectorOk = useAiSearchStore((s) => s.vectorOk)
   const jobId = useAiSearchStore((s) => s.jobId)
   const authReady = useAuthStore((s) => s.isChecked && !s.isLoading)
@@ -36,7 +37,7 @@ export function AiSearchPage() {
   const centered = phase === 'idle'
   const hasResults = !centered
   const loading = phase === 'submitting' || loadingJob || pendingSummary
-  const showCards = hasResults && !emptyResult && !staleResult && !unavailable && (hasItems || loading)
+  const showCards = hasResults && !emptyResult && !staleResult && !retrievalFailed && !unavailable && (hasItems || loading)
 
   useEffect(() => { setFeedback('') }, [jobId, phase])
 

@@ -16,6 +16,10 @@ afterEach(() => { cleanup(); useAiSearchStore.getState().reset(); vi.unstubAllGl
 
 describe('AiSearchResults announcements', () => {
   it.each([
+    { status: 'insufficient', error: null, message: '站内没有找到足够相关的内容，这次不计次数。换个更具体的说法试试。' },
+    { status: 'failed', error: 'retrieval_failed', message: '这次没能找完资料，可以再试一次，不计次数。' },
+    { status: 'failed', error: 'retrieval_timeout', message: '这次没能找完资料，可以再试一次，不计次数。' },
+    { status: 'failed', error: 'quota_exhausted', message: '当前额度已用完，明天 0 点恢复。' },
     { status: 'failed', error: 'hard_timeout', message: '这次总结用时太长，没能完成，可以再试一次。' },
     { status: 'failed', error: 'parse_error', message: '这次总结没有生成成功，可以再试一次。' },
     { status: 'failed', error: 'candidates_unavailable', message: '有几条原文刚刚下线了，重新搜索一次即可。' },

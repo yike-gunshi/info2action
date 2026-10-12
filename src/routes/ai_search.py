@@ -16,6 +16,7 @@ from slowapi.util import get_remote_address
 from starlette.concurrency import run_in_threadpool
 
 import ai_search_digest as digest
+import ai_search_retrieval as retrieval
 from ai_provider_guard import ProviderCooldown
 import remote_db
 from authz import can_access_all, current_user_id
@@ -38,6 +39,8 @@ limiter = Limiter(key_func=get_remote_address,
                   default_limits=[(os.environ.get('RATELIMIT_DEFAULT') or '600/minute').strip()])
 _AI_SEARCH_BG_TASKS = set()
 _AI_SEARCH_EXECUTOR = False
+_AI_SEARCH_SCHEMA_ERROR_LOGGED = False
+_AI_SEARCH_SCHEMA_READY = None
 # Keep this boundary fixed even if the first recovery needs to be retried.
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
@@ -57,9 +60,16 @@ def settings():
     def flag(key, default):
         value = str(env.get(key) or '').strip().lower()
         return default if not value else value not in ('0', 'false', 'off', 'no')
+    pipeline = str(env.get('AI_SEARCH_PIPELINE') or '').strip() or 'v2_admin'
+    if pipeline not in ('v1', 'v2_admin', 'v2'):
+        print('[warn] ai_search invalid AI_SEARCH_PIPELINE; using v1')
+        pipeline = 'v1'
     return {
         'enabled': flag('AI_SEARCH_ENABLED', True) and bool(str(env.get('GLM_CODING_API_KEY') or '').strip()),
         'worker_enabled': flag('AI_SEARCH_WORKER_ENABLED', False),
+        'pipeline': pipeline,
+        'retrieval_concurrency': max(1, integer('AI_SEARCH_RETRIEVAL_CONCURRENCY', 2)),
+        'retrieval_user_day': max(0, integer('AI_SEARCH_RETRIEVAL_USER_DAY', 10)),
         'window_days': max(1, integer('AI_SEARCH_WINDOW_DAYS', 90)),
         'sim_min': number('AI_SEARCH_SIM_MIN', .45),
         'quality_min': number('AI_SEARCH_QUALITY_MIN', None),
@@ -75,6 +85,30 @@ def settings():
 
 def enabled():
     return settings()['enabled']
+
+
+async def _schema_ready(*, strict=False):
+    global _AI_SEARCH_SCHEMA_READY, _AI_SEARCH_SCHEMA_ERROR_LOGGED
+    try:
+        ready = await run_in_threadpool(search.schema_ready)
+    except Exception as exc:
+        if strict:
+            raise
+        print(f'[warn] ai_search schema check failed: {exc}')
+        return _AI_SEARCH_SCHEMA_READY if _AI_SEARCH_SCHEMA_READY is not None else True
+    _AI_SEARCH_SCHEMA_READY = ready
+    if ready:
+        _AI_SEARCH_SCHEMA_ERROR_LOGGED = False
+    return ready
+
+
+async def available(config=None):
+    config = settings() if config is None else config
+    return config['enabled'] and await _schema_ready()
+
+
+def _uses_v2(request, config):
+    return config['pipeline'] == 'v2' or config['pipeline'] == 'v2_admin' and can_access_all(request)
 
 
 def _error(error, status=400, **extra):
@@ -122,7 +156,8 @@ async def _create_job(data, ip_hash, config, *, user_id, quota_exempt):
 def _public_error(error: str | None) -> str | None:
     if not error:
         return None
-    if error in {'parse_error', 'hard_timeout', 'candidates_unavailable', 'quota'}:
+    if error in {'parse_error', 'hard_timeout', 'candidates_unavailable', 'quota',
+                 'retrieval_failed', 'retrieval_timeout', 'quota_exhausted'}:
         return error
     lowered = error.lower()
     if 'timed out' in lowered or 'timeout' in lowered:
@@ -146,17 +181,30 @@ async def _job_items(job, request):
     # Summaries can quote private candidates. Do not expose a saved summary to
     # a caller who cannot read every source, even if they know the job UUID.
     if {item['id'] for item in items} != set(ids):
-        return None
+        missing = [i for i in ids if i not in {item['id'] for item in items}]
+        hidden = await run_in_threadpool(search.get_candidates, missing, public_only=False,
+                                         manual_owner_user_id=None, min_github_stars=0)
+        if hidden or set(missing).intersection(job.get('cited_ids') or []):
+            return None
     meta = {item['id']: item for item in job.get('candidate_meta') or []}
     by_id = {item['id']: item for item in items}
     cited = list(dict.fromkeys(i for i in job.get('cited_ids') or [] if i in by_id))
     cited_set = set(cited)
-    ordered_ids = cited + [i for i in ids if i not in cited_set]
+    ordered_ids = cited + [i for i in ids if i not in cited_set and i in by_id]
     return [{**by_id[i], **{k: v for k, v in meta.get(i, {}).items() if k in ('sim', 'legs', 'hs10')}} for i in ordered_ids]
 
 
-async def _job_response(job, items):
+async def _job_response(job, items, request):
     state = await _summary(job)
+    if job['status'] == 'retrieving':
+        record = job.get('retrieval') or {}
+        viewer = current_user_id(request)
+        can_see_progress = can_access_all(request) or bool(viewer and viewer == job.get('user_id'))
+        state['stage'] = 'searching' if can_see_progress and record.get('stage') == 'searching' else 'understanding'
+        if state['stage'] == 'searching':
+            state['keywords'] = record.get('keywords') or []
+    elif not (job['status'] == 'failed' and job.get('error') in ('retrieval_failed', 'retrieval_timeout')):
+        state['vector_ok'] = bool(job.get('vector_ok'))
     cited = job.get('cited_ids') or []
     return {'job_id': job['id'], 'query': job.get('query'), **state,
             'content_md': job.get('content_md_final') if job['status'] == 'done' else None,
@@ -169,7 +217,7 @@ async def _job_response(job, items):
 @limiter.limit('10/minute')
 async def post_search(request: Request):
     config = settings()
-    if not config['enabled']:
+    if not await available(config):
         return _error('ai_search_disabled', 404)
     user_id = current_user_id(request)
     if user_id is None and not getattr(request.state, 'legacy_authenticated', False):
@@ -183,6 +231,24 @@ async def post_search(request: Request):
         return _error('invalid_query')
     q = q.strip()
     ip_hash = _ip_hash(request, config)
+    if _uses_v2(request, config):
+        quota_exempt = can_access_all(request)
+        try:
+            jid = await run_in_threadpool(
+                search.create_retrieval_job, query=q, ip_hash=ip_hash, user_id=user_id,
+                scope={**_visibility(request), 'quota_exempt': quota_exempt},
+                user_day=config['user_day'], cap_day=config['cap_day'],
+                retrieval_user_day=config['retrieval_user_day'], quota_exempt=quota_exempt)
+        except search.QuotaExceeded:
+            return _error('quota_exhausted', 429)
+        except search.RetrievalInProgress:
+            return _error('retrieval_in_progress', 409)
+        try:
+            if _is_executor():
+                await _kick_retrieval()
+        except Exception as exc:
+            print(f'[warn] ai_search job {jid}: retrieval claim failed: {exc}')
+        return {'job_id': jid, 'query': q, 'summary': {'status': 'retrieving'}}
     error = await _quota_limit(request, config)
     if error is not None:
         return error
@@ -218,19 +284,24 @@ async def get_status(request: Request):
     config = settings()
     logged_in = current_user_id(request) is not None or bool(getattr(request.state, 'legacy_authenticated', False))
     reason = None
-    if not config['enabled']:
+    is_available = await available(config)
+    if not is_available:
         reason = 'disabled'
     elif not logged_in:
         reason = 'login_required'
     elif await _quota_limit(request, config) is not None:
         reason = 'quota_exhausted'
-    return {'enabled': config['enabled'], 'logged_in': logged_in, 'can_search': reason is None,
+    elif (_uses_v2(request, config) and not can_access_all(request)
+          and await run_in_threadpool(search.count_user_retrieval_day, current_user_id(request))
+          >= config['retrieval_user_day']):
+        reason = 'quota_exhausted'
+    return {'enabled': is_available, 'logged_in': logged_in, 'can_search': reason is None,
             'reason': reason, 'user_day_limit': config['user_day']}
 
 
 @router.get('/api/ai-search/history')
 async def get_history(request: Request, limit: int = 10):
-    if not enabled():
+    if not await available():
         return _error('ai_search_disabled', 404)
     user_id = current_user_id(request)
     if user_id is None:
@@ -244,15 +315,15 @@ async def get_history(request: Request, limit: int = 10):
 
 @router.get('/api/ai-search/{job_id}')
 async def get_search(request: Request, job_id: str):
-    if not enabled():
+    if not await available():
         return _error('ai_search_disabled', 404)
-    job = await run_in_threadpool(search.get_job, job_id)
+    job = await run_in_threadpool(search.get_job, job_id, include_input=False)
     if job is None:
         return _error('job_not_found', 404)
     items = await _job_items(job, request)
     if items is None:
         return _error('job_not_found', 404)
-    return await _job_response(job, items)
+    return await _job_response(job, items, request)
 
 
 @router.get('/api/admin/ai-search/jobs')
@@ -263,7 +334,7 @@ async def admin_jobs(request: Request, limit: int = Query(50, ge=1, le=200),
         return _error('admin_required', 403)
     if not remote_db.app_state_to_remote():
         return JSONResponse({'reason': 'remote_required'}, status_code=501)
-    if not enabled():
+    if not await available():
         return _error('ai_search_disabled', 404)
     config, model = settings(), digest.settings()
     return {'jobs': await run_in_threadpool(search.list_jobs, limit, offset, status or None),
@@ -283,14 +354,14 @@ async def admin_job(request: Request, job_id: str):
         return _error('admin_required', 403)
     if not remote_db.app_state_to_remote():
         return JSONResponse({'reason': 'remote_required'}, status_code=501)
-    if not enabled():
+    if not await available():
         return _error('ai_search_disabled', 404)
     job = await run_in_threadpool(search.get_job, job_id)
     return job if job is not None else _error('job_not_found', 404)
 
 
-def _spawn_job(job_id):
-    task = asyncio.create_task(_run_job(job_id))
+def _spawn_job(coroutine):
+    task = asyncio.create_task(coroutine)
     _AI_SEARCH_BG_TASKS.add(task)
     task.add_done_callback(_AI_SEARCH_BG_TASKS.discard)
 
@@ -310,23 +381,109 @@ async def _kick_next():
         jid = await run_in_threadpool(search.claim_next_queued, config['concurrency'])
         if jid is None:
             break
-        _spawn_job(jid)
+        _spawn_job(_run_job(jid))
 
 
-def _with_tiers(job, tiers):
-    meta = {item['id']: item for item in job.get('candidate_meta') or []}
-    return [{**meta.get(i, {'id': i}), 'tier': tiers.get(i)} for i in job['candidate_ids']]
+async def _kick_retrieval():
+    if not _is_executor():
+        return
+    concurrency = settings()['retrieval_concurrency']
+    for _ in range(concurrency):
+        if not _is_executor():
+            break
+        job = await run_in_threadpool(search.claim_next_retrieving, concurrency)
+        if job is None:
+            break
+        _spawn_job(_run_retrieval(job))
 
 
-def _prepare_input(job, candidates, config):
-    assembled = digest.build_input(job['query'], datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat(), candidates)
+async def _run_retrieval(job):
+    job_id = job['id']
+    cancelled = False
+    def progress(patch):
+        try:
+            search.update_retrieval_progress(job_id, patch)
+        except Exception as exc:
+            print(f'[warn] ai_search job {job_id}: retrieval progress failed: {exc}')
+
+    async def fail(code, patch=None):
+        if patch is not None:
+            await run_in_threadpool(progress, patch)
+        try:
+            await run_in_threadpool(search.fail_job, job_id, error=code)
+        except Exception as exc:
+            print(f'[warn] ai_search job {job_id}: failed to persist retrieval failure: {exc}')
+
+    try:
+        saved_scope = (job.get('retrieval') or {}).get('scope') or {}
+        quota_exempt = saved_scope.get('quota_exempt', False) is True
+        scope = dict(public_only=saved_scope.get('public_only', True),
+                     user_id=saved_scope.get('user_id'),
+                     manual_owner_user_id=saved_scope.get('manual_owner_user_id'),
+                     min_github_stars=saved_scope.get('min_github_stars', _github_cluster_display_min_stars()))
+        timeout_s = retrieval.settings()['AI_SEARCH_RETRIEVAL_TIMEOUT_S']
+        result = await asyncio.wait_for(
+            run_in_threadpool(retrieval.run, job['query'], **scope, progress=progress, timeout_s=timeout_s),
+            timeout=timeout_s + 15)
+        config = settings()
+        retry_delays = (1, 3, 9)
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                status = await run_in_threadpool(
+                    search.finish_retrieval, job_id, result['outcome'],
+                    **{key: result[key] for key in ('candidate_ids', 'candidate_meta', 'retrieval',
+                       'lexical_hits', 'vector_hits', 'vector_ok', 'window_days', 'query_lexical')},
+                    user_day=config['user_day'], cap_day=config['cap_day'], quota_exempt=quota_exempt)
+                break
+            except Exception as exc:
+                if attempt == len(retry_delays):
+                    print(f'[warn] ai_search job {job_id}: failed to persist retrieval result: {exc}')
+                    return
+                await asyncio.sleep(retry_delays[attempt])
+        if status == 'queued':
+            try:
+                await _kick_next()
+            except Exception as exc:
+                print(f'[warn] ai_search job {job_id}: writing claim failed: {exc}')
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    except retrieval.RetrievalError as exc:
+        await fail(exc.code, {**exc.retrieval, 'error': str(exc)[:500]})
+    except asyncio.TimeoutError:
+        await fail('retrieval_timeout')
+    except Exception as exc:
+        print(f'[warn] ai_search job {job_id}: retrieval failed: {exc}')
+        await fail('retrieval_failed', {'error': str(exc)[:500]})
+    finally:
+        if not cancelled and not asyncio.current_task().cancelling():
+            try:
+                await _kick_retrieval()
+            except Exception as exc:
+                print(f'[warn] ai_search job {job_id}: retrieval drain failed: {exc}')
+
+
+def _with_tiers(job, tiers, *, dropped_ids=()):
+    meta = {item['id']: {k: v for k, v in item.items() if k not in ('offline', 'dropped')}
+            for item in job.get('candidate_meta') or []}
+    dropped = set(dropped_ids)
+    return [{**meta.get(i, {'id': i}), 'tier': tiers.get(i),
+             **({'dropped': 'input_budget'} if i in dropped else {'offline': True} if i not in tiers else {})}
+            for i in job['candidate_ids']]
+
+
+def _prepare_input(job, candidates, config, *, now=None, dropped_ids=()):
+    current = now if now is not None else datetime.now(ZoneInfo('Asia/Shanghai'))
+    assembled = digest.build_input(job['query'], current.date().isoformat(), candidates,
+                                   settings=config, degrade=job.get('retrieval') is None)
     version, _ = digest.load_prompt(config['AI_SEARCH_PROMPT_PATH'])
     search.save_job_input(job['id'], input_text=assembled['user_message'],
-                          candidate_meta=_with_tiers(job, assembled['tiers']),
+                          candidate_meta=_with_tiers(job, assembled['tiers'], dropped_ids=dropped_ids),
                           model=config['AI_SEARCH_MODEL'], prompt_version=version,
                           request_params={'model': config['AI_SEARCH_MODEL'],
                                           'max_tokens': config['AI_SEARCH_MAX_TOKENS'],
                                           'reasoning_effort': config['AI_SEARCH_REASONING_EFFORT']})
+    return current
 
 
 async def _run_job(job_id):
@@ -337,18 +494,26 @@ async def _run_job(job_id):
             return
         candidates = await run_in_threadpool(search.get_candidates, job['candidate_ids'],
                                             full_text=True, public_only=False, min_github_stars=0)
-        if [c['id'] for c in candidates] != job['candidate_ids']:
+        by_id = {c['id']: c for c in candidates}
+        candidates = [by_id[i] for i in job['candidate_ids'] if i in by_id]
+        if not candidates:
             raise digest.DigestError('candidates_unavailable')
         config = digest.settings()
-        await run_in_threadpool(_prepare_input, job, candidates, config)
-        result = await run_in_threadpool(digest.run_digest, job, candidates, settings=config)
+        current = datetime.now(ZoneInfo('Asia/Shanghai'))
+        dropped_ids = []
+        if job.get('retrieval') is not None:
+            candidates, dropped_ids = await run_in_threadpool(
+                digest.trim_input_candidates, job['query'], current.date().isoformat(), candidates, config)
+        current = await run_in_threadpool(_prepare_input, job, candidates, config,
+                                         now=current, dropped_ids=dropped_ids)
+        result = await run_in_threadpool(digest.run_digest, job, candidates, settings=config, now=current)
         retry_delays = (1, 3, 9)
         for attempt in range(len(retry_delays) + 1):
             try:
                 await run_in_threadpool(search.finish_job, job_id,
                                         **{k: result[k] for k in ('input_text', 'result', 'content_md_final', 'cited_ids',
                                            'usage', 'elapsed_ms', 'model', 'prompt_version', 'request_params')},
-                                        candidate_meta=_with_tiers(job, result['tiers']),
+                                        candidate_meta=_with_tiers(job, result['tiers'], dropped_ids=dropped_ids),
                                         points_estimate=search.points_estimate(result['usage']))
                 break
             except Exception:
@@ -393,16 +558,24 @@ async def _run_job(job_id):
 
 
 async def _sweep():
+    global _AI_SEARCH_SCHEMA_ERROR_LOGGED
     startup = True
     next_recovery = 0.
     while True:
         try:
+            if not await _schema_ready(strict=True):
+                if not _AI_SEARCH_SCHEMA_ERROR_LOGGED:
+                    print('[error] ai_search v2 schema unavailable: migration not applied; AI search is disabled', flush=True)
+                    _AI_SEARCH_SCHEMA_ERROR_LOGGED = True
+                await asyncio.sleep(5)
+                continue
             config = settings()
             if time.monotonic() >= next_recovery:
                 await run_in_threadpool(search.recover_stale, config['hard_timeout'],
                                         requeue_before=_PROCESS_STARTED_AT if startup else None)
                 startup = False
                 next_recovery = time.monotonic() + 60
+            await _kick_retrieval()
             await _kick_next()
         except Exception as exc:
             print(f'[warn] ai_search job sweeper: {exc}')

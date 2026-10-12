@@ -7,6 +7,7 @@ import { renderMarkdownLite } from '../../lib/markdown-lite'
 
 const PAGE_SIZE = 50
 const STATUS_LABELS: Record<AiSearchJobStatus, string> = {
+  retrieving: '找资料', insufficient: '资料不足',
   queued: '排队', running: '运行', done: '完成', failed: '失败', unavailable: '不可用',
 }
 const NUMBER_CELL = 'px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap'
@@ -79,7 +80,10 @@ export function AiSearchLogsTab({ reloadSignal = 0 }: { reloadSignal?: number })
                 </tr>
               </thead>
               <tbody>
-                {jobs.map((job) => (
+                {jobs.map((job) => {
+                  const retrievalIncomplete = job.status === 'retrieving'
+                    || (job.status === 'failed' && (job.error === 'retrieval_failed' || job.error === 'retrieval_timeout'))
+                  return (
                   <Fragment key={job.id}>
                     <tr className="cursor-pointer border-b border-border hover:bg-muted/30" onClick={() => setExpandedId((current) => current === job.id ? null : job.id)}>
                       <td className="whitespace-nowrap px-3 py-2 font-mono tabular-nums">{formatTime(job.created_at)}</td>
@@ -90,8 +94,8 @@ export function AiSearchLogsTab({ reloadSignal = 0 }: { reloadSignal?: number })
                       </td>
                       <td className="whitespace-nowrap px-3 py-2">{STATUS_LABELS[job.status] ?? '—'}</td>
                       <td className={NUMBER_CELL}>
-                        {job.lexical_hits ?? '—'} / {job.vector_ok ? (job.vector_hits ?? '—') : '—'}
-                        {!job.vector_ok ? <span className="ml-1 text-[11px] text-muted-foreground">向量失败</span> : null}
+                        {job.lexical_hits ?? '—'} / {!retrievalIncomplete && job.vector_ok ? (job.vector_hits ?? '—') : '—'}
+                        {!retrievalIncomplete && !job.vector_ok ? <span className="ml-1 text-[11px] text-muted-foreground">向量失败</span> : null}
                       </td>
                       <td className={NUMBER_CELL}>{job.candidate_count ?? '—'}</td>
                       <td className={NUMBER_CELL}>{formatElapsed(job.elapsed_ms)}</td>
@@ -103,7 +107,8 @@ export function AiSearchLogsTab({ reloadSignal = 0 }: { reloadSignal?: number })
                       <tr><td colSpan={9} id={`ai-search-detail-${job.id}`} className="border-b border-border px-4 py-4"><JobDetail key={job.id} id={job.id} /></td></tr>
                     ) : null}
                   </Fragment>
-                ))}
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -144,6 +149,7 @@ function JobDetail({ id }: { id: string }) {
   return (
     <div className="space-y-4">
       {data.error ? <p className="whitespace-pre-wrap break-words text-[12px] text-destructive">错误：{data.error}</p> : null}
+      <RetrievalBlock retrieval={data.retrieval} />
       <RawBlock label="原始输入" text={data.input_text} />
       <RawBlock label="模型原始 JSON" text={data.result == null ? null : JSON.stringify(data.result, null, 2)} />
       <section aria-label="后处理正文">
@@ -160,6 +166,82 @@ function JobDetail({ id }: { id: string }) {
       </div>
     </div>
   )
+}
+
+function RetrievalBlock({ retrieval }: { retrieval: AiSearchJobDetail['retrieval'] }) {
+  const record = retrievalObject(retrieval)
+  const errors = [record.error, record.similarity_error].filter(error => error != null && error !== '')
+  const understanding = retrievalObject(record.understanding)
+  const previewTitles = retrievalStrings(record.preview_titles)
+  const legs = retrievalObjects(record.legs)
+  const dfCap = formatRetrievalNumber(record.df_cap, undefined, '上限')
+  const rerank = retrievalObject(record.rerank)
+  const distribution = retrievalObject(rerank.score_distribution)
+  const failedAttempts = retrievalObjects(rerank.attempts).filter(attempt => attempt.error != null
+    && (typeof attempt.error !== 'string' || attempt.error.trim().length > 0))
+  const selection = retrievalObject(record.selection)
+  const timings = Object.entries(retrievalObject(record.timings_s))
+  const usage = retrievalObjects(record.usage)
+  return (
+    <section aria-label="找资料" className="grid gap-2 break-words font-mono text-xs tabular-nums text-muted-foreground">
+      <h3 className={LABEL}>找资料</h3>
+      {errors.map((error, index) => <p key={index}>错误：{formatRetrievalText(error)}</p>)}
+      <p>拆问题：版本 {formatRetrievalText(understanding.prompt_version)} · 模型 {formatRetrievalText(understanding.model)}{understanding.fallback === true ? ` · 兜底：${formatRetrievalText(understanding.error)}` : ''} · 字段兜底：{formatRetrievalList(understanding.field_fallbacks)} · 耗时 {formatRetrievalNumber(understanding.elapsed_s, 1)} 秒</p>
+      <div className="grid gap-2">
+        <p>粗查标题：{Array.isArray(record.preview_titles) ? previewTitles.length : '—'} 条</p>
+        <ul className="grid gap-2">{previewTitles.length ? previewTitles.map((title, index) => <li key={index}>{title}</li>) : <li>—</li>}</ul>
+        <p>粗查错误：{formatRetrievalText(record.preview_error)}</p>
+      </div>
+      <p>关键词：{formatRetrievalList(record.keywords)}</p>
+      <p>检索句：{formatRetrievalList(record.semantic_queries, '；')}</p>
+      <p>检索范围：近{formatRetrievalNumber(record.window_days)}天 · 向量可用：{formatRetrievalBoolean(record.vector_ok)}{record.vector_ok === false ? ` · 错误：${formatRetrievalText(record.embedding_error)}` : ''}</p>
+      <div className="overflow-x-auto">
+        <table aria-label="检索各路" className="w-full text-left">
+          <thead><tr>{['类型', '查询', '命中', '取用', '是否跳过', '跳过原因', '错误', '耗时（秒）'].map((label) => <th key={label} className="px-3 py-2">{label}</th>)}</tr></thead>
+          <tbody>{legs.length ? legs.map((leg, index) => <tr key={index}>
+            <td className="px-3 py-2">{leg.type === 'lexical' ? '全文' : leg.type === 'vector' ? '向量' : '—'}</td>
+            <td className="px-3 py-2">{formatRetrievalText(leg.query)}</td>
+            <td className={NUMBER_CELL}>{leg.hits_capped === true ? `> ${dfCap}` : formatRetrievalNumber(leg.hits)}</td>
+            <td className={NUMBER_CELL}>{formatRetrievalNumber(leg.taken)}</td>
+            <td className="px-3 py-2">{formatRetrievalBoolean(leg.skipped)}</td>
+            <td className="px-3 py-2">{leg.skip_reason === 'df_cap' ? '泛词跳过' : formatRetrievalText(leg.skip_reason)}</td>
+            <td className="px-3 py-2">{formatRetrievalText(leg.error)}</td>
+            <td className={NUMBER_CELL}>{formatRetrievalNumber(leg.elapsed_s, 1)}</td>
+          </tr>) : <tr><td colSpan={8} className="px-3 py-2">—</td></tr>}</tbody>
+        </table>
+      </div>
+      <p>合并 {formatRetrievalNumber(record.merged_count)} · 时间过滤后 {formatRetrievalNumber(record.filtered_count)}</p>
+      <p>重排：模型 {formatRetrievalText(rerank.model)} · 兜底 {formatRetrievalBoolean(rerank.fallback)} · 共 {formatRetrievalNumber(rerank.count)} 条 · ≥ {rerank.threshold == null ? '阈值' : formatRetrievalNumber(rerank.threshold)}：{formatRetrievalNumber(rerank.above_threshold)} 条 · 判资料不足：{formatRetrievalBoolean(rerank.threshold_applied)}</p>
+      <p>重排分数分布：min {formatRetrievalNumber(distribution.min, 2)} · max {formatRetrievalNumber(distribution.max, 2)} · mean {formatRetrievalNumber(distribution.mean, 2)}</p>
+      <p>分桶：{Object.entries(retrievalObject(distribution.buckets)).map(([bucket, count]) => `${bucket}：${formatRetrievalNumber(count)}`).join(' · ') || '—'}</p>
+      <div className="grid gap-2"><p>重排尝试错误：</p>{failedAttempts.length ? failedAttempts.map((attempt, index) => <p key={index}>{formatRetrievalText(attempt.model)}：{formatRetrievalText(attempt.error)}</p>) : <p>—</p>}</div>
+      <p>取用与截断：前 {formatRetrievalNumber(selection.top_n_count)} 条 · 截掉 {formatRetrievalNumber(selection.dropped_count)} 条 · 最终 {formatRetrievalNumber(selection.final_count)} 条 · 估算 token {formatRetrievalNumber(selection.estimated_tokens)} / 上限 {formatRetrievalNumber(selection.input_max_tokens)} · 取不到正文长度 {Array.isArray(selection.unavailable_ids) ? retrievalStrings(selection.unavailable_ids).length : '—'} 条</p>
+      <section aria-label="各步耗时" className="grid gap-2"><h4 className={LABEL}>各步耗时</h4>{timings.length ? timings.map(([stage, seconds]) => <p key={stage}>{stage}：{formatRetrievalNumber(seconds, 1)} 秒</p>) : <p>—</p>}</section>
+      <section aria-label="各步用量" className="grid gap-2"><h4 className={LABEL}>各步用量</h4>{usage.length ? usage.map((entry, index) => <p key={index}>{formatRetrievalText(entry.stage)} · {formatRetrievalText(entry.model)} · 用量 {entry.usage && typeof entry.usage === 'object' && !Array.isArray(entry.usage) ? JSON.stringify(entry.usage) : '—'}</p>) : <p>—</p>}</section>
+    </section>
+  )
+}
+
+function retrievalObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+function retrievalObjects(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(entry => entry && typeof entry === 'object') : []
+}
+function retrievalStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(entry => typeof entry === 'string') : []
+}
+function formatRetrievalText(value: unknown) {
+  return typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) ? value : '—'
+}
+function formatRetrievalNumber(value: unknown, digits?: number, fallback = '—') {
+  return typeof value === 'number' && Number.isFinite(value) ? (digits == null ? value : value.toFixed(digits)) : fallback
+}
+function formatRetrievalBoolean(value: unknown) {
+  return typeof value === 'boolean' ? (value ? '是' : '否') : '—'
+}
+function formatRetrievalList(value: unknown, separator = ' · ') {
+  return retrievalStrings(value).join(separator) || '—'
 }
 
 function RawBlock({ label, text }: { label: string; text: string | null }) {

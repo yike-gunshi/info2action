@@ -36,6 +36,7 @@ describe('SummaryPane', () => {
     expect(document.querySelector('.ai-summary-meta')).toBe(meta)
     expect(meta).not.toHaveAttribute('role')
     expect(meta).not.toHaveAttribute('aria-live')
+    expect(meta).not.toHaveClass('ai-summary-meta-oneline')
     expect(meta).toHaveTextContent('用时 1 分 · 基于 2 条内容')
     expect(meta).not.toHaveTextContent('一篇很长的总结正文')
     expect(article).not.toHaveAttribute('aria-live')
@@ -146,7 +147,8 @@ describe('SummaryPane', () => {
   it('shows loading count, positive queue position and motion-safe skeleton', () => {
     summary({ status: 'queued', position: 2 })
     const { container } = render(<SummaryWithMeta />)
-    expect(screen.getByText('正在整理 2 条内容 · 通常需要 8 到 15 分钟 · 排在第 2 位')).toBeInTheDocument()
+    expect(screen.getByText('正在整理 2 条内容 · 通常需要 10 到 20 分钟 · 排在第 2 位')).toBeInTheDocument()
+    expect(container.querySelector('.ai-summary-meta')).not.toHaveClass('ai-summary-meta-oneline')
     expect(container.querySelectorAll('.animate-pulse')).toHaveLength(7)
     expect(container.querySelectorAll('.motion-reduce\\:animate-none')).toHaveLength(7)
     const bars = container.querySelectorAll('.ai-summary-skeleton-bar')
@@ -159,6 +161,46 @@ describe('SummaryPane', () => {
     summary({ status: 'running', position: 0 })
     render(<SummaryWithMeta />)
     expect(screen.queryByText(/排在第/)).not.toBeInTheDocument()
+  })
+
+  it.each(['understanding', undefined] as const)('shows understanding metadata and body skeleton while retrieving with stage=%s', stage => {
+    useAiSearchStore.setState({ items: [] })
+    summary({ status: 'retrieving', stage })
+    const { container } = render(<SummaryWithMeta />)
+    expect(container.querySelector('.ai-summary-meta')?.textContent).toBe('正在理解问题')
+    expect(container.querySelector('.ai-summary-meta')).toHaveClass('ai-summary-meta-oneline')
+    expect(screen.getByRole('region', { name: 'AI 总结' })).toHaveAttribute('aria-busy', 'true')
+    expect(container.querySelectorAll('.ai-summary-skeleton-bar')).toHaveLength(7)
+    expect(container.querySelector('.ai-summary-state-title')).toBeNull()
+  })
+
+  it('shows all search keywords in order and replaces retrieval metadata with writing metadata', () => {
+    const keywords = ['Muse', 'Cue', 'Instinct', '个人 Agent', 'Meta Muse', 'Manus Cue', '云电脑', '虚拟女友']
+    useAiSearchStore.setState({ items: [] })
+    summary({ status: 'retrieving', stage: 'searching', keywords })
+    const { container } = render(<SummaryWithMeta />)
+    const meta = container.querySelector('.ai-summary-meta')!
+    expect(meta.textContent).toBe(`正在查：${keywords.join(' · ')}`)
+    expect(meta).toHaveClass('ai-summary-meta-oneline')
+    expect(meta.querySelector('.ai-summary-keywords')?.textContent).toBe(keywords.join(' · '))
+    expect(container.querySelectorAll('.ai-summary-skeleton-bar')).toHaveLength(7)
+    act(() => {
+      useAiSearchStore.setState({ items })
+      summary({ status: 'queued', position: 3 })
+    })
+    expect(meta.textContent).toBe('正在整理 2 条内容 · 通常需要 10 到 20 分钟 · 排在第 3 位')
+    expect(meta).not.toHaveClass('ai-summary-meta-oneline')
+    expect(meta.querySelector('.ai-summary-keywords')).toBeNull()
+    act(() => summary({ status: 'running', position: 3 }))
+    expect(meta.textContent).toBe('正在整理 2 条内容 · 通常需要 10 到 20 分钟')
+    expect(meta).not.toHaveClass('ai-summary-meta-oneline')
+  })
+
+  it('handles a searching stage whose optional keywords have not arrived', () => {
+    summary({ status: 'retrieving', stage: 'searching', keywords: undefined })
+    const { container } = render(<SummaryWithMeta />)
+    expect(container.querySelector('.ai-summary-meta')?.textContent).toBe('正在查：')
+    expect(container.querySelector('.ai-summary-keywords')).toBeEmptyDOMElement()
   })
 
   it('renders first-appearance citation numbers and locates the matching API item', () => {
@@ -217,12 +259,16 @@ describe('SummaryPane', () => {
   })
 
   it.each([
+    { state: 'insufficient', error: null, message: '站内没有找到足够相关的内容，这次不计次数。换个更具体的说法试试。' },
+    { state: 'retrieval_failed', error: 'retrieval_failed', message: '这次没能找完资料，可以再试一次，不计次数。' },
+    { state: 'retrieval_timeout', error: 'retrieval_timeout', message: '这次没能找完资料，可以再试一次，不计次数。' },
+    { state: 'quota_exhausted', error: 'quota_exhausted', message: '当前额度已用完，明天 0 点恢复。' },
     { state: 'failed', error: 'hard_timeout', message: '这次总结用时太长，没能完成，可以再试一次。' },
     { state: 'service', error: 'quota', message: 'AI 总结服务暂时不可用，请稍后再来。' },
     { state: 'stale', error: 'job_not_found', message: '这次的结果已失效，可以重新搜索。' },
     { state: 'empty', error: null, message: '站内近 90 天没有找到相关内容，换个说法试试。' },
   ])('renders one sentence and no buttons for $state', ({ state, error, message }) => {
-    summary({ status: 'failed', error })
+    summary({ status: state === 'insufficient' ? 'insufficient' : 'failed', error })
     useAiSearchStore.setState({ emptyResult: state === 'empty', items: [] })
     render(<SummaryWithMeta />)
     const region = screen.getByRole('region', { name: 'AI 总结' })

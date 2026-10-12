@@ -173,6 +173,30 @@ describe('AiSearchPage route lifecycle', () => {
     expect(screen.queryByRole('link', { name: '登录' })).not.toBeInTheDocument()
   })
 
+  it('returns a retrieval conflict to the idle input with one ordinary hint and no error alert', async () => {
+    document.documentElement.style.setProperty('--ai-hist-max', '3')
+    vi.mocked(getAiSearchStatus).mockResolvedValue(usableStatus)
+    vi.mocked(apiFetch).mockImplementation(async (_url, options) => {
+      if (options?.method === 'POST') throw Object.assign(new Error('retrieval_in_progress'), { status: 409 })
+      return { anonymous: false, total: 0, items: [] }
+    })
+    render(<AiSearchPage />)
+    await waitFor(() => expect(useAiSearchStore.getState().statusLoading).toBe(false))
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '保留这次的新问题' } })
+    fireEvent.click(screen.getByRole('button', { name: 'AI 搜索' }))
+    const hint = await screen.findByText('上一个问题还在找资料，请稍等')
+    expect(hint).toHaveAttribute('role', 'status')
+    expect(hint).toHaveClass('ai-search-hint')
+    expect(hint).not.toHaveClass('text-[var(--destructive)]')
+    expect(screen.getAllByText('上一个问题还在找资料，请稍等')).toHaveLength(1)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox')).toHaveValue('保留这次的新问题')
+    expect(screen.getByRole('button', { name: 'AI 搜索' })).toBeEnabled()
+    expect(screen.queryByRole('heading', { level: 1 })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: '引用内容' })).not.toBeInTheDocument()
+    expect(useAiSearchStore.getState()).toMatchObject({ phase: 'idle', query: '保留这次的新问题', jobId: null })
+  })
+
   it('keeps administrators usable when an exhausted status was retained', async () => {
     vi.mocked(getAiSearchStatus).mockResolvedValue(usableStatus)
     useAuthStore.setState({ user: { id: 'admin', username: 'admin', email: '', role: 'admin' } })
@@ -286,6 +310,7 @@ describe('AiSearchPage route lifecycle', () => {
   })
 
   it.each([
+    { status: 'retrieving', error: null },
     { status: 'done', error: null },
     { status: 'running', error: null },
     { status: 'queued', error: null },
@@ -352,6 +377,47 @@ describe('AiSearchPage route lifecycle', () => {
       fireEvent.submit(input.closest('form')!)
       expect(vi.mocked(apiFetch).mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false)
     }
+  })
+
+  it.each([
+    { status: 'insufficient', error: null, itemCount: 7, cardCount: 5, message: '站内没有找到足够相关的内容，这次不计次数。换个更具体的说法试试。' },
+    { status: 'insufficient', error: null, itemCount: 0, cardCount: 0, message: '站内没有找到足够相关的内容，这次不计次数。换个更具体的说法试试。' },
+    { status: 'failed', error: 'retrieval_failed', itemCount: 7, cardCount: 0, message: '这次没能找完资料，可以再试一次，不计次数。' },
+    { status: 'failed', error: 'retrieval_timeout', itemCount: 7, cardCount: 0, message: '这次没能找完资料，可以再试一次，不计次数。' },
+    { status: 'failed', error: 'quota_exhausted', itemCount: 7, cardCount: 7, message: '当前额度已用完，明天 0 点恢复。' },
+  ] as const)('renders the new outcome $status / $error with $cardCount citations for $itemCount candidates', ({ status, error, itemCount, cardCount, message }) => {
+    document.documentElement.style.setProperty('--ai-toc-bp', '1500px')
+    vi.stubGlobal('innerWidth', 1600)
+    const candidates = Array.from({ length: itemCount }, (_, index) => ({ id: `candidate-${index}`, title: `来源 ${index + 1}`, platform: 'rss', fetched_at: '' }))
+    render(<AiSearchPage />)
+    act(() => useAiSearchStore.setState({ phase: 'results', query: longQuery, items: candidates,
+      cardOrder: candidates.map(item => item.id), summary: { ...useAiSearchStore.getState().summary, status, error } }))
+    expect(screen.getByRole('textbox', { name: 'AI 搜索' })).toHaveValue(longQuery)
+    expect(screen.queryByRole('heading', { level: 1 })).not.toBeInTheDocument()
+    expect(screen.getByText(message, { selector: '.ai-summary-state-title' })).toBeInTheDocument()
+    expect(document.querySelector('.ai-summary-meta')).toBeNull()
+    expect(document.querySelector('main')).toHaveAttribute('data-columns', String(cardCount > 0))
+    if (cardCount) {
+      const cards = screen.getByRole('region', { name: '引用内容' })
+      expect(cards.querySelectorAll('[data-ai-card-id]')).toHaveLength(cardCount)
+      const toc = document.querySelector('.ai-search-toc')!
+      expect(toc).toHaveAttribute('aria-hidden', 'true')
+      expect(toc).toBeEmptyDOMElement()
+    } else {
+      expect(screen.queryByRole('region', { name: '引用内容' })).not.toBeInTheDocument()
+      expect(document.querySelector('.ai-search-toc')).toBeNull()
+    }
+    document.documentElement.style.removeProperty('--ai-toc-bp')
+  })
+
+  it.each(['retrieval_failed', 'retrieval_timeout'])('hides citations for a reason-only %s result', reason => {
+    render(<AiSearchPage />)
+    act(() => useAiSearchStore.setState({ phase: 'results', query: longQuery,
+      items: [{ id: 'retained', title: '已有原文', platform: 'rss', fetched_at: '' }], cardOrder: ['retained'],
+      summary: { ...useAiSearchStore.getState().summary, status: 'failed', error: null, reason } }))
+    expect(screen.getByText('这次没能找完资料，可以再试一次，不计次数。', { selector: '.ai-summary-state-title' })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: '引用内容' })).not.toBeInTheDocument()
+    expect(document.querySelector('.ai-search-toc')).toBeNull()
   })
 
   it('submits the edited failure query through the idle submit flow and updates the job hash', async () => {

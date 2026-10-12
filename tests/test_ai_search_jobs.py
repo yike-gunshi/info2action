@@ -82,8 +82,8 @@ def test_daily_quota_counts_all_statuses_since_beijing_midnight(db, method, args
     assert getattr(search, method)(*args) == 3
     sql, params = next((s, p) for s, p in conn.calls if "count(*)" in s)
     assert "status" not in sql and "ip_hash" not in sql
-    assert "created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'" in sql
-    assert "created_at <= now()" not in sql
+    assert "write_queued_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')) AT TIME ZONE 'Asia/Shanghai'" in sql
+    assert "write_queued_at <= now()" not in sql
     if args:
         assert "user_id = %s" in sql and params == args and "user'1" not in sql
     else:
@@ -98,7 +98,7 @@ def test_month_count_includes_all_statuses_and_ips_from_calendar_month_start(db)
     assert conn.checkouts == 1
     sql, params = next((s, p) for s, p in conn.calls if "count(*)" in s)
     assert "FROM test_search.ai_search_jobs" in sql
-    assert "WHERE created_at >= date_trunc('month', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'" in sql
+    assert "WHERE write_queued_at >= date_trunc('month', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'" in sql
     assert "status" not in sql and "ip_hash" not in sql
     assert params in (None, ())
     assert any(s.startswith("SET LOCAL statement_timeout") for s, _ in conn.calls)
@@ -111,19 +111,26 @@ def test_recover_stale_marks_timeouts_then_requeues_only_prestartup_jobs(db):
     cutoff = datetime(2026, 10, 10, 10, tzinfo=timezone.utc)
     search.recover_stale(45, requeue_before=cutoff)
     updates = [(s, p) for s, p in conn.calls if s.startswith("UPDATE")]
-    assert len(updates) == 2
+    assert len(updates) == 4
     assert "status='failed'" in updates[0][0] and "hard_timeout" in updates[0][0]
     assert "finished_at=now()" in updates[0][0] and "started_at <" in updates[0][0]
     assert updates[0][1] == (45,)
     assert "status='queued'" in updates[1][0] and "started_at=NULL" in updates[1][0]
     assert "WHERE status='running' AND started_at < %s" in updates[1][0]
     assert updates[1][1] == (cutoff,)
+    assert "status='retrieving'" in updates[2][0] and "retrieval_timeout" in updates[2][0]
+    assert "created_at < now() - interval '5 minutes'" in updates[2][0]
+    assert "retrieval - 'started_at'" in updates[3][0] and '"stage": "queued"' in updates[3][0]
+    assert "WHERE status='retrieving'" in updates[3][0] and updates[3][1] == (cutoff,)
 
 
 def test_periodic_recovery_does_not_requeue_live_jobs(db):
     search, conn = db
     search.recover_stale()
-    assert len([s for s, _ in conn.calls if s.startswith("UPDATE")]) == 1
+    updates = [s for s, _ in conn.calls if s.startswith("UPDATE")]
+    assert len(updates) == 2
+    assert "hard_timeout" in updates[0] and "retrieval_timeout" in updates[1]
+    assert not any("retrieval - 'started_at'" in s for s in updates)
 
 
 def test_create_job_parameterizes_all_input_and_json(db):
@@ -410,7 +417,7 @@ def real_jobs_db(jobs_postgres, monkeypatch):
             status text NOT NULL DEFAULT 'queued', error text, result jsonb,
             content_md_final text, cited_ids jsonb, usage jsonb, elapsed_ms integer,
             points_estimate numeric, model text, prompt_version text, request_params jsonb,
-            input_text text, candidate_meta jsonb)''')
+            input_text text, candidate_meta jsonb, retrieval jsonb)''')
     barrier = {'value': None}
 
     class Connection:

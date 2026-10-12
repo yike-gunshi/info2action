@@ -30,6 +30,11 @@ def api(monkeypatch):
     monkeypatch.setenv('AI_SEARCH_IP_SALT', 'test-salt')
     monkeypatch.setenv('GLM_CODING_API_KEY', 'fake-test-key')
     monkeypatch.setenv('AI_SEARCH_WORKER_ENABLED', '1')
+    monkeypatch.setenv('AI_SEARCH_PIPELINE', 'v1')
+    monkeypatch.setattr(route.search, 'schema_ready', Mock(return_value=True))
+    monkeypatch.setattr(route, '_AI_SEARCH_SCHEMA_READY', None)
+    monkeypatch.setattr(route, '_AI_SEARCH_SCHEMA_ERROR_LOGGED', False)
+    monkeypatch.setattr(route.search, 'claim_next_retrieving', Mock(return_value=None))
     monkeypatch.setattr(route, '_AI_SEARCH_EXECUTOR', True, raising=False)
     monkeypatch.setattr(route.limiter, 'enabled', False)
     monkeypatch.setattr(route, '_github_cluster_display_min_stars', lambda: 50)
@@ -50,7 +55,7 @@ def api(monkeypatch):
         return queued[0]['id']
     monkeypatch.setattr(route.search, 'create_job', create)
     monkeypatch.setattr(route.search, 'claim_job', Mock(side_effect=AssertionError('must claim FIFO')))
-    monkeypatch.setattr(route.search, 'get_job', lambda jid: jobs.get(jid))
+    monkeypatch.setattr(route.search, 'get_job', lambda jid, **kw: jobs.get(jid))
     def used_day(user_id=None):
         return sum(not job.get('quota_exempt', False) and
                    (user_id is None or job.get('user_id') == user_id)
@@ -66,7 +71,10 @@ def api(monkeypatch):
     monkeypatch.setattr(route.search, 'retrieve', Mock(return_value={
         'items': items, 'query_lexical': '"test"', 'lexical_hits': 1,
         'vector_hits': 2, 'vector_ok': True}))
-    monkeypatch.setattr(route, '_spawn_job', started.append)
+    def spawned(coroutine):
+        started.append(coroutine.cr_frame.f_locals['job_id'])
+        coroutine.close()
+    monkeypatch.setattr(route, '_spawn_job', spawned)
     monkeypatch.setattr(route.search, 'claim_next_queued', Mock(side_effect=claim_next))
     monkeypatch.setattr(route.search, 'save_job_input', Mock())
     monkeypatch.setattr(route.search, 'finish_job', Mock())
@@ -86,7 +94,7 @@ def api(monkeypatch):
         'AI_SEARCH_JOB_TIMEOUT_S': 2400}
     monkeypatch.setattr(route.digest, 'settings', lambda: model_config)
     monkeypatch.setattr(route.digest, 'load_prompt', lambda _: ('v1', 'prompt'))
-    monkeypatch.setattr(route.digest, 'build_input', lambda *a: {'user_message': 'full input', 'tiers': {'b': 'content', 'a': 'summary'}})
+    monkeypatch.setattr(route.digest, 'build_input', lambda *a, **kw: {'user_message': 'full input', 'tiers': {'b': 'content', 'a': 'summary'}})
     monkeypatch.setattr(route.digest, 'run_digest', Mock(return_value={
         'input_text': 'full input', 'tiers': {'b': 'content', 'a': 'summary'},
         'raw': '{"content_md":"answer"}',
@@ -453,6 +461,8 @@ def test_reordered_job_hides_summary_when_any_candidate_is_invisible(api, visibl
 def test_private_candidate_blocks_summary(api):
     route, client, jobs, created, _ = api
     jobs['old'] = {'id': 'old', 'status': 'failed', 'candidate_ids': ['secret'], 'content_md_final': 'secret'}
+    route.search.get_candidates.side_effect = lambda ids, **kw: (
+        [{'id': 'secret'}] if kw.get('manual_owner_user_id') is None else [])
     assert client.get('/api/ai-search/old').status_code == 404
     assert not created
 
@@ -466,7 +476,7 @@ def test_get_shared_job_uses_source_visibility_not_job_owner(api, visible_ids):
     route.search.get_candidates.side_effect = None
     route.search.get_candidates.return_value = [{'id': item_id} for item_id in visible_ids]
     response = client.get('/api/ai-search/shared', headers={'x-test-role': 'user'})
-    assert route.search.get_candidates.call_args.kwargs['user_id'] == 'user-1'
+    assert route.search.get_candidates.call_args_list[0].kwargs['user_id'] == 'user-1'
     if len(visible_ids) == 2:
         assert response.status_code == 200
         assert response.json()['content_md'] == 'shared answer'
@@ -509,9 +519,8 @@ def test_admin(api, role):
 @pytest.mark.parametrize('role', [None, 'user', 'admin'])
 @pytest.mark.parametrize('enabled', ['0', '1'])
 def test_admin_requires_remote_mode(api, monkeypatch, role, enabled):
-    from routes import admin
     route, client, _, _, _ = api
-    monkeypatch.setattr(admin.remote_db, 'app_state_to_remote', lambda: False)
+    monkeypatch.setattr(route.remote_db, 'app_state_to_remote', lambda: False)
     monkeypatch.setenv('AI_SEARCH_ENABLED', enabled)
     get_job = Mock()
     monkeypatch.setattr(route.search, 'get_job', get_job)

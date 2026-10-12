@@ -146,3 +146,6 @@ scripts/auto-deploy.sh
 
 # oss-export 工作目录（导出快照与公开仓库 clone）
 .oss-export/
+
+# AI 搜索 v2 评测：评审用的条目文本由 eval_build.py 每次重新生成
+.features/ai-search-v2/eval/pools/*/judged_items.json

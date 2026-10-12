@@ -1,11 +1,13 @@
 import { create } from 'zustand'
 import { tryRefresh } from '../lib/api/_client'
 import { useAuthStore } from './authStore'
-import { describeSummaryError, getAiSearchStatus, getAiSearchJob, postAiSearch, QUERY_MAX_CHARS, QUERY_VALIDATION_MESSAGE, POLL_INTERVAL_MS, HIGHLIGHT_MS } from '../lib/api/aiSearch'
-import type { AiSearchItem, AiSearchJobResponse, AiSearchJobStatus, AiSearchStatusResponse } from '../lib/api/aiSearch'
+import { describeSummaryError, getAiSearchStatus, getAiSearchJob, postAiSearch, QUERY_MAX_CHARS, QUERY_VALIDATION_MESSAGE, POLL_INTERVAL_MS, RETRIEVAL_POLL_INTERVAL_MS, RETRIEVAL_IN_PROGRESS_MESSAGE, HIGHLIGHT_MS } from '../lib/api/aiSearch'
+import type { AiSearchItem, AiSearchJobResponse, AiSearchJobStatus, AiSearchRetrievalStage, AiSearchStatusResponse } from '../lib/api/aiSearch'
 
 export interface AiSearchSummary {
   status: AiSearchJobStatus | 'none'
+  stage?: AiSearchRetrievalStage
+  keywords?: string[]
   position?: number
   reason?: string | null
   contentMd: string | null
@@ -31,6 +33,7 @@ interface AiSearchState {
   refreshStatus: () => Promise<void>
   invalidateStatus: () => void
   requestError: string | null
+  requestNotice: string | null
   unavailable: boolean
   emptyResult: boolean
   highlightItemId: string | null
@@ -38,7 +41,7 @@ interface AiSearchState {
   setQuery: (q: string) => void
   submit: (q: string) => Promise<void>
   loadJob: (id: string, hintQuery?: string) => Promise<void>
-  poll: () => void
+  poll: (immediate?: boolean) => void
   stopPolling: () => void
   highlight: (itemId: string, durationMs?: number) => void
   reset: () => void
@@ -51,7 +54,7 @@ const emptySummary = (): AiSearchSummary => ({
 const initialState = () => ({
   query: '', phase: 'idle' as const, jobId: null, items: [], vectorOk: true,
   lexicalHits: 0, vectorHits: 0, summary: emptySummary(), loadingJob: false,
-  requestError: null, unavailable: false, emptyResult: false, highlightItemId: null, cardOrder: [],
+  requestError: null, requestNotice: null, unavailable: false, emptyResult: false, highlightItemId: null, cardOrder: [],
 })
 let generation = 0
 let statusGeneration = 0
@@ -60,7 +63,7 @@ let highlightTimer: ReturnType<typeof setTimeout> | undefined
 let visibilityListener: (() => void) | undefined
 let polling = false
 let inFlight = false
-const pending = (status: AiSearchSummary['status']) => status === 'queued' || status === 'running'
+const pending = (status: AiSearchSummary['status']) => status === 'retrieving' || status === 'queued' || status === 'running'
 
 function clearPolling() {
   clearTimeout(pollTimer)
@@ -81,11 +84,13 @@ function jobState(response: AiSearchJobResponse, fallbackId: string) {
     ...(response.query !== undefined ? { query: response.query } : {}),
     phase: 'results' as const, jobId: response.job_id || fallbackId,
     items: response.items, emptyResult: response.items.length === 0 && response.status === 'done',
+    ...(response.vector_ok !== undefined ? { vectorOk: response.vector_ok } : {}),
     // The API aligns items with the stored citation numbers. Keep cardOrder
     // for CardsPane's scroll anchoring as pending candidates become cited.
     cardOrder: ids,
     summary: {
       status: response.status, position: response.position, reason: response.error ?? null,
+      stage: response.stage, keywords: response.keywords ?? [],
       contentMd: response.content_md ?? null, citedIds,
       error: response.error ?? null, model: response.model ?? null,
       elapsedMs: response.elapsed_ms ?? null, citedCount: response.cited_count ?? null,
@@ -95,6 +100,9 @@ function jobState(response: AiSearchJobResponse, fallbackId: string) {
 function requestErrorState(error: unknown, status?: AiSearchStatusResponse | null) {
   const detail = error as { status?: number; message?: string }
   const message = detail?.message ?? ''
+  if (detail?.status === 409 && message === 'retrieval_in_progress') {
+    return { requestError: null, requestNotice: RETRIEVAL_IN_PROGRESS_MESSAGE, unavailable: false }
+  }
   if (message === 'ai_search_disabled') return { requestError: null, unavailable: true }
   if ((detail?.status === 401 && message === 'login_required') || (detail?.status === 429 && message === 'quota_exhausted')) {
     statusGeneration += 1
@@ -152,7 +160,7 @@ export const useAiSearchStore = create<AiSearchState>((set, get) => ({
       if (current === statusGeneration) set({ statusLoading: false })
     }
   },
-  setQuery: query => set({ query }),
+  setQuery: query => set({ query, requestNotice: null }),
   submit: async q => {
     const query = q.trim()
     if (Array.from(query).length < 1 || Array.from(query).length > QUERY_MAX_CHARS) {
@@ -166,18 +174,19 @@ export const useAiSearchStore = create<AiSearchState>((set, get) => ({
     try {
       const response = await postAiSearch(query)
       if (current !== generation) return
+      const items = response.items ?? []
       set({
         phase: 'results', query: response.query, jobId: response.job_id,
-        items: response.items, vectorOk: response.vector_ok, lexicalHits: response.lexical_hits,
-        vectorHits: response.vector_hits, emptyResult: response.items.length === 0 && response.summary.status === 'none',
-        cardOrder: response.items.map(item => item.id),
+        items, vectorOk: response.vector_ok ?? true, lexicalHits: response.lexical_hits ?? 0,
+        vectorHits: response.vector_hits ?? 0, emptyResult: items.length === 0 && response.summary.status === 'none',
+        cardOrder: items.map(item => item.id),
         summary: { ...emptySummary(), status: response.summary.status, position: response.summary.position,
           reason: response.summary.reason ?? null, error: response.summary.reason ?? null },
       })
       writeJobHash(response.job_id, response.query || get().query)
-      // Creating a job consumes a turn even if its summary later fails.
+      // Reconcile availability; v2 consumes writing quota only after retrieval succeeds.
       if (response.job_id) void get().refreshStatus()
-      get().poll()
+      get().poll(response.summary.status === 'retrieving')
     } catch (error) {
       if (current !== generation) return
       set({ phase: 'idle', ...requestErrorState(error, get().searchStatus) })
@@ -217,15 +226,17 @@ export const useAiSearchStore = create<AiSearchState>((set, get) => ({
       }
     }
   },
-  poll: () => {
+  poll: (immediate = false) => {
     if (polling || !get().jobId || !pending(get().summary.status)) return
     polling = true
     const current = generation
     const id = get().jobId!
+    let retrievalStatusRefreshed = false
     const schedule = () => {
       if (current !== generation || !polling || document.visibilityState === 'hidden') return
       clearTimeout(pollTimer)
-      pollTimer = setTimeout(() => { void tick() }, POLL_INTERVAL_MS)
+      const interval = get().summary.status === 'retrieving' ? RETRIEVAL_POLL_INTERVAL_MS : POLL_INTERVAL_MS
+      pollTimer = setTimeout(() => { void tick() }, interval)
     }
     const tick = async () => {
       if (current !== generation || !polling || inFlight || document.visibilityState === 'hidden') return
@@ -233,7 +244,12 @@ export const useAiSearchStore = create<AiSearchState>((set, get) => ({
       try {
         const response = await getAiSearchJob(id)
         if (current !== generation) return
+        const retrievalFinished = get().summary.status === 'retrieving' && response.status !== 'retrieving'
         set(jobState(response, id))
+        if (retrievalFinished && !retrievalStatusRefreshed) {
+          retrievalStatusRefreshed = true
+          void get().refreshStatus()
+        }
         if (!pending(response.status)) clearPolling()
       } catch (error) {
         if (current !== generation) return
@@ -258,7 +274,8 @@ export const useAiSearchStore = create<AiSearchState>((set, get) => ({
       if (document.visibilityState !== 'hidden') void tick()
     }
     document.addEventListener('visibilitychange', visibilityListener)
-    schedule()
+    if (immediate) void tick()
+    else schedule()
   },
   stopPolling: stopRequests,
   highlight: (itemId, durationMs = HIGHLIGHT_MS) => {

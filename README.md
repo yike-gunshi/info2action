@@ -4,7 +4,7 @@
 
 **信息的尽头，应该是行动**
 
-跨平台聚合 · 跨源事件去重 · AI 精选 · 信息→行动闭环
+跨平台聚合 · 跨源事件去重 · AI 精选 · AI 搜索 · 信息→行动闭环
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
@@ -14,7 +14,7 @@
 
 **中文** · [English](docs/README.en.md)
 
-[核心能力](#-核心能力) · [功能演示](#-功能演示) · [能力全景](#-能力全景) · [架构](#-架构) · [Quick Start](#-quick-start) · [自部署](#-self-hosting) · [Community](#-community)
+[核心能力](#-核心能力) · [AI 搜索](#-ai-搜索问一句话拿到一篇带出处的整理) · [功能演示](#-功能演示) · [能力全景](#-能力全景) · [架构](#-架构) · [Quick Start](#-quick-start) · [自部署](#-self-hosting) · [Community](#-community)
 
 <br>
 
@@ -89,6 +89,35 @@
 | ![个人设置](docs/assets/readme/settings.png) | ![登录页](docs/assets/readme/login.png) |
 
 </details>
+
+## 🔎 AI 搜索：问一句话，拿到一篇带出处的整理
+
+<div align="center">
+<img src="docs/assets/readme/ai-search-result.png" alt="AI 搜索结果页 — 左侧目录、中间带角标的文章、右侧被引用的原文" width="880">
+
+<sub>问「jev 是啥、怎么用」：站内找到 200 条相关内容，写成一篇约 1.9 万字的整理，引用了其中 199 条；每句话后的角标都能点回原文</sub>
+</div>
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/ai-search-searching.png" alt="找资料中 — 显示正在查的关键词">
+      <p align="center"><sub><b>先找资料</b> — 约 20 秒，等待页显示正在查的关键词</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/ai-search-insufficient.png" alt="资料不足 — 不写文章、不计次数">
+      <p align="center"><sub><b>没有就直说</b> — 站内资料不够时不硬写、不计次数，列出最相关的几条</sub></p>
+    </td>
+  </tr>
+</table>
+
+- **怎么找资料**：MiniMax-M3 先参考站内标题，把问题拆成要查的对象、关键词和几句检索句；全文检索、向量检索多路并行，合并后用 Voyage rerank-3 对每条打相关分，取前 200 条全文交给 GLM-5.3，10–20 分钟写成文章。
+- **不编、不丢**：每个事实句都带角标，由服务端逐个核对；相关原文至少引用一次，漏引的补进「其他相关内容」。
+- **资料不足不扣次数**：相关分达到 0.65 的不到 3 条，就判为资料不足，不写文章、不计次数。
+- **效果**：14 道评测题上，交给模型的前 100 条里，直接有用的从 384 条增加到 698 条；同一个问题「jev」，新版引用 199 条原文，旧版只有 96 条。
+- **可追溯**：每次搜索都会留档，包括拆出的关键词、每一路命中了多少、重排分数、送进模型的完整输入，管理后台可以查看。两段 prompt 都开源：[`17_ai_search_digest.md`](prompts/17_ai_search_digest.md)（写文章）、[`18_ai_search_query.md`](prompts/18_ai_search_query.md)（拆问题）。
+
+登录后可用，每人每天 2 次（开始写文章才计）。自部署需要 GLM Coding Plan 套餐 key，配置见 [配置指南](docs/配置指南.md)。
 
 ## 🎬 功能演示
 
@@ -184,7 +213,7 @@
     </tr>
     <tr>
       <td width="150"><b>AI 搜索</b></td>
-      <td>站内词法与向量检索结合，异步生成带引用的总结；支持目录、来源卡片、个人搜索历史和每日额度。需另配 Supabase 与 GLM Coding Plan，见 <a href="docs/SELF-HOST.md#35-ai-搜索可选">自部署说明</a></td>
+      <td>问一句话：拆问题 → 全文 + 向量多路检索 → Voyage 重排取前 200 → GLM-5.3 写成每句带角标的整理；资料不足不写不扣次数，支持目录、来源卡片、个人搜索历史和每日额度。需另配 Supabase、embedding / 重排服务与 GLM Coding Plan，见 <a href="docs/SELF-HOST.md#35-ai-搜索可选">自部署说明</a></td>
     </tr>
     <tr>
       <td width="150"><b>统一阅读</b></td>

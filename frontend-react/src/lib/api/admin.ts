@@ -49,6 +49,105 @@ export interface AiSearchJobsResponse {
   }
 }
 
+export interface AiSearchJobRetrieval {
+  error?: string | null
+  df_cap?: number
+  scope?: {
+    public_only?: boolean
+    user_id?: string | null
+    manual_owner_user_id?: string | null
+    min_github_stars?: number
+  }
+  stage?: 'understanding' | 'searching'
+  preview_titles?: string[]
+  preview_error?: string
+  understanding?: {
+    prompt_version?: string
+    input?: string
+    output?: {
+      type?: 'entity' | 'broad'
+      entities?: Array<{ name?: string; aliases?: string[] }>
+      keyword_queries?: string[]
+      semantic_queries?: string[]
+      time_window_days?: number
+    } | null
+    usage?: Record<string, unknown>
+    fallback?: boolean
+    field_fallbacks?: string[]
+    elapsed_s?: number
+    model?: string
+    raw_text?: string
+    error?: string
+  }
+  keywords?: string[]
+  semantic_queries?: string[]
+  window_days?: number
+  vector_ok?: boolean
+  embedding_error?: string
+  similarity_error?: string
+  legs?: Array<{
+    type?: 'lexical' | 'vector'
+    query?: string
+    hits?: number
+    hits_capped?: boolean
+    taken?: number
+    skipped?: boolean
+    skip_reason?: string
+    error?: string | null
+    elapsed_s?: number
+    discarded?: boolean
+    discard_reason?: string
+  }>
+  merged_count?: number
+  filtered_count?: number
+  rerank?: {
+    model?: string | null
+    count?: number
+    query?: string
+    elapsed_s?: number
+    fallback?: boolean
+    above_threshold?: number
+    threshold?: number
+    threshold_applied?: boolean
+    score_distribution?: {
+      min?: number | null
+      max?: number | null
+      mean?: number | null
+      buckets?: Record<string, number>
+    }
+    attempts?: Array<{
+      model?: string
+      error?: string | null
+      batches?: Array<{
+        start?: number
+        count?: number
+        usage?: Record<string, unknown>
+        elapsed_s?: number
+      }>
+    }>
+  }
+  selection?: {
+    top_n?: number
+    top_n_count?: number
+    dropped_count?: number
+    unavailable_ids?: string[]
+    estimated_tokens?: number
+    system_prompt_chars?: number
+    input_max_tokens?: number
+    retained_count?: number
+    final_count?: number
+  }
+  timings_s?: Record<string, number>
+  usage?: Array<{
+    stage?: string
+    model?: string
+    usage?: Record<string, unknown>
+    start?: number
+    count?: number
+    elapsed_s?: number
+  }>
+}
+
 export interface AiSearchJobDetail extends AiSearchJobRow {
   query_lexical: string
   input_text: string | null
@@ -65,6 +164,8 @@ export interface AiSearchJobDetail extends AiSearchJobRow {
   request_params: Record<string, unknown> | null
   model: string | null
   prompt_version: string | null
+  // Retrieval records may be partial while a job is still finding sources.
+  retrieval?: AiSearchJobRetrieval | null
 }
 
 export async function getAiSearchJobs(params: {
